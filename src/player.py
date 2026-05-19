@@ -25,16 +25,29 @@ from panda3d.core import (
 from .physics import make_ground_ray
 
 
-EYE_HEIGHT = 1.7
+# 1.7 → 1.55: 1.7m 는 사람 정수리 높이라 1인칭 시점에서 팔/총이 화면을 너무 많이
+# 차지함. 평균 한국 성인 눈높이(1.55~1.6m) 로 낮춰 1인칭 구도를 더 자연스럽게.
+EYE_HEIGHT = 1.55
 WALK_SPEED = 8.0
 RUN_MULTIPLIER = 1.5
-MOUSE_SENSITIVITY = 0.15
+# 이전 기본값 0.15는 너무 민감해 무빙 중 시점이 휙휙 돌아간다는 피드백.
+# 절반 수준(0.075)으로 낮춰 정밀 사격이 가능하게 함. 설정 메뉴 슬라이더로 0.025 ~ 0.5
+# 범위에서 런타임 조절 가능.
+MOUSE_SENSITIVITY = 0.075
 GRAVITY = 20.0
 JUMP_VELOCITY = 7.5
 SPAWN_POS = Vec3(0, 0, 2)
 MAX_DT = 1.0 / 30.0
 GROUND_SCAN_HEIGHT = 200.0
 GROUND_EPSILON = 0.01
+
+# ADS (Aim Down Sights) — 마우스 우클릭으로 조준 모드 진입 ---------
+# 카메라 FOV 를 좁히고(시각적 줌) + 권총을 화면 중앙으로 이동(가늠쇠 조준) + 마우스
+# 민감도 절반으로 정밀 조준 가능. 권총 이동은 weapons.Pistol.set_ads 에서 처리.
+ADS_DEFAULT_FOV = 70.0        # 평상시 시야각 (도)
+ADS_ZOOM_FOV = 50.0           # 조준 시 시야각 (도) — 약 1.4배 줌 (40→50 으로 완화)
+ADS_LERP_TIME = 0.12          # FOV 전환 시간 (초) — 권총 이동과 동기화
+ADS_SENSITIVITY_MULT = 0.5    # 조준 중 마우스 민감도 배율
 
 # 체력 / 피격 비네트 -----------------------------------------------
 PLAYER_MAX_HP = 100
@@ -68,6 +81,13 @@ class PlayerController:
         # 마우스 감도를 인스턴스 변수로 — 설정 메뉴에서 런타임에 변경 가능.
         self.sensitivity = MOUSE_SENSITIVITY
 
+        # ADS 상태 — set_ads(True/False)로 토글. 매 프레임 _update_ads_fov가
+        # ads_current_fov를 ads_target_fov로 ADS_LERP_TIME에 맞춰 보간.
+        # camLens 초기 FOV도 ADS_DEFAULT_FOV로 설정해 시작부터 70도 시야 보장.
+        self.ads_active = False
+        self.ads_current_fov = ADS_DEFAULT_FOV
+        base.camLens.setFov(ADS_DEFAULT_FOV)
+
         self.node = base.render.attachNewNode("player")
         self.node.setPos(SPAWN_POS)
 
@@ -84,6 +104,11 @@ class PlayerController:
 
         self.vz = 0.0
         self.on_ground = False
+
+        # 이동/달리기 상태 — weapons.py 의 _update_sway 등 외부 모션 시스템이 참조.
+        # _update_movement 가 매 프레임 갱신. 키 입력 + on_ground 둘 다 충족해야 True.
+        self.is_moving = False
+        self.is_running = False
 
         # View bob 상태
         self._bob_phase = 0.0
@@ -118,7 +143,9 @@ class PlayerController:
     def update(self, task):
         # 일시정지 중에는 마우스룩/이동/중력/bob 모두 정지.
         # _first_mouse 리셋은 resume 시 main._toggle_pause에서 처리.
+        # ADS FOV 는 일시정지여도 진행 — 멈추면 메뉴 들어갈 때 FOV 가 어색하게 박제됨.
         if getattr(self.base, "paused", False):
+            self._update_ads_fov(_clock.getDt())
             return task.cont
         dt = _clock.getDt()
         if dt > MAX_DT:
@@ -128,7 +155,48 @@ class PlayerController:
         self._update_gravity_and_ground(dt)
         self._update_view_bob(dt)
         self._update_damage_flash(dt)
+        self._update_ads_fov(dt)
         return task.cont
+
+    def set_ads(self, active):
+        """우클릭 누르면 active=True, 떼면 False. 일시정지/재장전 중에는 무시.
+
+        FOV 와 민감도는 본 클래스에서, 권총 위치 lerp 는 weapons.Pistol.set_ads
+        에 위임.
+        """
+        if getattr(self.base, "paused", False):
+            # 일시정지 중 누른 우클릭은 메뉴 클릭 의도일 가능성이 높으므로 ADS 무시.
+            return
+        pistol = getattr(self.base, "pistol", None)
+        # 재장전 중 ADS 진입 금지 — 권총 모션 충돌 방지.
+        if active and pistol is not None and pistol.reloading:
+            return
+        self.ads_active = bool(active)
+        if pistol is not None:
+            pistol.set_ads(active)
+
+    def _update_ads_fov(self, dt):
+        """ads_current_fov 를 target FOV 로 ADS_LERP_TIME 에 맞춰 선형 보간.
+
+        target 에 0.01도 이내로 접근하면 정확한 target 값으로 스냅 — float 누적 오차 방지.
+        """
+        target_fov = ADS_ZOOM_FOV if self.ads_active else ADS_DEFAULT_FOV
+        if abs(self.ads_current_fov - target_fov) < 0.01:
+            if self.ads_current_fov != target_fov:
+                self.ads_current_fov = target_fov
+                self.base.camLens.setFov(target_fov)
+            return
+        # ADS_LERP_TIME 동안 (DEFAULT - ZOOM) 만큼 변화하는 속도.
+        delta_per_sec = (ADS_DEFAULT_FOV - ADS_ZOOM_FOV) / ADS_LERP_TIME
+        if self.ads_current_fov > target_fov:
+            self.ads_current_fov = max(
+                target_fov, self.ads_current_fov - delta_per_sec * dt
+            )
+        else:
+            self.ads_current_fov = min(
+                target_fov, self.ads_current_fov + delta_per_sec * dt
+            )
+        self.base.camLens.setFov(self.ads_current_fov)
 
     def take_damage(self, amount, source=None):
         """좀비 _enter_strike에서 호출됨. hp가 0 이하면 추가 데미지 무시 (게임오버는 다음 단계)."""
@@ -138,6 +206,11 @@ class PlayerController:
         self._damage_flash_alpha = DAMAGE_FLASH_PEAK_ALPHA
         self.base.hud.set_player_hp(self.hp, self.max_hp)
         self.base.hud.set_damage_flash(self._damage_flash_alpha)
+        # 피격 시 재장전 중이면 모션을 안전하게 중단 — 왼손이 카메라 자식으로 남아
+        # 엉뚱한 위치에 박제되는 버그 방지. ammo 는 그대로 두어 패널티로 작용.
+        pistol = getattr(self.base, "pistol", None)
+        if pistol is not None and pistol.reloading:
+            pistol.abort_reload()
 
     def _update_damage_flash(self, dt):
         if self._damage_flash_alpha <= 0.0:
@@ -161,10 +234,9 @@ class PlayerController:
         - Z (위아래): sin(phase) — 한 발걸음마다 한 번 올라갔다 내려옴
         - X (좌우): sin(phase / 2) — 두 발걸음마다 한 번 좌우 → 자연스런 figure-8
         """
-        keys = getattr(self, "_last_keys", None) or {}
-        has_input = bool(keys.get("w") or keys.get("a") or keys.get("s") or keys.get("d"))
-        moving = has_input and self.on_ground
-        running = moving and bool(keys.get("shift", False))
+        # _update_movement 에서 이미 갱신된 플래그 재사용 — 중복 계산 제거.
+        moving = self.is_moving
+        running = self.is_running
 
         # intensity 부드러운 fade — 멈춰도 갑자기 0으로 떨어지지 않고 잔잔히 잦아듦
         target_intensity = 1.0 if moving else 0.0
@@ -211,8 +283,10 @@ class PlayerController:
             return
         dx = x - cx
         dy = y - cy
-        self.yaw -= dx * self.sensitivity
-        self.pitch -= dy * self.sensitivity
+        # ADS 중에는 정밀 조준이 가능하도록 민감도 절반 적용.
+        sens = self.sensitivity * (ADS_SENSITIVITY_MULT if self.ads_active else 1.0)
+        self.yaw -= dx * sens
+        self.pitch -= dy * sens
         if self.pitch > 89.0:
             self.pitch = 89.0
         elif self.pitch < -89.0:
@@ -237,6 +311,13 @@ class PlayerController:
 
         forward = (1 if keys["w"] else 0) - (1 if keys["s"] else 0)
         strafe = (1 if keys["d"] else 0) - (1 if keys["a"] else 0)
+
+        # 이동/달리기 플래그 갱신 — w+s 처럼 상쇄되어도 키는 눌린 상태이므로
+        # has_input 은 키 기준으로 판정 (sway 모션이 "걸을 의지"를 반영하도록).
+        has_input = bool(keys["w"] or keys["a"] or keys["s"] or keys["d"])
+        self.is_moving = has_input and self.on_ground
+        self.is_running = self.is_moving and bool(keys["shift"])
+
         if forward == 0 and strafe == 0:
             return
 

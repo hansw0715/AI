@@ -52,12 +52,14 @@ class SettingsMenu:
             relief=None,
         )
 
+        # 기본 민감도가 0.075 로 내려갔으므로 슬라이더 최솟값도 그 절반(0.025) 까지
+        # 내려 더 정밀한 조준 선호 유저를 수용. pageSize 도 비례로 축소.
         current_sens = self._get_current_sens()
         self.sens_slider = DirectSlider(
             parent=self.frame,
-            range=(0.05, 0.5),
+            range=(0.025, 0.5),
             value=current_sens,
-            pageSize=0.05,
+            pageSize=0.025,
             scale=0.4,
             pos=(0, 0, 0.15),
             command=self._on_sens_change,

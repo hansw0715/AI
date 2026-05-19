@@ -97,6 +97,9 @@ class FPSGame(ShowBase):
         # Esc는 종료가 아니라 일시정지 토글. 종료는 설정 메뉴의 Quit 버튼.
         self.accept("escape", self._toggle_pause)
         self.accept("mouse1", self.pistol.shoot)
+        # 우클릭 누르고 있는 동안만 ADS — press 에서 활성, release 에서 해제.
+        self.accept("mouse3", self.player.set_ads, [True])
+        self.accept("mouse3-up", self.player.set_ads, [False])
         self.accept("r", self.pistol.reload)
 
         self.taskMgr.add(self._weapons_update_task, "weapons_update")

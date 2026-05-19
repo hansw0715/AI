@@ -71,10 +71,13 @@ DEATH_FALL_PITCH = 90      # 뒤로 넘어가는 pitch (어색하면 -90)
 # AI 튜닝 ---------------------------------------------------------
 WALK_SPEED = 1.2           # m/s — 좀비답게 느림
 TURN_SPEED_DEG = 180.0     # 초당 회전 각도
-ATTACK_RANGE = 1.6         # m — 이 안에 들어오면 멈추고 공격 windup 시작
+# 1.6m 는 좀비가 거의 플레이어를 통과해 지나가야 트리거되어 체감상 공격이 거의 안 됨.
+# 사람 팔 길이(약 0.7m) + 플레이어 충돌 반경 여유 고려해 2.0m 로 완화.
+ATTACK_RANGE = 2.0         # m — 이 안에 들어오면 멈추고 공격 windup 시작
 
 # 공격 상태머신 / 데미지 --------------------------------------------
-ATTACK_HIT_RANGE = 1.8       # strike 시점에 이 거리 안이면 명중 (RANGE보다 약간 큼)
+# ATTACK_RANGE 보다 약간 넉넉해야 windup 도중 플레이어가 살짝 움직여도 명중 가능.
+ATTACK_HIT_RANGE = 2.2       # strike 시점에 이 거리 안이면 명중 (RANGE보다 약간 큼)
 ATTACK_WINDUP_SEC = 0.45     # 팔 들어올리는 시간
 ATTACK_STRIKE_SEC = 0.15     # 휘두름 시간
 ATTACK_RECOVER_SEC = 0.35    # 복귀 시간
@@ -87,7 +90,10 @@ LEG_SWING_DEG = 18.0       # 보폭 좁게 (좀비스럽게)
 LEG_LIMP_BIAS_DEG = 6.0    # 왼다리가 항상 뒤로 빠지는 절뚝 bias
 
 # 팔: 어깨에서 항상 앞으로 뻗은 자세 + 가벼운 흔들림
-ARM_FORWARD_BASE_DEG = -90.0  # 팔 앞으로 뻗은 기본 각도 (P)
+# Panda3D 어깨 pivot pitch(P) 회전: 0=팔이 -Z(아래)로 늘어뜨림, +90=-Z가 +Y(앞)로,
+# -90=-Z가 -Y(뒤)로 회전. 이전 값 -90은 의도와 달리 팔을 뒤로 향하게 해서
+# 좀비가 시각적으로 뒷걸음치는 것처럼 보였음 → +90으로 뒤집어 정면을 향하게 함.
+ARM_FORWARD_BASE_DEG = 90.0   # 팔 앞으로 뻗은 기본 각도 (P) — +Y 방향
 ARM_SWAY_DEG = 8.0            # 좌우 (R) 흔들림 폭
 ARM_VERTICAL_BOB_DEG = 5.0    # 위아래 (P 보정) 흔들림 폭
 
@@ -122,13 +128,14 @@ HIT_SPHERE_RADIUS = {
 }
 
 # 공격 모션 ------------------------------------------------------
-# 어깨 pivot pitch 좌표: 0 = 팔 아래로 늘어뜨림, -90 = 앞으로 뻗음, +-180 = 위로.
-# REST 를 워킹 sway 의 중심 (ARM_FORWARD_BASE_DEG = -90) 에 맞춰야
+# 어깨 pivot pitch(P) 좌표: 0 = 팔 아래로 늘어뜨림, +90 = 앞(+Y)으로 뻗음, ±180 = 위로.
+# (이전에는 -90 을 "앞"으로 잘못 가정해 부호가 모두 음수였음. ARM_FORWARD_BASE_DEG
+#  를 +90 으로 뒤집은 만큼 WINDUP/STRIKE 도 같이 +쪽으로 뒤집어 좌우 일관성 유지.)
+# REST 를 워킹 sway 중심(ARM_FORWARD_BASE_DEG = +90)에 맞춰야
 # recover → chasing 복귀 시 톡 튀지 않음.
-# (이전 시도에서 WINDUP/STRIKE 부호가 반대였음 — 사용자가 "반대방향" 지적 후 뒤집음.)
-ATTACK_ARM_REST_PITCH = ARM_FORWARD_BASE_DEG   # -90, 워킹 sway 중심과 일치
-ATTACK_ARM_WINDUP_PITCH = -30                   # 앞→뒤/위로 60도 들어올림
-ATTACK_ARM_STRIKE_PITCH = -120                  # 앞→아래로 30도 휘두름
+ATTACK_ARM_REST_PITCH = ARM_FORWARD_BASE_DEG   # +90, 워킹 sway 중심과 일치
+ATTACK_ARM_WINDUP_PITCH = 30                    # 앞→아래로 60도 끌어내려 windup
+ATTACK_ARM_STRIKE_PITCH = 120                   # 앞→위로 30도 휘둘러 strike
 
 # 체력바 ---------------------------------------------------------
 # 프롬프트는 Y_OFFSET이라고 부르지만 Panda3D는 Z가 위라 Z_OFFSET이 맞다.
