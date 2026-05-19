@@ -14,6 +14,10 @@ from panda3d.core import (
 
 GROUND_MASK = BitMask32.bit(1)
 HITTABLE_MASK = BitMask32.bit(2)
+# 좀비 전용 비트 — 환경과 분리해서 raycast가 둘을 구분할 수 있게 함.
+# 권총 raycast는 from-mask에 HITTABLE_MASK | ZOMBIE_MASK를 사용하고,
+# entry의 PythonTag("zombie")로 어느 좀비를 맞췄는지 역추적한다.
+ZOMBIE_MASK = BitMask32.bit(3)
 
 
 def make_ground_ray(parent_node, traverser, handler, name="player_ground_ray", origin_z=200.0):

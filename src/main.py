@@ -23,12 +23,15 @@ from panda3d.core import (
     DirectionalLight,
     Vec3,
     Vec4,
+    WindowProperties,
 )
 
 from .physics import GROUND_MASK, HITTABLE_MASK
 from .player import PlayerController
+from .settings_menu import SettingsMenu
 from .ui import HUD
 from .weapons import Pistol
+from .zombie import ZombieManager
 
 
 _clock = ClockObject.getGlobalClock()
@@ -58,6 +61,13 @@ class FPSGame(ShowBase):
         self.scene.setCollideMask(GROUND_MASK | HITTABLE_MASK)
         # 잎/풀 등 single-sided 폴리곤의 뒷면도 그리도록 양면 렌더링 활성화
         self.scene.setTwoSided(True)
+        # 1단계 좀비 테스트 — 바닥 빼고 다 제거해서 좀비 시인성 확보.
+        # 나무/대나무/바위/잎/실린더는 다음 단계에서 다시 추가.
+        # Ground (small, Z≈0)와 Ground01 (large, Z≈-0.28) 두 메시만 남김.
+        _KEEP_NAMES = {"Ground", "Ground01"}
+        for child in list(self.scene.getChildren()):
+            if child.getName() not in _KEEP_NAMES:
+                child.removeNode()
 
         ambient = AmbientLight("ambient")
         ambient.setColor(Vec4(0.4, 0.4, 0.4, 1))
@@ -69,18 +79,49 @@ class FPSGame(ShowBase):
         directional_np.setHpr(45, -45, 0)
         self.render.setLight(directional_np)
 
+        # 일시정지 플래그 — Esc로 토글. zombies/pistol/player update가 이 값을 본다.
+        # 설정 메뉴는 player 생성 후에 만들어야 _get_current_sens가 sensitivity를 읽을 수 있음.
+        self.paused = False
+
         self.player = PlayerController(self)
         self.hud = HUD(self)
         self.pistol = Pistol(self)
 
-        self.accept("escape", self.userExit)
+        # 좀비 추적 5마리.
+        self.zombies = ZombieManager(self)
+        self.zombies.spawn_initial_wave()
+
+        # 일시정지 + 설정 UI — 생성 직후 hide(). _toggle_pause가 show/hide.
+        self.settings_menu = SettingsMenu(self)
+
+        # Esc는 종료가 아니라 일시정지 토글. 종료는 설정 메뉴의 Quit 버튼.
+        self.accept("escape", self._toggle_pause)
         self.accept("mouse1", self.pistol.shoot)
         self.accept("r", self.pistol.reload)
 
         self.taskMgr.add(self._weapons_update_task, "weapons_update")
 
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        if self.paused:
+            self.settings_menu.show()
+            # 마우스 커서 표시 + 절대 모드 → UI 클릭 가능.
+            props = WindowProperties()
+            props.setCursorHidden(False)
+            props.setMouseMode(WindowProperties.M_absolute)
+            self.win.requestProperties(props)
+        else:
+            self.settings_menu.hide()
+            # resume 첫 프레임 마우스 델타 무시 — 안 그러면 시점이 휙 돌아감.
+            self.player._first_mouse = True
+            self.player._capture_mouse()
+
     def _weapons_update_task(self, task):
-        self.pistol.update(_clock.getDt())
+        if self.paused:
+            return task.cont
+        dt = _clock.getDt()
+        self.pistol.update(dt)
+        self.zombies.update(dt)
         return task.cont
 
 

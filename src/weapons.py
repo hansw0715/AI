@@ -42,14 +42,26 @@ from panda3d.core import (
     Vec3,
 )
 
+from .effects import spawn_hit_particles
 from .hands import Hand
-from .physics import HITTABLE_MASK
+from .physics import HITTABLE_MASK, ZOMBIE_MASK
+
+
+def _find_zombie_and_part(entry):
+    """raycast entry 에서 (Zombie, hit_part) 추출. 부위별 충돌 노드에
+    "zombie"/"hit_part" 두 태그가 같이 박혀 있어서 getNetPythonTag 한 번에 잡힘.
+    """
+    hit_np = entry.getIntoNodePath()
+    zombie = hit_np.getNetPythonTag("zombie")
+    hit_part = hit_np.getNetPythonTag("hit_part")
+    return zombie, hit_part
 
 
 MAG_SIZE = 12
 COOLDOWN = 0.2
 RELOAD_TIME = 2.0  # 검사 자세(inspect) 안무가 충분히 보이도록 1.8 → 2.0
 MAX_RANGE = 100.0
+BASE_DAMAGE = 10   # 권총 한 발 기본 데미지. 부위 배율 적용 전 값.
 
 # 화면 우중하단에 권총 배치. Z를 살짝 올려(-0.20 → -0.12) 가만히 있을 때
 # 양손이 화면 안에 잘 보이도록 함. (모든 자식 — 권총 부품/양손 — 같이 올라감)
@@ -181,7 +193,9 @@ class Pistol:
 
         cnode = CollisionNode("shoot_ray")
         cnode.addSolid(CollisionRay(0, 0, 0, 0, 1, 0))
-        cnode.setFromCollideMask(HITTABLE_MASK)
+        # 환경(HITTABLE_MASK)과 좀비(ZOMBIE_MASK) 둘 다 검출 → 가장 가까운 hit을
+        # entry로 받고, PythonTag로 좀비 여부 판정.
+        cnode.setFromCollideMask(HITTABLE_MASK | ZOMBIE_MASK)
         cnode.setIntoCollideMask(BitMask32.allOff())
 
         self.ray_np = self.base.camera.attachNewNode(cnode)
@@ -195,11 +209,20 @@ class Pistol:
         self._play_recoil()
         self._flash_muzzle()
 
-        hit_pos = self._raycast_hit()
+        hit_pos, hit_zombie, hit_part = self._raycast_hit()
         if hit_pos is not None:
             cam_pos = self.base.camera.getPos(self.base.render)
             tracer_distance = (hit_pos - cam_pos).length()
-            self._spawn_hit_marker(hit_pos)
+            if hit_zombie is not None:
+                # 부위별 배율은 take_damage 안에서 적용. 파티클은 부위 카테고리별 양/색.
+                hit_zombie.take_damage(BASE_DAMAGE, hit_part=hit_part)
+                spawn_hit_particles(self.base, hit_pos, hit_part)
+                # 헤드샷은 크로스헤어 아래 데미지 숫자 띄움.
+                if hit_part == "head":
+                    final_damage = int(round(BASE_DAMAGE * 1.5))
+                    self.game.hud.show_headshot_number(final_damage)
+            else:
+                self._spawn_hit_marker(hit_pos)
         else:
             tracer_distance = MAX_RANGE
         self._spawn_tracer(tracer_distance)
@@ -233,16 +256,22 @@ class Pistol:
             self.cooldown -= dt
 
     def _raycast_hit(self):
+        """(hit_pos, zombie_or_None, hit_part_or_None) 반환. miss/범위 초과면 (None, None, None).
+
+        부위별 충돌 노드에 "zombie"/"hit_part" 두 태그가 같이 박혀 있어서
+        hit_np.getNetPythonTag 로 둘 다 즉시 잡힘.
+        """
         self.traverser.traverse(self.base.render)
         if self.handler.getNumEntries() == 0:
-            return None
+            return None, None, None
         self.handler.sortEntries()
         entry = self.handler.getEntry(0)
         hit_pos = entry.getSurfacePoint(self.base.render)
         cam_pos = self.base.camera.getPos(self.base.render)
         if (hit_pos - cam_pos).length() > MAX_RANGE:
-            return None
-        return hit_pos
+            return None, None, None
+        zombie, hit_part = _find_zombie_and_part(entry)
+        return hit_pos, zombie, hit_part
 
     def _spawn_hit_marker(self, world_pos):
         marker = self.base.loader.loadModel("models/misc/sphere")

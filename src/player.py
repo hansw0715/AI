@@ -36,6 +36,11 @@ MAX_DT = 1.0 / 30.0
 GROUND_SCAN_HEIGHT = 200.0
 GROUND_EPSILON = 0.01
 
+# 체력 / 피격 비네트 -----------------------------------------------
+PLAYER_MAX_HP = 100
+DAMAGE_FLASH_PEAK_ALPHA = 0.55     # 비네트 최대 알파 (피격 직후)
+DAMAGE_FLASH_FADE_SEC = 0.8        # 비네트 1→0 페이드 시간
+
 # View bob — 걷기/달리기 시 카메라가 흔들리는 정도와 주기.
 # 주파수는 이전 다운 상태 유지 (사용자가 만족), 진폭은 키워서 흔들림이 더 보이게.
 WALK_BOB_AMPLITUDE_Z = 0.06
@@ -60,6 +65,9 @@ class PlayerController:
     def __init__(self, base):
         self.base = base
 
+        # 마우스 감도를 인스턴스 변수로 — 설정 메뉴에서 런타임에 변경 가능.
+        self.sensitivity = MOUSE_SENSITIVITY
+
         self.node = base.render.attachNewNode("player")
         self.node.setPos(SPAWN_POS)
 
@@ -80,6 +88,11 @@ class PlayerController:
         # View bob 상태
         self._bob_phase = 0.0
         self._bob_intensity = 0.0
+
+        # 체력 / 피격 비네트 — HUD 갱신은 HUD 생성 후에 zombie.take_damage에서 진행.
+        self.max_hp = PLAYER_MAX_HP
+        self.hp = self.max_hp
+        self._damage_flash_alpha = 0.0
 
         self.traverser = CollisionTraverser("player_traverser")
         self.ground_handler = CollisionHandlerQueue()
@@ -103,6 +116,10 @@ class PlayerController:
         self.base.win.requestProperties(props)
 
     def update(self, task):
+        # 일시정지 중에는 마우스룩/이동/중력/bob 모두 정지.
+        # _first_mouse 리셋은 resume 시 main._toggle_pause에서 처리.
+        if getattr(self.base, "paused", False):
+            return task.cont
         dt = _clock.getDt()
         if dt > MAX_DT:
             dt = MAX_DT
@@ -110,7 +127,24 @@ class PlayerController:
         self._update_movement(dt)
         self._update_gravity_and_ground(dt)
         self._update_view_bob(dt)
+        self._update_damage_flash(dt)
         return task.cont
+
+    def take_damage(self, amount, source=None):
+        """좀비 _enter_strike에서 호출됨. hp가 0 이하면 추가 데미지 무시 (게임오버는 다음 단계)."""
+        if self.hp <= 0:
+            return
+        self.hp = max(0, self.hp - amount)
+        self._damage_flash_alpha = DAMAGE_FLASH_PEAK_ALPHA
+        self.base.hud.set_player_hp(self.hp, self.max_hp)
+        self.base.hud.set_damage_flash(self._damage_flash_alpha)
+
+    def _update_damage_flash(self, dt):
+        if self._damage_flash_alpha <= 0.0:
+            return
+        fade_rate = DAMAGE_FLASH_PEAK_ALPHA / DAMAGE_FLASH_FADE_SEC
+        self._damage_flash_alpha = max(0.0, self._damage_flash_alpha - dt * fade_rate)
+        self.base.hud.set_damage_flash(self._damage_flash_alpha)
 
     def _query_ground_z(self):
         """플레이어 XY 위치 바로 아래의 지면 Z를 반환. 없으면 None."""
@@ -177,8 +211,8 @@ class PlayerController:
             return
         dx = x - cx
         dy = y - cy
-        self.yaw -= dx * MOUSE_SENSITIVITY
-        self.pitch -= dy * MOUSE_SENSITIVITY
+        self.yaw -= dx * self.sensitivity
+        self.pitch -= dy * self.sensitivity
         if self.pitch > 89.0:
             self.pitch = 89.0
         elif self.pitch < -89.0:
