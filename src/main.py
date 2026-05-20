@@ -87,9 +87,10 @@ class FPSGame(ShowBase):
         self.hud = HUD(self)
         self.pistol = Pistol(self)
 
-        # 좀비 추적 5마리.
+        # 10 웨이브 좀비. start_wave(1) 이 즉시 첫 웨이브 좀비를 스폰하고 HUD 갱신.
+        # 이후 웨이브 진행은 ZombieManager 가 자체 상태머신으로 처리.
         self.zombies = ZombieManager(self)
-        self.zombies.spawn_initial_wave()
+        self.zombies.start_wave(1)
 
         # 일시정지 + 설정 UI — 생성 직후 hide(). _toggle_pause가 show/hide.
         self.settings_menu = SettingsMenu(self)

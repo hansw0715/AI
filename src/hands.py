@@ -17,7 +17,7 @@ hand_root (NodePath) 원점 = 손목 위치.
     hand.np.setHpr(...)
 """
 
-from panda3d.core import Vec4
+from panda3d.core import TransparencyAttrib, Vec4
 
 
 HAND_COLOR = Vec4(0.75, 0.55, 0.45, 1)
@@ -31,6 +31,9 @@ class Hand:
         # 카메라 회전에 따라 directional light가 손을 어둡게 만드는 걸 막기 위해
         # 권총과 동일하게 라이팅을 끔. 자식들도 자동 상속.
         self.np.setLightOff()
+        # ADS 진입/해제 시 LerpColorScaleInterval 로 알파를 0↔1 페이드.
+        # 자식 setColor 의 alpha 와 colorScale alpha 가 곱해지므로 모두 영향.
+        self.np.setTransparency(TransparencyAttrib.MAlpha)
 
         # 주먹 — hand_root 원점 부근에 센터
         # scale 0.065 × 0.08 × 0.065 → 코너 origin이라 setPos를 절반씩 빼서 센터에 둠

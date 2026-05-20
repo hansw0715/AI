@@ -56,11 +56,11 @@ DAMAGE_FLASH_FADE_SEC = 0.8        # 비네트 1→0 페이드 시간
 
 # View bob — 걷기/달리기 시 카메라가 흔들리는 정도와 주기.
 # 주파수는 이전 다운 상태 유지 (사용자가 만족), 진폭은 키워서 흔들림이 더 보이게.
-WALK_BOB_AMPLITUDE_Z = 0.06
-WALK_BOB_AMPLITUDE_X = 0.035
+WALK_BOB_AMPLITUDE_Z = 0.025   # 0.06 → 0.025: 카메라 상하 흔들림 ~42%로
+WALK_BOB_AMPLITUDE_X = 0.015   # 0.035 → 0.015: 카메라 좌우 흔들림 ~43%로
 WALK_BOB_FREQUENCY = 2.8       # 5.5 → 2.8: 너무 잔망스러워서 사람 걸음 속도 (≈2~3 Hz)로
-RUN_BOB_AMPLITUDE_Z = 0.08
-RUN_BOB_AMPLITUDE_X = 0.05
+RUN_BOB_AMPLITUDE_Z = 0.035    # 0.08 → 0.035: 달리기 상하 ~44%로
+RUN_BOB_AMPLITUDE_X = 0.022    # 0.05 → 0.022: 달리기 좌우 ~44%로
 RUN_BOB_FREQUENCY = 4.0        # 7.0 → 4.0: 달리기 페이스에 맞춤
 BOB_BLEND_RATE = 8.0           # 보빙 fade in/out 속도
 

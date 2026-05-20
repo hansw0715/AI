@@ -1,27 +1,27 @@
-"""화면 HUD — 크로스헤어 + 탄약 + 체력 + 피격 비네트 + 헤드샷 데미지 숫자."""
+"""화면 HUD — 크로스헤어 + 탄약 + 체력 + 피격 비네트 + 웨이브 UI."""
 
 from direct.gui.OnscreenText import OnscreenText
-from panda3d.core import CardMaker, ClockObject, TextNode, TransparencyAttrib
+from panda3d.core import CardMaker, TextNode, TransparencyAttrib
 
-
-_clock = ClockObject.getGlobalClock()
 
 CROSSHAIR_SCALE = 0.07
 AMMO_SCALE = 0.07
 HP_SCALE = 0.07
 AMMO_COLOR = (1, 1, 1, 1)
 HP_COLOR = (1, 1, 1, 1)
-VIGNETTE_RGB = (0.6, 0.0, 0.0)     # 피격 비네트 색 (붉은색)
+VIGNETTE_RGB = (0.6, 0.0, 0.0)            # 피격 비네트 색 (붉은색)
 
-# 헤드샷 데미지 숫자 ---------------------------------------------
-HEADSHOT_TEXT_COLOR = (1.0, 0.95, 0.3, 1.0)   # 노란색
-HEADSHOT_TEXT_SCALE = 0.07
-HEADSHOT_TEXT_X = 0.0
-HEADSHOT_TEXT_Z = -0.08                       # 크로스헤어 바로 아래
-HEADSHOT_TEXT_HOLD_SEC = 0.35
-HEADSHOT_TEXT_FADE_SEC = 0.25
-HEADSHOT_TEXT_RISE = 0.05                     # 숫자가 떠오르는 거리
-_HEADSHOT_TASK_DT_CAP = 1.0 / 30.0
+# 웨이브 UI -------------------------------------------------------
+WAVE_LABEL_SCALE = 0.06
+WAVE_LABEL_COLOR = (1, 1, 1, 1)
+REMAINING_LABEL_SCALE = 0.05
+REMAINING_LABEL_COLOR = (0.9, 0.9, 0.9, 1)
+INTERMISSION_SCALE = 0.12
+INTERMISSION_COLOR = (1.0, 1.0, 0.6, 1)   # 밝은 노란빛 (카운트다운)
+VICTORY_SCALE = 0.20
+VICTORY_COLOR = (0.3, 1.0, 0.3, 1)        # 밝은 녹색
+# 화면 중앙 텍스트(aspect2d 기준 (0,0)=정중앙)를 크로스헤어와 겹치지 않게 살짝 위로.
+CENTER_TEXT_Z = 0.18
 
 
 class HUD:
@@ -73,6 +73,52 @@ class HUD:
         self.damage_vignette.setBin("background", 0)
         self.damage_vignette.hide()
 
+        # 상단 중앙 — 현재 웨이브 / 총 웨이브. 항상 보임.
+        # a2dTopCenter 의 (0,0) 은 화면 상단 가운데. Z 가 -면 아래쪽.
+        self.wave_text = OnscreenText(
+            text="Wave 0 / 0",
+            parent=base.a2dTopCenter,
+            pos=(0, -0.10),
+            scale=WAVE_LABEL_SCALE,
+            fg=WAVE_LABEL_COLOR,
+            align=TextNode.ACenter,
+            mayChange=True,
+        )
+
+        # 상단 중앙(웨이브 아래) — 남은 좀비 수. active 동안만 표시.
+        self.remaining_text = OnscreenText(
+            text="",
+            parent=base.a2dTopCenter,
+            pos=(0, -0.18),
+            scale=REMAINING_LABEL_SCALE,
+            fg=REMAINING_LABEL_COLOR,
+            align=TextNode.ACenter,
+            mayChange=True,
+        )
+        self.remaining_text.hide()
+
+        # 화면 중앙 — 인터미션 카운트다운. intermission 동안만 표시.
+        self.intermission_text = OnscreenText(
+            text="",
+            pos=(0, CENTER_TEXT_Z),
+            scale=INTERMISSION_SCALE,
+            fg=INTERMISSION_COLOR,
+            align=TextNode.ACenter,
+            mayChange=True,
+        )
+        self.intermission_text.hide()
+
+        # 화면 중앙 — 10웨이브 클리어 시 표시. 한 번 표시하면 그대로.
+        self.victory_text = OnscreenText(
+            text="VICTORY",
+            pos=(0, CENTER_TEXT_Z),
+            scale=VICTORY_SCALE,
+            fg=VICTORY_COLOR,
+            align=TextNode.ACenter,
+            mayChange=False,
+        )
+        self.victory_text.hide()
+
     def update_ammo(self, current, max_, reloading):
         if reloading:
             self.ammo_text.setText("Reloading...")
@@ -89,43 +135,26 @@ class HUD:
         else:
             self.damage_vignette.show()
 
-    def show_headshot_number(self, damage_value):
-        """크로스헤어 아래 "+{N}" 숫자가 0.35s 유지 → 0.25s 페이드 + 살짝 떠오름.
+    # ----- 웨이브 -----
+    def set_wave(self, current, total):
+        self.wave_text.setText(f"Wave {current} / {total}")
 
-        매번 새 OnscreenText 생성 → 페이드 끝나면 destroy.
-        동시 다발 헤드샷 시에도 각 인스턴스가 독립적으로 진행.
-        """
-        text = OnscreenText(
-            text=f"+{damage_value}",
-            pos=(HEADSHOT_TEXT_X, HEADSHOT_TEXT_Z),
-            scale=HEADSHOT_TEXT_SCALE,
-            fg=HEADSHOT_TEXT_COLOR,
-            align=TextNode.ACenter,
-            mayChange=True,
+    def set_remaining(self, count):
+        """남은 좀비 수 갱신. 0 이면 자동으로 숨김 (인터미션/클리어 시 호출자 별도 처리 불필요)."""
+        if count > 0:
+            self.remaining_text.setText(f"Zombies: {count}")
+            self.remaining_text.show()
+        else:
+            self.remaining_text.hide()
+
+    def show_intermission_countdown(self, seconds_left, next_wave):
+        self.intermission_text.setText(
+            f"Wave {next_wave} starting in {seconds_left}..."
         )
-        text.setTransparency(TransparencyAttrib.MAlpha)
+        self.intermission_text.show()
 
-        state = {"age": 0.0, "text": text}
-        task_name = f"headshot_text_{id(state)}"
-        total = HEADSHOT_TEXT_HOLD_SEC + HEADSHOT_TEXT_FADE_SEC
+    def hide_intermission(self):
+        self.intermission_text.hide()
 
-        def _update(task, _state=state, _total=total):
-            dt = min(_clock.getDt(), _HEADSHOT_TASK_DT_CAP)
-            _state["age"] += dt
-            age = _state["age"]
-            t = age / _total
-            new_z = HEADSHOT_TEXT_Z + HEADSHOT_TEXT_RISE * t
-            _state["text"].setPos(HEADSHOT_TEXT_X, new_z)
-            if age < HEADSHOT_TEXT_HOLD_SEC:
-                alpha = 1.0
-            elif age < _total:
-                alpha = 1.0 - (age - HEADSHOT_TEXT_HOLD_SEC) / HEADSHOT_TEXT_FADE_SEC
-            else:
-                alpha = 0.0
-            _state["text"].setAlphaScale(max(0.0, alpha))
-            if age >= _total:
-                _state["text"].destroy()
-                return task.done
-            return task.cont
-
-        self.base.taskMgr.add(_update, task_name)
+    def show_victory(self):
+        self.victory_text.show()

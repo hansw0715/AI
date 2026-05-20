@@ -22,20 +22,23 @@ _clock = ClockObject.getGlobalClock()
 # 부위 카테고리별 파라미터 ---------------------------------------
 # "arm"/"leg" 카테고리는 left_/right_ 두 부위가 공유.
 PARTICLE_COUNT = {"head": 18, "body": 10, "arm": 5, "leg": 5}
-PARTICLE_SIZE = {"head": 0.10, "body": 0.07, "arm": 0.05, "leg": 0.05}
+# 사이즈 약 절반으로 축소 — 큰 카드들이 화면을 덮어 둔탁해 보였음.
+PARTICLE_SIZE = {"head": 0.05, "body": 0.035, "arm": 0.025, "leg": 0.025}
 
 PARTICLE_COLOR_HEAD_PRIMARY = (1.0, 1.0, 1.0, 1.0)        # 흰색 플래시
 PARTICLE_COLOR_HEAD_SECONDARY = (0.7, 0.05, 0.05, 1.0)    # 진한 빨강
 PARTICLE_COLOR_BODY = (0.7, 0.05, 0.05, 1.0)
 PARTICLE_COLOR_LIMB = (0.5, 0.03, 0.03, 1.0)              # 어두운 빨강
 
+# 속도 약 2배 — 피격 시 더 강하게 튀는 임팩트.
 PARTICLE_SPEED_RANGE = {
-    "head": (2.5, 4.5),
-    "body": (1.5, 3.0),
-    "arm": (1.0, 2.0),
-    "leg": (1.0, 2.0),
+    "head": (5.0, 9.0),
+    "body": (3.5, 6.0),
+    "arm": (2.5, 4.5),
+    "leg": (2.5, 4.5),
 }
-PARTICLE_LIFETIME = {"head": 0.45, "body": 0.30, "arm": 0.25, "leg": 0.25}
+# 수명은 짧게 — 더 빠른 속도라 같은 lifetime 이면 너무 멀리 흩어짐.
+PARTICLE_LIFETIME = {"head": 0.35, "body": 0.22, "arm": 0.18, "leg": 0.18}
 PARTICLE_GRAVITY = 4.0      # m/s^2, -Z 방향. Panda3D Z-up.
 _MAX_DT = 1.0 / 30.0        # 첫 프레임 dt 폭주 시 파티클이 멀리 튀는 거 방지
 

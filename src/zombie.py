@@ -24,6 +24,7 @@
 """
 
 import math
+import random
 
 from direct.interval.IntervalGlobal import (
     Func,
@@ -146,6 +147,15 @@ HEALTHBAR_BG_COLOR = (0, 0, 0, 1)
 HEALTHBAR_FILL_COLOR = (0.9, 0.1, 0.1, 1)
 HEALTHBAR_HOLD_SEC = 2.5           # 마지막 피격 후 풀 알파 유지 시간
 HEALTHBAR_FADE_SEC = 1.0           # 페이드 아웃 길이
+
+# 웨이브 시스템 ----------------------------------------------------
+# 인덱스 i 가 (i+1) 번째 웨이브의 좀비 수. len = 총 웨이브 수.
+WAVE_COUNTS = [3, 5, 7, 9, 12, 15, 18, 22, 26, 30]
+WAVE_INTERMISSION_SEC = 3.0                  # 웨이브 종료 ~ 다음 웨이브 시작 텀
+WAVE_SPAWN_MIN_DIST_FROM_PLAYER = 6.0        # 스폰 위치는 플레이어로부터 최소 m
+WAVE_SPAWN_X_RANGE = (-11.0, 10.0)           # Ground 메시 X 범위
+WAVE_SPAWN_Y_RANGE = (-10.0, 11.0)           # Ground 메시 Y 범위
+WAVE_SPAWN_MAX_ATTEMPTS = 10                 # 거리 제약 만족 시도 횟수. 실패 시 마지막 후보 사용
 
 
 class Zombie:
@@ -517,9 +527,13 @@ class Zombie:
     # ---------- 피격 / 사망 ----------
 
     def take_damage(self, amount=1, hit_part=None):
-        """hit_part 가 DAMAGE_MULTIPLIER 키면 배율 적용, 아니면 amount 그대로."""
+        """hit_part 가 DAMAGE_MULTIPLIER 키면 배율 적용, 아니면 amount 그대로.
+
+        반환값: 실제로 적용된 final_damage (호출자가 데미지 숫자 UI 등에 사용).
+        이미 dying/dead 상태면 0 반환.
+        """
         if self.state != "alive":
-            return
+            return 0
         if hit_part is not None and hit_part in DAMAGE_MULTIPLIER:
             final_damage = int(round(amount * DAMAGE_MULTIPLIER[hit_part]))
         else:
@@ -538,6 +552,7 @@ class Zombie:
 
         if self.hp <= 0:
             self._start_death()
+        return final_damage
 
     def _flash_hit(self):
         # 연사로 hit 받을 때 색 복원이 먼저 발동해 깜빡이 끊기지 않도록 이전 task 제거.
@@ -617,9 +632,69 @@ class Zombie:
 
 
 class ZombieManager:
+    """10 웨이브 상태머신.
+
+    상태 전이:
+      idle → start_wave(1) → spawning → active
+      active → (모두 사망) → intermission → start_wave(n+1) → spawning → active ...
+      active (wave==마지막) → (모두 사망) → cleared (VICTORY 표시)
+
+    paused 호환: 인터미션 카운트다운은 별도 task/doMethodLater 가 아니라
+    update(dt) 안에서 dt 누적으로 진행 → main 의 paused 게이트가 그대로 작동.
+
+    `_on_zombie_removed` 는 좀비의 death Sequence Func 에서 호출됨 (사망 1.1s 후) →
+    페이드 종료 시점에 자연스럽게 다음 웨이브 텀이 시작됨.
+    """
+
     def __init__(self, game):
         self.game = game
         self.zombies = []
+        self.current_wave = 0                # 1-indexed. 0 은 게임 시작 전.
+        self.wave_state = "idle"             # idle/spawning/active/intermission/cleared
+        self.intermission_timer = 0.0
+        # 카운트다운 매초 갱신 — 같은 정수면 setText 안 부르고 패스.
+        self._last_countdown_int = None
+
+    # ---------- 웨이브 제어 ----------
+
+    def start_wave(self, n):
+        """n 번째 웨이브 시작 (1-indexed). 좀비를 한 번에 스폰 후 active 로 전이."""
+        if n < 1 or n > len(WAVE_COUNTS):
+            return
+        self.current_wave = n
+        self.wave_state = "spawning"
+        count = WAVE_COUNTS[n - 1]
+        for _ in range(count):
+            self.spawn(self._pick_spawn_position())
+        self.wave_state = "active"
+
+        hud = getattr(self.game, "hud", None)
+        if hud is not None:
+            hud.set_wave(self.current_wave, len(WAVE_COUNTS))
+            hud.set_remaining(len(self.zombies))
+            hud.hide_intermission()
+
+    def _pick_spawn_position(self):
+        """플레이어로부터 WAVE_SPAWN_MIN_DIST_FROM_PLAYER 이상 떨어진 랜덤 좌표.
+
+        WAVE_SPAWN_MAX_ATTEMPTS 안에 못 찾으면 마지막 후보 그대로 사용
+        (무한 루프 방지 — 실제 ground 면적 대비 제약이 느슨해 거의 즉시 통과).
+        """
+        player_pos = self.game.player.node.getPos(self.game.render)
+        last_candidate = Vec3(0, 0, 0)
+        for _ in range(WAVE_SPAWN_MAX_ATTEMPTS):
+            x = random.uniform(*WAVE_SPAWN_X_RANGE)
+            y = random.uniform(*WAVE_SPAWN_Y_RANGE)
+            candidate = Vec3(x, y, 0)
+            last_candidate = candidate
+            # 수평 거리만 비교 (좀비 발=Z0, 플레이어 발도 같은 평면).
+            dx = x - player_pos.x
+            dy = y - player_pos.y
+            if (dx * dx + dy * dy) >= WAVE_SPAWN_MIN_DIST_FROM_PLAYER ** 2:
+                return candidate
+        return last_candidate
+
+    # ---------- spawn / removal ----------
 
     def spawn(self, position):
         z = Zombie(self.game, position)
@@ -631,22 +706,52 @@ class ZombieManager:
     def _on_zombie_removed(self, zombie):
         if zombie in self.zombies:
             self.zombies.remove(zombie)
+        # active 동안 한 마리도 안 남으면 다음 웨이브 텀으로 전이.
+        # (spawning/intermission/cleared 에서는 무시 — 스폰 중엔 list 가 일시적으로 줄 수 없고,
+        #  intermission/cleared 에선 이미 active 가 아니라 추가 전이 없음.)
+        if self.wave_state == "active":
+            hud = getattr(self.game, "hud", None)
+            if hud is not None:
+                hud.set_remaining(len(self.zombies))
+            if not self.zombies:
+                self._enter_intermission()
 
-    def spawn_initial_wave(self):
-        """플레이어 스폰(0,0,2) 주변 4-10m에 5마리 배치.
+    def _enter_intermission(self):
+        if self.current_wave >= len(WAVE_COUNTS):
+            self._enter_cleared()
+            return
+        self.wave_state = "intermission"
+        self.intermission_timer = WAVE_INTERMISSION_SEC
+        self._last_countdown_int = None  # 첫 프레임에서 즉시 텍스트 한 번 갱신되게.
 
-        Ground 범위 X(-11~10), Y(-10~11) 안. Z=0 고정.
-        """
-        positions = [
-            Vec3( 4,  6, 0),
-            Vec3(-3,  7, 0),
-            Vec3( 6, -4, 0),
-            Vec3(-5, -5, 0),
-            Vec3( 0, 10, 0),
-        ]
-        for pos in positions:
-            self.spawn(pos)
+    def _enter_cleared(self):
+        self.wave_state = "cleared"
+        hud = getattr(self.game, "hud", None)
+        if hud is not None:
+            hud.set_remaining(0)
+            hud.hide_intermission()
+            hud.show_victory()
+
+    # ---------- 매 프레임 ----------
 
     def update(self, dt):
-        for z in self.zombies:
+        # 자식 zombie update — death Sequence Func 가 list 를 줄일 수 있으니
+        # snapshot 으로 안전하게 순회.
+        for z in list(self.zombies):
             z.update(dt)
+
+        if self.wave_state == "intermission":
+            self.intermission_timer -= dt
+            if self.intermission_timer <= 0.0:
+                # 다음 웨이브로. start_wave 가 intermission 을 hide 처리.
+                self.start_wave(self.current_wave + 1)
+            else:
+                # math.ceil 로 "3, 2, 1" 패턴 — 진입 직후 첫 1초는 "3" 표시.
+                seconds_left = int(math.ceil(self.intermission_timer))
+                if seconds_left != self._last_countdown_int:
+                    self._last_countdown_int = seconds_left
+                    hud = getattr(self.game, "hud", None)
+                    if hud is not None:
+                        hud.show_intermission_countdown(
+                            seconds_left, self.current_wave + 1
+                        )

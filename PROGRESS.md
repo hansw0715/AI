@@ -13,7 +13,8 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 | `src/zombie.py` | 좀비 — 사람형 모델, 추적 AI, 워킹/공격 애니메이션, 부위별 데미지, 체력바, 사망 시퀀스 |
 | `src/hands.py` | 손 모델 (주먹 + 팔뚝 + 소매 박스 조립) |
 | `src/effects.py` | 피격 파티클 (부위별 개수/색/속도) |
-| `src/ui.py` | HUD — 크로스헤어, 탄약, HP, 피격 비네트, 헤드샷 데미지 숫자 |
+| `src/damage_numbers.py` | 월드 공간 데미지 숫자 — 피격 위치에 빨간 숫자 떠올랐다 페이드 |
+| `src/ui.py` | HUD — 크로스헤어, 탄약, HP, 피격 비네트 |
 | `src/settings_menu.py` | Esc 일시정지 메뉴 — 마우스 감도 슬라이더, Resume/Quit |
 | `src/physics.py` | 충돌 마스크 상수 + 지면 ray 헬퍼 |
 
@@ -26,7 +27,7 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 - 중력 + 지면 충돌: CollisionRay 위쪽(local +Z 200)에서 아래로 발사. `dt`를 1/30초로 clamp해 첫 프레임 dt 폭주 시 터널링 방지. 스폰 직후 즉시 ground snap
 - **ADS (우클릭)**: camLens FOV를 70°→50°로 lerp(0.12s), 마우스 민감도 절반, 권총을 화면 중앙으로 이동. 재장전 중에는 무시
 - **체력 시스템**: max_hp=100. 좀비 strike에 맞으면 hp 감소 + 화면 붉은 비네트(alpha 0.55 → 0.8s 페이드)
-- **View bob**: 걷기/달리기 시 카메라를 위아래(sin) + 좌우(sin/2) 흔들기. 권총 anchor(`np_anchor`)에 정확히 반대 위상 적용해 권총은 월드에 정지, 화면 안에서는 배경과 함께 흔들리게(GUN_BOB_RATIO = -1.0)
+- **View bob**: 걷기/달리기 시 카메라를 위아래(sin) + 좌우(sin/2) 흔들기. 권총 anchor(`np_anchor`)에 정확히 반대 위상 적용해 권총은 월드에 정지, 화면 안에서는 배경과 함께 흔들리게(GUN_BOB_RATIO = -1.0). 진폭은 보행감만 살아나도록 완화 — WALK Z/X = 0.025/0.015, RUN Z/X = 0.035/0.022 (이전 0.06/0.035, 0.08/0.05 대비 ~42%)
 
 ### 권총 / 양손 (`src/weapons.py`)
 - 부품: 그립 + 프레임 + 슬라이드(anchor 노드) + 총신 + 탄창 + 머즐 플래시 + 오른손 + 왼손
@@ -40,7 +41,7 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
   - 헤드샷 시 크로스헤어 아래 `+15` 숫자 0.35s 표시 후 0.25s 페이드
   - 머즐 플래시 0.04s, 트레이서 0.05s (camera-local), 슬라이드 후퇴(40ms) + 권총 pitch +2° → 복귀
 - ADS 시 권총을 우측 hip(`PISTOL_REST_POS`)에서 화면 중앙(`ADS_GUN_POS`)으로 lerp. FOV lerp와 같은 0.12s
-- 보행 sway: 권총은 진폭 8%/팔은 42% (ADS 중). 평상시 100%. Shift 달리기 시 진폭 1.7배 + 주파수 1.5배. 정지/이동 전환은 지수 블렌드(SWAY_BLEND_RATE=8.0)
+- 보행 sway: 권총은 진폭 8%/팔은 42% (ADS 중). 평상시 100%. Shift 달리기 시 진폭 1.25배(이전 1.7배에서 완화) + 주파수 1.5배. 정지/이동 전환은 지수 블렌드(SWAY_BLEND_RATE=8.0). 기본 sway 변위는 GUN X/Z = 0.008/0.005, ARM P/R = 1.2°/0.6° — 이전(0.020/0.012, 3.0°/1.5°) 대비 약 40%로 축소해 조준선 안정
 - 탄창 12발, 쿨다운 0.2초
 - 재장전 (r): 2.0초 검사 자세 안무 — 권총을 카메라 안쪽으로 끌어와 위로 들고, 탄창 빠짐 → 새 탄창 → 슬라이드 당김. 왼손은 재장전 중 `wrtReparentTo(camera)`로 카메라 자식이 되어 권총 회전과 독립적으로 움직임, 종료 시 `_reset_left_hand`로 강제 복귀. ADS lerp/recoil과 충돌 방지를 위해 시작 시 finish 처리
 - 피격 중 재장전 인터럽트(`abort_reload`): Sequence finish + doMethodLater 취소 + 왼손 강제 복귀. ammo는 충전 안 함(패널티)
@@ -50,10 +51,16 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 - AI: chasing → windup(0.45s) → strike(0.15s) → recover(0.35s) → cooldown(0.8s) → chasing. ATTACK_RANGE=2.0m 안에 들어오면 멈추고 공격 모션. windup 진입 시 1회만 플레이어 쪽으로 회전(이후 안 따라감, 피하기 가능)
 - 워킹 애니메이션: sin 기반 절댓값 setHpr — 다리 좌우 18° + 왼다리 절뚝 bias 6°, 팔은 ARM_FORWARD_BASE_DEG=+90으로 앞을 향한 채 좌우/상하 흔들림, 몸통 sway 6°, 머리 12° 기울임 + 약한 떨림
 - 체력 30. 부위별 배율: head 1.5x(2발 처치), body 1.0x(3발), 팔다리 0.5x(6발). 부위별 CollisionSphere에 두 PythonTag("zombie", "hit_part") 부착
+- `take_damage(amount, hit_part)` 가 적용된 final_damage 를 반환 (이전엔 반환값 없음) → weapons.py 가 damage 숫자 UI 띄울 때 사용. DAMAGE_MULTIPLIER 는 zombie 내부에 캡슐화 유지
 - 체력바: 머리 위 빌보드 카드 2장(배경 + 채우기 pivot — setSx로 왼쪽 정렬 축소). 피격 후 2.5s 풀 알파 → 1.0s 페이드
 - 사망: 뒤로 90° 쓰러짐(0.5s) → 페이드(0.6s) → removeNode. 충돌 마스크/PythonTag 즉시 해제해 raycast가 시체 안 잡음
 - 매 프레임 hit-flash 색 복원 task가 연사 시 끊기지 않도록 이전 task 제거 후 재발급
-- `ZombieManager.spawn_initial_wave()` — 플레이어 스폰 주위 5마리
+- `ZombieManager` 10 웨이브 상태머신 — `idle → spawning → active → intermission → ... → cleared`
+  - 웨이브당 좀비 수: `WAVE_COUNTS = [3, 5, 7, 9, 12, 15, 18, 22, 26, 30]`
+  - 스폰 위치는 동적 생성 — Ground 범위(X -11~10, Y -10~11) 내 랜덤, 플레이어로부터 최소 6m, 시도 10회 후 마지막 후보 fallback
+  - 웨이브 종료 판정은 기존 `_on_zombie_removed` 콜백 재활용 — `active` 중 `len(self.zombies) == 0` 이면 인터미션 진입. 좀비 페이드(0.5+0.6=1.1s) 끝에 콜백이 호출되므로 자연스러운 텀
+  - 인터미션은 3초. 카운트다운은 `update(dt)` 안에서 dt 누적 → 일시정지 시 함께 멈춤 (별도 doMethodLater 안 씀)
+  - 마지막 웨이브(10) 클리어 시 `cleared` 상태 + VICTORY 표시. 그 후 종료/리스폰 UI 는 별도 작업
 
 ### 환경 (`src/main.py`)
 - Panda3D 기본 `models/environment` 사용
@@ -68,7 +75,17 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 - 우하단 탄약 카운터 `"12 / 12"`, 재장전 중엔 `"Reloading..."`
 - 좌하단 HP `"HP 100/100"`
 - 피격 비네트 — render2d 전체 카드, `setBin("background", 0)`으로 다른 UI 아래
-- 헤드샷 데미지 숫자 — 크로스헤어 아래 `+15` 노란색, 0.35s 유지 + 0.25s 페이드 + 살짝 위로 떠오름. 매 헤드샷마다 새 OnscreenText → 동시 다발 지원
+- 상단 중앙 `"Wave 3 / 10"` (항상) + `"Zombies: 7"` (active 동안만)
+- 화면 중앙 인터미션 카운트다운 `"Wave 4 starting in 3..."` (intermission 동안만, 매초 갱신)
+- 화면 중앙 `"VICTORY"` (10웨이브 클리어 시)
+
+### 월드 데미지 숫자 (`src/damage_numbers.py`)
+- 모든 좀비 피격마다 hit point 월드 위치에 final_damage 숫자가 잠깐 뜨고 위로 떠오르며 페이드. 헤드샷/일반/팔다리 모두 표시 (이전엔 헤드샷만 HUD 중앙에 떴음)
+- TextNode + `BillboardEffect.makePointEye()` 로 카메라를 항상 향함, `setLightOff(1)` 로 라이팅 무시 (체력바와 같은 패턴), `setTransparency(MAlpha)` + 매 프레임 task 로 페이드
+- 색/크기: 일반은 빨강 `(1.0, 0.2, 0.2)`, 헤드샷만 노란빛 빨강 `(1.0, 0.85, 0.2)` + 크기 1.3 배로 강조
+- 수명 0.7초 (HOLD 0.3 + FADE 0.4), 위로 0.8m 떠오름. spawn 시 X/Z 에 ±0.15m jitter → 연사 시 같은 좌표에 겹치는 문제 회피
+- task dt 는 effects.py 와 동일하게 `min(_clock.getDt(), 1/30)` 으로 클램프 — 첫 프레임 폭주 시 한 번에 끝까지 페이드되는 것 방지
+- weapons.py 호출: `final_damage = hit_zombie.take_damage(BASE_DAMAGE, hit_part=hit_part)` 반환값을 그대로 표시 — DAMAGE_MULTIPLIER 는 zombie 안에 캡슐화
 
 ### 일시정지 + 설정 (`src/settings_menu.py`)
 - Esc로 토글. paused 플래그가 True면 player/pistol/zombies update 모두 정지
@@ -88,8 +105,7 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 - **명중 hitmarker**: 좀비 맞췄을 때 크로스헤어 깜빡
 - **무기 교체 / 추가 무기** (소총, 산탄총 등)
 - **벽 충돌**: 현재 지면만 충돌. 벽은 통과됨
-- **좀비 wave 시스템**: 초기 5마리 다 처치하면 다음 wave 자동 스폰
-- **게임오버 / 리스폰 UI**: hp=0 시점 처리
+- **게임오버 / 리스폰 UI**: hp=0 시점 처리. 10웨이브 클리어 후 VICTORY → 재시작 흐름도 같이
 - **환경 복원**: 나무/대나무/바위/잎/실린더 다시 추가 (현재 시인성 위해 Ground만 남김)
 - Bullet 물리 도입은 적/투사체 단계에서 검토 예정
 
@@ -108,16 +124,29 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 | `src/player.py` | `JUMP_VELOCITY` | `7.5` | |
 | `src/player.py` | `GRAVITY` | `20.0` | m/s² |
 | `src/weapons.py` | `PISTOL_REST_POS` | `(0.25, 0.9, -0.12)` | 우측 hip |
-| `src/weapons.py` | `ADS_GUN_POS` | `(0.0, 0.85, -0.10)` | 화면 중앙 |
+| `src/weapons.py` | `ADS_GUN_POS` | `(-0.0195, 0.85, -0.013)` | 머즐 플래시 X/Z 가 카메라 광축과 정렬 |
 | `src/weapons.py` | `MAG_SIZE` | `12` | |
 | `src/weapons.py` | `COOLDOWN` | `0.2` | 초 |
 | `src/weapons.py` | `RELOAD_TIME` | `2.0` | 초 |
 | `src/weapons.py` | `MAX_RANGE` | `100.0` | m |
 | `src/weapons.py` | `BASE_DAMAGE` | `10` | head=15 / body=10 / limb=5 |
+| `src/weapons.py` | `RUN_AMPLITUDE_MULT` / `RUN_FREQ_MULT` | `1.25` / `1.5` | 달리기 진폭/주파수 |
+| `src/weapons.py` | `GUN_SWAY_X_SCALE` / `GUN_SWAY_Z_SCALE` | `0.008` / `0.005` | 권총 sway 최대 변위 (m) |
+| `src/weapons.py` | `ARM_SWAY_P_DEG` / `ARM_SWAY_R_DEG` | `1.2` / `0.6` | 팔 sway 최대 (도) |
+| `src/player.py` | `WALK_BOB_AMPLITUDE_Z` / `_X` | `0.025` / `0.015` | 카메라 보빙 (m) |
+| `src/player.py` | `RUN_BOB_AMPLITUDE_Z` / `_X` | `0.035` / `0.022` | 달리기 보빙 (m) |
 | `src/zombie.py` | `WALK_SPEED` | `1.2` | m/s |
 | `src/zombie.py` | `ATTACK_RANGE` / `ATTACK_HIT_RANGE` | `2.0` / `2.2` | m |
 | `src/zombie.py` | `ATTACK_DAMAGE` | `10` | |
 | `src/zombie.py` | `MAX_HP` | `30` | |
+| `src/zombie.py` | `WAVE_COUNTS` | `[3,5,7,9,12,15,18,22,26,30]` | 웨이브당 좀비 수 (인덱스+1 = 웨이브 번호) |
+| `src/zombie.py` | `WAVE_INTERMISSION_SEC` | `3.0` | 웨이브 종료 ~ 다음 웨이브 시작 텀 (초) |
+| `src/zombie.py` | `WAVE_SPAWN_MIN_DIST_FROM_PLAYER` | `6.0` | 좀비 스폰 시 플레이어 최소 거리 (m) |
+| `src/zombie.py` | `WAVE_SPAWN_X_RANGE` / `_Y_RANGE` | `(-11,10)` / `(-10,11)` | Ground 메시 안 좌표 범위 |
+| `src/damage_numbers.py` | `DAMAGE_TEXT_HOLD_SEC` / `_FADE_SEC` | `0.3` / `0.4` | 풀 알파 / 페이드 (초) |
+| `src/damage_numbers.py` | `DAMAGE_TEXT_RISE` | `0.8` | 수명 동안 위로 떠오르는 거리 (m) |
+| `src/damage_numbers.py` | `DAMAGE_TEXT_SCALE` / `HEADSHOT_SCALE_MULT` | `0.6` / `1.3` | 기본 크기 / 헤드샷 배수 |
+| `src/damage_numbers.py` | `DAMAGE_TEXT_JITTER` | `0.15` | spawn 시 X/Z ± 오프셋 (m) |
 
 ## 해결됐던 함정들 (재발 방지 메모)
 
@@ -140,3 +169,4 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 - **AmbientLight 영향으로 체력바 어두워짐**: 빌보드 카드에 `setLightOff(1)` (priority=1로 부모 setLight override)
 - **재장전 중 ADS 진입 시 권총 점프**: ADS lerp가 reload Sequence의 마지막 keyframe과 다른 노드 값으로 종료 → reload 중 ADS 무시(`set_ads`에서 early return)
 - **공격 도중 좀비 사망 시 어깨 각도 박제**: `_start_death`에서 `arm_right_pivot.setHpr(0, REST_PITCH, 0)`으로 명시적 리셋
+- **ADS 머즐 ↔ 크로스헤어 X/Z 어긋남**: pistol-local 에서 barrel/머즐 플래시가 `(0.0195, *, 0.013)` 만큼 그립 우상단으로 오프셋되어 있어서, `ADS_GUN_POS.x/z` 를 0 으로 두면 화면 중앙에 와도 총구는 크로스헤어 오른쪽-아래에 놓인다. `ADS_GUN_POS = Vec3(-0.0195, 0.85, -0.013)` 로 barrel offset 만큼 음수 보정해 머즐이 카메라 광축에 정확히 오게 함 (raycast 는 카메라 정면이라 명중에는 영향 없음, 순수 시각 정렬)
