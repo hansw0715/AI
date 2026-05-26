@@ -1,8 +1,8 @@
-"""피격 파티클 — 좀비 부위 hit 시 hit point에서 사방으로 퍼지는 작은 카드들.
+"""파티클 효과 — 피격(`spawn_hit_particles`) + 흙 분출(`spawn_dirt_burst`).
 
 부위별로 개수/크기/색/속도/수명이 다름.
 실제 Panda3D ParticleEffect 안 씀 — CardMaker + 매 프레임 task로 단순 시뮬레이션
-(설정 파일 .ptf 부담 회피).
+(설정 파일 .ptf 부담 회피). 두 헬퍼는 같은 task-loop 패턴을 공유.
 """
 
 import math
@@ -119,6 +119,87 @@ def spawn_hit_particles(base, world_pos, hit_part):
             # 중력
             p["velocity"].z -= PARTICLE_GRAVITY * dt
             # 수명 후반(50%)부터 알파 페이드.
+            t = p["age"] / _lifetime
+            if t > 0.5:
+                p["np"].setAlphaScale(max(0.0, 1.0 - (t - 0.5) * 2.0))
+        if all_dead:
+            return task.done
+        return task.cont
+
+    base.taskMgr.add(_update, task_name)
+
+
+# 흙 파티클 (좀비 등장 연출용) ----------------------------------
+# 좀비가 땅을 파고 올라올 때 분출되는 갈색 흙. 피격 파티클과 같은 task-loop /
+# 빌보드 / 중력 / 알파 페이드 패턴이지만 다음이 다름:
+#   - 색: 갈색 그라데이션 3 종 무작위
+#   - 속도 분포: 위쪽(+Z) 으로 편향 (구 균등 분포 X)
+#   - 카드 크기 약간 큼 (흙덩이 느낌)
+DIRT_COLORS = (
+    (0.35, 0.22, 0.12, 1.0),
+    (0.25, 0.15, 0.08, 1.0),
+    (0.45, 0.30, 0.18, 1.0),
+)
+DIRT_PARTICLE_COUNT_BASE = 14         # intensity=1.0 기준 개수
+DIRT_PARTICLE_SIZE = 0.06
+DIRT_SPEED_RANGE = (2.5, 5.5)
+DIRT_LIFETIME = 0.55
+DIRT_GRAVITY = 8.0                    # 흙은 더 빨리 떨어짐
+
+
+def _random_upward_direction():
+    """위쪽(+Z) 편향 단위 벡터 — 흙이 사방이 아니라 주로 분수형으로 튀어 오르도록.
+
+    수평 각도는 균등, 수직 각도(z) 는 [0.3, 0.95] 로 양수 편향. 약간의 옆 퍼짐 허용.
+    """
+    theta = random.uniform(0.0, 2.0 * math.pi)
+    z = random.uniform(0.3, 0.95)
+    horizontal = math.sqrt(max(0.0, 1.0 - z * z))
+    return Vec3(horizontal * math.cos(theta), horizontal * math.sin(theta), z)
+
+
+def spawn_dirt_burst(base, world_pos, intensity=1.0):
+    """world_pos 에서 위쪽으로 분수처럼 흙이 튀어 오르는 파티클 분출.
+
+    intensity 는 개수 스칼라 — emerging 중 지속 분출은 작게(0.3~0.5), 텔레그래프
+    시작 시 큰 한 방은 1.0 으로 호출.
+    """
+    count = max(1, int(round(DIRT_PARTICLE_COUNT_BASE * intensity)))
+    size = DIRT_PARTICLE_SIZE
+    speed_min, speed_max = DIRT_SPEED_RANGE
+    lifetime = DIRT_LIFETIME
+
+    particles = []
+    for i in range(count):
+        cm = CardMaker(f"dirt_particle_{i}")
+        cm.setFrame(-size / 2, size / 2, -size / 2, size / 2)
+        p_np = base.render.attachNewNode(cm.generate())
+        p_np.setPos(world_pos)
+        p_np.setEffect(BillboardEffect.makePointEye())
+        p_np.setTransparency(TransparencyAttrib.MAlpha)
+        p_np.setLightOff(1)
+        p_np.setColor(*random.choice(DIRT_COLORS))
+
+        direction = _random_upward_direction()
+        speed = random.uniform(speed_min, speed_max)
+        velocity = direction * speed
+        particles.append({"np": p_np, "velocity": velocity, "age": 0.0})
+
+    task_name = f"dirt_particles_{id(particles)}"
+
+    def _update(task, _particles=particles, _lifetime=lifetime):
+        dt = min(_clock.getDt(), _MAX_DT)
+        all_dead = True
+        for p in _particles:
+            if p["np"].isEmpty():
+                continue
+            p["age"] += dt
+            if p["age"] >= _lifetime:
+                p["np"].removeNode()
+                continue
+            all_dead = False
+            p["np"].setPos(p["np"].getPos() + p["velocity"] * dt)
+            p["velocity"].z -= DIRT_GRAVITY * dt
             t = p["age"] / _lifetime
             if t > 0.5:
                 p["np"].setAlphaScale(max(0.0, 1.0 - (t - 0.5) * 2.0))

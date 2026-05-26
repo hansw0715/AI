@@ -80,6 +80,9 @@ class PlayerController:
 
         # 마우스 감도를 인스턴스 변수로 — 설정 메뉴에서 런타임에 변경 가능.
         self.sensitivity = MOUSE_SENSITIVITY
+        # 보행 속도도 인스턴스로 — 레벨업 "이동 속도" 특성이 런타임 곱연산 적용.
+        # 모듈 상수 WALK_SPEED 는 초기값 source 로만 남음.
+        self.walk_speed = WALK_SPEED
 
         # ADS 상태 — set_ads(True/False)로 토글. 매 프레임 _update_ads_fov가
         # ads_current_fov를 ads_target_fov로 ADS_LERP_TIME에 맞춰 보간.
@@ -96,7 +99,8 @@ class PlayerController:
         base.camera.setHpr(0, 0, 0)
 
         base.disableMouse()
-        self._capture_mouse()
+        # 마우스 캡처는 시작 화면에서 Start 클릭 시 main._begin_game 가 호출.
+        # 부팅 직후엔 커서가 보여서 메뉴 버튼이 클릭 가능해야 함.
 
         self.yaw = 0.0
         self.pitch = 0.0
@@ -141,10 +145,14 @@ class PlayerController:
         self.base.win.requestProperties(props)
 
     def update(self, task):
-        # 일시정지 중에는 마우스룩/이동/중력/bob 모두 정지.
-        # _first_mouse 리셋은 resume 시 main._toggle_pause에서 처리.
-        # ADS FOV 는 일시정지여도 진행 — 멈추면 메뉴 들어갈 때 FOV 가 어색하게 박제됨.
-        if getattr(self.base, "paused", False):
+        # 일시정지/시작화면/레벨업 카드 중에는 마우스룩/이동/중력/bob 모두 정지.
+        # _first_mouse 리셋은 resume 시 main._toggle_pause / _begin_game / LevelUpScreen
+        # 카드 클릭 콜백에서 처리.
+        # ADS FOV 는 그래도 진행 — 멈추면 메뉴 들어갈 때 FOV 가 어색하게 박제됨.
+        # `started` 는 시작 화면이 떠 있을 때만 False. 기본값 True 로 fallback (테스트 호환).
+        if (not getattr(self.base, "started", True)
+                or getattr(self.base, "paused", False)
+                or getattr(self.base, "level_up_active", False)):
             self._update_ads_fov(_clock.getDt())
             return task.cont
         dt = _clock.getDt()
@@ -323,7 +331,7 @@ class PlayerController:
 
         local = Vec3(strafe, forward, 0)
         local.normalize()
-        speed = WALK_SPEED * (RUN_MULTIPLIER if keys["shift"] else 1.0)
+        speed = self.walk_speed * (RUN_MULTIPLIER if keys["shift"] else 1.0)
 
         move = self.node.getQuat(self.base.render).xform(local) * (speed * dt)
         move.z = 0

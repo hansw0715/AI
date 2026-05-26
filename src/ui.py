@@ -23,6 +23,17 @@ VICTORY_COLOR = (0.3, 1.0, 0.3, 1)        # 밝은 녹색
 # 화면 중앙 텍스트(aspect2d 기준 (0,0)=정중앙)를 크로스헤어와 겹치지 않게 살짝 위로.
 CENTER_TEXT_Z = 0.18
 
+# XP 바 -----------------------------------------------------------
+# Vampire Survivors 스타일 — 화면 최상단을 가로지르는 얇은 노란색 바.
+# render2d 좌표계: X = -1..+1 (전체 너비), Z = -1..+1 (전체 높이).
+# 바를 render2d 에 부착해 화면비 무관하게 화면 전폭(width 2.0) 으로 펼침.
+XP_BAR_HEIGHT = 0.015      # render2d 단위 — 화면 상단 1.5% 높이
+XP_BAR_Z_TOP = 1.0         # 화면 최상단
+XP_BAR_BG_COLOR = (0.15, 0.15, 0.15, 0.85)
+XP_BAR_FILL_COLOR = (1.0, 0.85, 0.2, 1)   # 황금빛 노란색
+XP_LEVEL_TEXT_SCALE = 0.05
+XP_LEVEL_TEXT_COLOR = (1.0, 0.85, 0.2, 1)
+
 
 class HUD:
     def __init__(self, base):
@@ -119,6 +130,42 @@ class HUD:
         )
         self.victory_text.hide()
 
+        # XP 바 (render2d 부착, 화면 전폭). 배경 카드 + 채우기 pivot 패턴 —
+        # 좀비 체력바와 동일하게 pivot 의 setSx 만 변경하면 왼쪽 정렬로 폭이 줄어듦.
+        # render2d X = -1..+1 → 바 너비 2.0 (화면 전폭).
+        xp_bg_cm = CardMaker("xp_bar_bg")
+        xp_bg_cm.setFrame(-1.0, 1.0, XP_BAR_Z_TOP - XP_BAR_HEIGHT, XP_BAR_Z_TOP)
+        self.xp_bar_bg = base.render2d.attachNewNode(xp_bg_cm.generate())
+        self.xp_bar_bg.setTransparency(TransparencyAttrib.MAlpha)
+        self.xp_bar_bg.setColor(*XP_BAR_BG_COLOR)
+
+        # 채우기 pivot — 원점을 바 왼쪽 끝 (X = -1) 으로.
+        # 이후 pivot.setSx(ratio) 만 호출하면 왼쪽 끝 고정으로 폭이 변함.
+        self.xp_bar_fill_pivot = base.render2d.attachNewNode("xp_bar_fill_pivot")
+        self.xp_bar_fill_pivot.setX(-1.0)
+
+        # 채우기 카드 — pivot 원점에서 +X 방향으로 2.0 (화면 전폭).
+        xp_fill_cm = CardMaker("xp_bar_fill")
+        xp_fill_cm.setFrame(0.0, 2.0, XP_BAR_Z_TOP - XP_BAR_HEIGHT, XP_BAR_Z_TOP)
+        self.xp_bar_fill = self.xp_bar_fill_pivot.attachNewNode(xp_fill_cm.generate())
+        self.xp_bar_fill.setColor(*XP_BAR_FILL_COLOR)
+
+        # 초기 폭 0 — set_xp 호출 시 갱신. setSx(0) 은 singular matrix 경고가 뜨므로
+        # 좀비 체력바와 같은 패턴으로 0.001 클램프.
+        self.xp_bar_fill_pivot.setSx(0.001)
+
+        # Lv 텍스트 — XP 바 바로 아래 좌측. 가독성 위해 a2dTopLeft 부모.
+        # a2dTopLeft (0,0) = 화면 좌상단 코너. X 양수 = 안쪽, Z 음수 = 아래.
+        self.xp_level_text = OnscreenText(
+            text="Lv 1",
+            parent=base.a2dTopLeft,
+            pos=(0.04, -0.06),
+            scale=XP_LEVEL_TEXT_SCALE,
+            fg=XP_LEVEL_TEXT_COLOR,
+            align=TextNode.ALeft,
+            mayChange=True,
+        )
+
     def update_ammo(self, current, max_, reloading):
         if reloading:
             self.ammo_text.setText("Reloading...")
@@ -158,3 +205,39 @@ class HUD:
 
     def show_victory(self):
         self.victory_text.show()
+
+    # ----- XP / 레벨 -----
+    def set_xp(self, level, xp, xp_to_next_):
+        """XP 바 폭과 Lv 텍스트 동시 갱신. xp_to_next_ 가 0 이면 가득 채움."""
+        if xp_to_next_ <= 0:
+            ratio = 1.0
+        else:
+            ratio = max(0.001, min(1.0, xp / xp_to_next_))
+        self.xp_bar_fill_pivot.setSx(ratio)
+        self.xp_level_text.setText(f"Lv {level}")
+
+    # ----- 시작 화면 동안 HUD 전체 토글 -----
+    def hide_gameplay(self):
+        """시작 화면이 떠 있는 동안 모든 게임플레이 UI 숨김. 월드만 배경처럼 보이게."""
+        self.crosshair.hide()
+        self.ammo_text.hide()
+        self.hp_text.hide()
+        self.wave_text.hide()
+        self.remaining_text.hide()
+        self.intermission_text.hide()
+        self.victory_text.hide()
+        self.damage_vignette.hide()
+        self.xp_bar_bg.hide()
+        self.xp_bar_fill_pivot.hide()
+        self.xp_level_text.hide()
+
+    def show_gameplay(self):
+        """게임 시작 시 호출. 항상 보여야 하는 요소만 다시 표시 —
+        remaining/intermission/victory 는 ZombieManager 가 상태에 따라 show 함."""
+        self.crosshair.show()
+        self.ammo_text.show()
+        self.hp_text.show()
+        self.wave_text.show()
+        self.xp_bar_bg.show()
+        self.xp_bar_fill_pivot.show()
+        self.xp_level_text.show()

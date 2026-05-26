@@ -46,6 +46,8 @@ from panda3d.core import (
     Vec3,
 )
 
+from .effects import spawn_dirt_burst
+from .level_up import ZOMBIE_XP_REWARD
 from .physics import ZOMBIE_MASK
 
 
@@ -148,6 +150,31 @@ HEALTHBAR_FILL_COLOR = (0.9, 0.1, 0.1, 1)
 HEALTHBAR_HOLD_SEC = 2.5           # 마지막 피격 후 풀 알파 유지 시간
 HEALTHBAR_FADE_SEC = 1.0           # 페이드 아웃 길이
 
+# 등장 연출 (땅 파고 올라오기) ------------------------------------
+# 상태 흐름: waiting → telegraph → emerging → alive → dying → dead.
+# 모든 단계 타이머는 update(dt) 에서 누적 — doMethodLater / Sequence 안 씀
+# (일시정지/레벨업 카드 동안 흘러가는 버그 방지).
+TELEGRAPH_SEC = 1.2          # 흙더미만 보이는 경고 시간
+EMERGE_SEC = 1.5             # 좀비 root 가 지하→지상 lerp 하는 시간
+EMERGE_BURIED_Z = -1.9       # waiting/telegraph 동안 root Z (좀비 키 1.75m + 여유)
+EMERGE_GROUND_Z = 0.0        # emerging 종료 시 root Z (= 평소 위치)
+SPAWN_STAGGER_MAX_SEC = 1.5  # 같은 웨이브 내 스폰 간 무작위 지연 최댓값
+
+# 흙더미 카드 (telegraph 동안 ground 평면에 깔리는 갈색 카드).
+DIRT_MOUND_HALF_SIZE = 0.7         # 1.4m × 1.4m
+DIRT_MOUND_Z = 0.01                # 바닥 위 1cm — Z-fighting 방지
+DIRT_MOUND_COLOR = (0.25, 0.15, 0.08, 1)
+
+# emerging 중 지속 흙 분출 간격 — 지나치게 잦으면 파티클이 화면을 채움.
+EMERGE_DIRT_PERIOD = 0.15
+EMERGE_DIRT_INTENSITY = 0.35       # 지속 분출 1 회당 개수 배율
+
+# emerging 중 양팔을 위로 뻗은 자세 (왼쪽/오른쪽 대칭).
+# ARM_FORWARD_BASE_DEG=+90(앞) 기준에서 P 를 작게 하면 팔이 위로 향함.
+EMERGE_ARM_LEFT_HPR = (0, -30, 20)
+EMERGE_ARM_RIGHT_HPR = (0, -30, -20)
+
+
 # 웨이브 시스템 ----------------------------------------------------
 # 인덱스 i 가 (i+1) 번째 웨이브의 좀비 수. len = 총 웨이브 수.
 WAVE_COUNTS = [3, 5, 7, 9, 12, 15, 18, 22, 26, 30]
@@ -166,8 +193,11 @@ class Zombie:
         self.game = game
         self.base = game
         self.hp = Zombie.MAX_HP
-        # state: "alive" → "dying" (쓰러짐 + 페이드 진행 중) → "dead" (제거됨).
-        self.state = "alive"
+        # state: "waiting"(스폰 직후 지연) → "telegraph"(흙더미만) →
+        #        "emerging"(root Z 솟아오름) → "alive" → "dying" → "dead".
+        # 매 단계 진입/유지/종료 헬퍼는 _enter_*/_update_* 로 분리. attack_state 와
+        # 별개 — 한 변수에 섞지 않음.
+        self.state = "waiting"
         # 공격 서브 상태머신 (alive 안에서만 의미 있음).
         # "chasing" → "windup" → "strike" → "recover" → "chasing"...
         self.attack_state = "chasing"
@@ -180,13 +210,27 @@ class Zombie:
         self._moving = False
         self._walk_time = 0.0
 
+        # 등장 연출 타이머 + 자원.
+        # spawn_delay: 같은 웨이브 N 마리가 한꺼번에 솟지 않도록 무작위 staggering.
+        self.spawn_delay = random.uniform(0.0, SPAWN_STAGGER_MAX_SEC)
+        self.emerge_timer = 0.0
+        self.telegraph_timer = 0.0
+        self.emerge_dirt_timer = 0.0
+        self.dirt_mound = None        # _enter_telegraph 가 생성, _enter_alive 가 제거.
+        # XY 는 _pick_spawn_position 결과 그대로, Z 는 지하로 묻어 시작 — waiting 동안
+        # 화면에 안 보이고, emerging 끝에 EMERGE_GROUND_Z 로 솟아오름.
+        self._spawn_xy = position
+
         self.np = game.render.attachNewNode("zombie_root")
-        self.np.setPos(position)
+        self.np.setPos(position.x, position.y, EMERGE_BURIED_Z)
 
         self._build_model()
         self._setup_pivots()
         self._setup_hit_parts()
         self._create_healthbar()
+        # waiting/telegraph 동안 raycast 가 묻혀 있는 좀비를 잡지 않도록 hit 마스크 무력화.
+        # _enter_emerging 이 복원. 안전망 — 묻혀 있어도 ground 메시가 먼저 hit 되긴 함.
+        self._set_hit_parts_active(False)
 
     # ---------- 모델 빌드 ----------
 
@@ -294,6 +338,109 @@ class Zombie:
             cn_np.setPythonTag("hit_part", part_name)
             self.hit_part_nodes[part_name] = cn_np
 
+    def _set_hit_parts_active(self, active):
+        """waiting/telegraph 동안엔 hit_part 마스크 비활성, emerging/alive 진입 시 복원.
+
+        _start_death 는 별도 경로(마스크 + PythonTag 둘 다 영구 해제)라 여기서 다루지 않음.
+        """
+        mask = ZOMBIE_MASK if active else BitMask32.allOff()
+        for cn_np in self.hit_part_nodes.values():
+            cn_np.node().setIntoCollideMask(mask)
+
+    # ---------- 등장 연출 (땅 파고 올라오기) ----------
+
+    def _enter_telegraph(self):
+        """waiting → telegraph: 흙더미 카드 생성 + 큰 흙 분출 1 회."""
+        self.state = "telegraph"
+        self.telegraph_timer = 0.0
+        # 흙더미 카드 — render 자식(좀비 root 아님)이라 좀비가 솟을 때 같이 움직이지 않음.
+        cm = CardMaker("dirt_mound")
+        cm.setFrame(
+            -DIRT_MOUND_HALF_SIZE, DIRT_MOUND_HALF_SIZE,
+            -DIRT_MOUND_HALF_SIZE, DIRT_MOUND_HALF_SIZE,
+        )
+        self.dirt_mound = self.game.render.attachNewNode(cm.generate())
+        # 카드의 +Y 가 위쪽을 향하도록 -90° pitch — 바닥에 평평하게 깔림.
+        self.dirt_mound.setHpr(0, -90, 0)
+        self.dirt_mound.setPos(self._spawn_xy.x, self._spawn_xy.y, DIRT_MOUND_Z)
+        self.dirt_mound.setColor(*DIRT_MOUND_COLOR)
+        self.dirt_mound.setTransparency(TransparencyAttrib.MAlpha)
+        # 씬 라이팅이 거의 검은색으로 만들지 않게 priority=1 로 light off.
+        self.dirt_mound.setLightOff(1)
+        # 첫 텔레그래프 시점에 큰 흙 분수 1 회.
+        spawn_dirt_burst(
+            self.base,
+            Vec3(self._spawn_xy.x, self._spawn_xy.y, DIRT_MOUND_Z + 0.05),
+            intensity=1.0,
+        )
+
+    def _update_waiting(self, dt):
+        self.spawn_delay -= dt
+        if self.spawn_delay <= 0.0:
+            self._enter_telegraph()
+
+    def _update_telegraph(self, dt):
+        self.telegraph_timer += dt
+        if self.telegraph_timer >= TELEGRAPH_SEC:
+            self._enter_emerging()
+
+    def _enter_emerging(self):
+        """telegraph → emerging: hit 마스크 복원, 팔 위로, 흙 분수 1 회, 지속 분출 타이머 시작."""
+        self.state = "emerging"
+        self.emerge_timer = 0.0
+        self.emerge_dirt_timer = 0.0
+        # hit 마스크 복원 — 머리/상체가 솟아오르는 순간부터 raycast 명중 가능.
+        # 단 ground 메시가 더 가까이 있는 동안엔 자연스럽게 보호됨 (raycast 가 더 가까운 hit 채택).
+        self._set_hit_parts_active(True)
+        # 양팔 위로 뻗은 자세 — 워킹 anim 은 emerging 동안 건너뛰므로 setHpr 가 박제됨.
+        self.arm_left_pivot.setHpr(*EMERGE_ARM_LEFT_HPR)
+        self.arm_right_pivot.setHpr(*EMERGE_ARM_RIGHT_HPR)
+        # emerging 시작 시 한 번 더 큰 분수.
+        spawn_dirt_burst(
+            self.base,
+            Vec3(self._spawn_xy.x, self._spawn_xy.y, DIRT_MOUND_Z + 0.05),
+            intensity=1.0,
+        )
+
+    def _update_emerging(self, dt):
+        """root Z 를 ease-out 으로 BURIED → GROUND. 흙더미 알파는 동기 페이드.
+
+        ease-out: 1 - (1 - t)^2. 처음엔 빠르게 솟다가 마지막에 천천히 안착.
+        """
+        self.emerge_timer += dt
+        t = min(1.0, self.emerge_timer / EMERGE_SEC)
+        eased = 1.0 - (1.0 - t) * (1.0 - t)
+        z = EMERGE_BURIED_Z + (EMERGE_GROUND_Z - EMERGE_BURIED_Z) * eased
+        self.np.setZ(z)
+        if self.dirt_mound is not None and not self.dirt_mound.isEmpty():
+            # 흙더미는 emerging 진행과 함께 사라짐. 한꺼번에 0 으로 떨어지지 않게
+            # 후반(t > 0.3) 부터 페이드 시작.
+            if t > 0.3:
+                self.dirt_mound.setAlphaScale(max(0.0, 1.0 - (t - 0.3) / 0.7))
+        # 지속 흙 분출 — 0.15s 간격, root 위치 + 살짝 위에서.
+        self.emerge_dirt_timer -= dt
+        if self.emerge_dirt_timer <= 0.0:
+            self.emerge_dirt_timer = EMERGE_DIRT_PERIOD
+            spawn_dirt_burst(
+                self.base,
+                Vec3(self._spawn_xy.x, self._spawn_xy.y, DIRT_MOUND_Z + 0.2),
+                intensity=EMERGE_DIRT_INTENSITY,
+            )
+        if t >= 1.0:
+            self._enter_alive()
+
+    def _enter_alive(self):
+        """emerging → alive: 흙더미 제거, 팔 자세 복원, 정상 추적/공격 로직 활성."""
+        self.state = "alive"
+        # 정확한 지상 Z 로 스냅 — float 누적 오차 방지.
+        self.np.setZ(EMERGE_GROUND_Z)
+        if self.dirt_mound is not None and not self.dirt_mound.isEmpty():
+            self.dirt_mound.removeNode()
+        self.dirt_mound = None
+        # 팔 자세 복원 — 워킹 anim 의 매 프레임 setHpr 가 다시 자연스럽게 흔들기 시작.
+        self.arm_left_pivot.setHpr(0, ARM_FORWARD_BASE_DEG, 0)
+        self.arm_right_pivot.setHpr(0, ARM_FORWARD_BASE_DEG, 0)
+
     # ---------- 체력바 ----------
 
     def _create_healthbar(self):
@@ -372,9 +519,21 @@ class Zombie:
     # ---------- 공격 상태머신 ----------
 
     def _dist_to_player(self):
+        """수평(XY) 거리만. Z 차이(지형 높낮이) 는 무시.
+
+        이전엔 3D length 였는데, `_update_chase` 의 정지 조건은 to_player.z=0 으로
+        만들어 XY 만 비교하는 반면 이 함수는 3D 라 두 기준이 어긋남.
+        Ground01 메시(Z≈-0.28) 위 플레이어와 Z=0 좀비 사이엔 항상 0.28m 의 Z 갭이
+        있어 3D dist 가 XY dist 보다 큼 → 좀비가 XY 로 ATTACK_RANGE 안에 들어와도
+        3D 로는 밖이라 windup 진입 실패 + _update_chase 가 멈춤 → 영원히 정지.
+        XY 거리로 통일해 모든 비교(`< ATTACK_RANGE`, `< ATTACK_HIT_RANGE`)가
+        같은 기준을 쓰도록 수정.
+        """
         player_pos = self.game.player.node.getPos(self.game.render)
         my_pos = self.np.getPos(self.game.render)
-        return (player_pos - my_pos).length()
+        dx = player_pos.x - my_pos.x
+        dy = player_pos.y - my_pos.y
+        return math.sqrt(dx * dx + dy * dy)
 
     def _face_player_instant(self):
         """수평(H)만 회전해서 즉시 플레이어를 바라봄. windup 진입 시 1회 호출."""
@@ -434,6 +593,17 @@ class Zombie:
     # ---------- 매 프레임 업데이트 ----------
 
     def update(self, dt):
+        # 등장 연출(waiting/telegraph/emerging) 은 각자 헬퍼로 분기 — 추적/공격/체력바
+        # 알파 모두 정지하고 해당 단계만 진행.
+        if self.state == "waiting":
+            self._update_waiting(dt)
+            return
+        if self.state == "telegraph":
+            self._update_telegraph(dt)
+            return
+        if self.state == "emerging":
+            self._update_emerging(dt)
+            return
         # dying/dead 는 Sequence 가 알아서 처리. AI/모션/체력바 알파 모두 정지.
         if self.state != "alive":
             return
@@ -530,9 +700,10 @@ class Zombie:
         """hit_part 가 DAMAGE_MULTIPLIER 키면 배율 적용, 아니면 amount 그대로.
 
         반환값: 실제로 적용된 final_damage (호출자가 데미지 숫자 UI 등에 사용).
-        이미 dying/dead 상태면 0 반환.
+        waiting/telegraph/dying/dead 면 0 반환. emerging 은 피격 가능 (머리/상체가
+        솟아오른 시점부터 raycast 명중) — 다만 체력바는 alive 전까지 숨김 유지.
         """
-        if self.state != "alive":
+        if self.state in ("waiting", "telegraph", "dying", "dead"):
             return 0
         if hit_part is not None and hit_part in DAMAGE_MULTIPLIER:
             final_damage = int(round(amount * DAMAGE_MULTIPLIER[hit_part]))
@@ -541,16 +712,22 @@ class Zombie:
         self.hp -= final_damage
         self._flash_hit()
 
-        # 체력바를 항상 갱신 — hp=0 도 빈 바로 보여야 한다 (사용자 요청).
-        # 페이드 중이었어도 즉시 풀 알파로 복귀.
+        # 체력바 갱신은 alive 일 때만. emerging 중 피격은 ratio 만 내부적으로 반영
+        # (alive 진입 후 다음 피격에 보이도록 한다). 페이드 중이었어도 alive 면 즉시 풀 알파 복귀.
         if self.hp <= 0:
             self.hp = 0
-        self.last_hit_time = _clock.getFrameTime()
-        self.healthbar_root.show()
-        self.healthbar_root.setAlphaScale(1.0)
-        self._update_healthbar_fill()
+        if self.state == "alive":
+            self.last_hit_time = _clock.getFrameTime()
+            self.healthbar_root.show()
+            self.healthbar_root.setAlphaScale(1.0)
+            self._update_healthbar_fill()
 
         if self.hp <= 0:
+            # XP 보상은 사망 시퀀스 트리거 *직전* — _start_death 가 state 를 dying 으로
+            # 바꾸기 전에 호출해야 의도 명확. 멀티 레벨업도 add_xp 가 알아서 큐 처리.
+            level_up = getattr(self.game, "level_up", None)
+            if level_up is not None:
+                level_up.add_xp(ZOMBIE_XP_REWARD)
             self._start_death()
         return final_damage
 
@@ -565,18 +742,30 @@ class Zombie:
         )
 
     def _restore_color(self, task):
-        if self.state == "alive":
+        # dying/dead 외 모든 상태(alive/emerging) 에서 색 복원 — emerging 중 피격 후
+        # alive 진입 시 빨강이 박제되지 않도록.
+        if self.state not in ("dying", "dead"):
             # wrapper의 color attrib만 제거 → 자식 박스의 원색이 다시 보임.
             self.body.clearColor()
             self.head.clearColor()
         return task.done
 
     def _start_death(self):
-        """뒤로 쓰러짐 → 페이드 → 제거 시퀀스 시작. 추적/공격/충돌은 즉시 중단."""
+        """뒤로 쓰러짐 → 페이드 → 제거 시퀀스 시작. 추적/공격/충돌은 즉시 중단.
+
+        emerging 중 사망이면 쓰러지는 lerp 가 어색하므로 (반쯤 묻혀 있는데 더 쓰러진다?)
+        fall + linger 생략하고 알파 페이드만 진행. 흙더미 카드도 명시적 제거.
+        """
+        was_emerging = self.state == "emerging"
         self.state = "dying"
         # 공격 중에 죽으면 어깨 pivot이 windup/strike 자세로 박제됨 → 리셋.
         self.attack_state = "chasing"
         self.arm_right_pivot.setHpr(0, ATTACK_ARM_REST_PITCH, 0)
+        # 흙더미 카드 정리 — emerging 중 사망이면 _enter_alive 가 호출되지 않으므로
+        # 여기서 안 지우면 흙더미가 영구히 남음.
+        if self.dirt_mound is not None and not self.dirt_mound.isEmpty():
+            self.dirt_mound.removeNode()
+        self.dirt_mound = None
 
         # 부위별 충돌 마스크 + PythonTag 모두 해제 — raycast 가 죽은 좀비를 더 안 잡음.
         # pythonTag 는 강참조라 명시적으로 끊어야 좀비 인스턴스 GC 가능.
@@ -594,6 +783,19 @@ class Zombie:
         # (prompt_02 는 즉시 hide/removeNode 지시했지만, 사용자가 "체력 0 상태도 보고 싶다"
         #  고 했으므로 체력바를 남겨두고 페이드와 함께 자연 소실시킴).
         self.np.setTransparency(TransparencyAttrib.MAlpha)
+
+        if was_emerging:
+            # emerging 중 사망 — fall lerp 없이 즉시 페이드만.
+            self.death_seq = Sequence(
+                LerpFunc(
+                    self._set_corpse_alpha,
+                    fromData=1.0, toData=0.0,
+                    duration=DEATH_FADE_SEC,
+                ),
+                Func(self._remove_corpse),
+            )
+            self.death_seq.start()
+            return
 
         # 쓰러짐 시작/종착 HPR/POS 미리 캐싱 (LerpInterval 은 절댓값).
         start_hpr = self.np.getHpr()

@@ -14,8 +14,10 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 | `src/hands.py` | 손 모델 (주먹 + 팔뚝 + 소매 박스 조립) |
 | `src/effects.py` | 피격 파티클 (부위별 개수/색/속도) |
 | `src/damage_numbers.py` | 월드 공간 데미지 숫자 — 피격 위치에 빨간 숫자 떠올랐다 페이드 |
-| `src/ui.py` | HUD — 크로스헤어, 탄약, HP, 피격 비네트 |
+| `src/ui.py` | HUD — 크로스헤어, 탄약, HP, 피격 비네트, XP 바, Lv |
 | `src/settings_menu.py` | Esc 일시정지 메뉴 — 마우스 감도 슬라이더, Resume/Quit |
+| `src/start_screen.py` | 게임 시작 화면 — 타이틀 "Game" + Start/Settings/Controls 패널 |
+| `src/level_up.py` | 레벨업 시스템 — XP/레벨 매니저 + 4 장 카드 선택 화면 + 8 특성 풀 |
 | `src/physics.py` | 충돌 마스크 상수 + 지면 ray 헬퍼 |
 
 ## 구현 완료
@@ -31,6 +33,7 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 
 ### 권총 / 양손 (`src/weapons.py`)
 - 부품: 그립 + 프레임 + 슬라이드(anchor 노드) + 총신 + 탄창 + 머즐 플래시 + 오른손 + 왼손
+- 권총 부품 박스 Z-fight 제거 — grip/frame/magazine 볼륨 겹침 해소, slide/barrel 좌표는 ADS calibration 위해 유지. 새 Z 스택: slide[0.0, 0.052] / frame[-0.032, 0.0] / grip[-0.162, -0.032], 탄창 [-0.20, -0.05] 는 grip XY 안에 fully contained 되어 coplanar 표면 없음
 - 슬라이드를 scale 없는 anchor로 둠 — 부모 scale이 자식에 곱해져 위치가 어긋나는 문제 회피
 - 노드 계층: `camera → np_anchor (view bob) → np_sway (보행 sway) → self.np (권총 루트, ADS/recoil/reload가 점유)`
 - 발사 (mouse1):
@@ -87,6 +90,58 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 - task dt 는 effects.py 와 동일하게 `min(_clock.getDt(), 1/30)` 으로 클램프 — 첫 프레임 폭주 시 한 번에 끝까지 페이드되는 것 방지
 - weapons.py 호출: `final_damage = hit_zombie.take_damage(BASE_DAMAGE, hit_part=hit_part)` 반환값을 그대로 표시 — DAMAGE_MULTIPLIER 는 zombie 안에 캡슐화
 
+### 시작 화면 (`src/start_screen.py`)
+- 부팅 시 환경/조명/카메라만 떠 있는 상태에서 시작 화면 표시. 월드는 메뉴 뒤로 보이게 frameColor 알파 0
+- 메인 패널: 타이틀 "Game" + 세로 3 버튼 (Start / Settings / Controls)
+- Settings 패널: 마우스 감도 슬라이더(일시정지 메뉴와 동일 사양) + Back. 변경값은 즉시 `player.sensitivity` 반영
+- Controls 패널: WASD/Shift/Space/Mouse/L·R Click/R/Esc 매핑 텍스트 + Back
+- 게임 상태 플래그: `started=False, paused=False` → 시작 화면. `_begin_game` 가 HUD 표시 + 마우스 캡처(M_relative) + `start_wave(1)` 실행
+- 입력 게이트: mouse1/mouse3/R 모두 `main._on_*` 디스패처를 통해 `started and not paused` 조건일 때만 pistol/player 로 전달 — DirectGUI 버튼 클릭으로 들어오는 mouse1 이 사격을 발동시키지 않도록
+- Esc 는 시작 화면 동안 무시 — 메뉴 버튼으로 명시적 진입을 강제
+- HUD: `hide_gameplay/show_gameplay` 로 시작 화면 동안 크로스헤어/탄약/HP/웨이브 전부 숨김
+
+### 좀비 등장 연출 (땅 파고 올라오기)
+- 상태머신을 `waiting → telegraph → emerging → alive → dying → dead` 로 확장. `attack_state` 와 섞지 않고 분리. 각 단계에 `_enter_*` / `_update_*` 헬퍼
+- `waiting`: spawn 직후 `spawn_delay = random(0, SPAWN_STAGGER_MAX_SEC)` 동안 안 보임 (root Z 가 `EMERGE_BURIED_Z = -1.9`). 같은 웨이브 N 마리가 한꺼번에 솟지 않도록 분산
+- `telegraph` (1.2s): 흙더미 카드 1.4m × 1.4m 가 ground 평면(Z=0.01)에 깔리고 위에서 보임. 시작 시 큰 흙 분수 1 회
+- `emerging` (1.5s): root Z 를 ease-out (`1 - (1-t)^2`) 으로 BURIED → GROUND 으로 보간. 양팔은 위로 뻗은 자세로 박제(워킹 anim 건너뜀). 진입 시 큰 흙 분수 1 회 + 0.15s 마다 작은 흙 분수. 흙더미 카드는 `t > 0.3` 시점부터 알파 페이드
+- 흙 파티클: `effects.spawn_dirt_burst(base, world_pos, intensity)` — hit-particle 과 같은 task-loop / 빌보드 / 중력 / 알파 페이드 패턴, 위쪽(+Z) 편향 분수. 갈색 3 종 그라데이션 무작위
+- 일시정지 호환: 모든 단계 타이머는 `update(dt)` 안에서 누적. `doMethodLater` / `Sequence` 안 씀 → paused / level_up_active 동안 자동 정지
+- 피격 / 사망 처리:
+  - `waiting/telegraph` 동안 hit-part `IntoCollideMask` 무력화 → raycast 가 묻힌 좀비를 안 잡음 (`_set_hit_parts_active`). emerging 진입 시 마스크 복원 → 머리/상체가 솟는 순간부터 명중 가능
+  - emerging 중 hp 0 → `_start_death` 분기로 fall+linger 없이 알파 페이드만 (어색한 자세 회피). 흙더미 카드는 명시적 `removeNode`
+  - 체력바: emerging 중 피격받아도 `healthbar_root.show` 호출 안 함 — alive 진입 후 다음 피격 시 정확한 ratio 로 표시
+  - `_restore_color` 의 색 복원 조건을 `state == "alive"` → `state not in ("dying", "dead")` 로 확장 — emerging 피격 후 alive 진입 시 빨강 박제 방지
+- 웨이브 종료 판정은 그대로 — waiting/telegraph/emerging 좀비도 `self.zombies` 에 남아 있어 자연 카운트, HUD `Zombies: N` 정확
+
+### 레벨업 시스템 (`src/level_up.py`)
+- 좀비 처치 시 XP 보상(`ZOMBIE_XP_REWARD = 10`). `Zombie.take_damage` 에서 hp ≤ 0 직전에 `game.level_up.add_xp(...)` 호출 — 사망 시퀀스 트리거 *전* 에 보상 확정
+- XP 곡선 (2 차): `xp_to_next(L) = 30 + (L-1) * 20 + (L-1)^2 * 5`. Lv 1→2: 30, 2→3: 55, 3→4: 90, 4→5: 135, 5→6: 190, ..., 9→10: 510. 선형만으로는 후반이 너무 쉬워서 2 차 항으로 가속
+- XP 획득 시 `xp_multiplier` 자동 적용 (기본 1.0, "경험치 획득" 특성으로 곱연산 누적)
+- 한 번에 여러 레벨업이 가능 — `_pending_levelups` 큐로 처리해 카드 화면을 연속 표시. 카드 한 장 고르면 `consume_card()` 가 다음 단계 결정
+- `LevelUpScreen` — DirectFrame 반투명 배경(`frameColor=(0,0,0,0.7)`) + DirectButton 카드 4 장 가로 배치. SettingsMenu 와 동일 패턴
+- 희귀도: 카드 1 장당 독립 굴림 — common 50% / rare 30% / epic 15% / legendary 5%. 같은 화면 4 장은 perk 중복 금지, 희귀도 중복 허용
+- 희귀도색: 회색 / 파랑 / 보라 / 황금. 카드 frame 배경에 RGB×0.25 로 어두운 색 깔고 텍스트는 풀 색 — 시각적으로 가장 안정적
+- 특성 8 개: 데미지 / 연사 속도 / 탄창 크기 / 신속 재장전 / 이동 속도 / 최대 체력 / 즉시 회복 / 경험치 획득. 각 4 단계 효과량 (common/rare/epic/legendary)
+- 특성 적용은 `apply(game, amt)` 콜백 — 각 perk 정의에 캡슐화. 직접 `game.pistol.base_damage` / `game.player.walk_speed` 등 인스턴스 속성 가감 (단방향 의존)
+- 즉시 회복 전설(`amt=None`)은 풀 회복 — `describe`/`apply` 모두 None 처리 분기
+
+#### 런타임 가변 인스턴스 속성 리팩토링
+- `weapons.py`: `BASE_DAMAGE` → `Pistol.base_damage`, `COOLDOWN` → `cooldown_time`, `MAG_SIZE` → `mag_size`, `RELOAD_TIME` → `reload_time`. 모듈 상수는 초기값 source 로만 남음. shoot/reload/HUD 모두 인스턴스 속성 참조
+- `player.py`: `WALK_SPEED` → `PlayerController.walk_speed`. `_update_movement` 가 참조
+- 재장전 완료 타이머: 기존 `doMethodLater("pistol_reload_finish")` → `update(dt)` 안의 `self._reload_remaining` 카운트다운. `_weapons_update_task` 가 paused / level_up_active 둘 다 게이트하므로 재장전 중 레벨업 떠도 ammo 자동 충전 안 됨
+
+#### main.py / player.py 게이트
+- `level_up_active` 플래그 추가 — paused 와 동일하게 player.update / `_weapons_update_task` / `_on_mouse1` / `_on_mouse3` / `_on_reload` 가 모두 스킵
+- Esc 토글은 level_up_active 동안 무시 — 카드 선택 강제
+- LevelUpScreen show → 마우스 커서 + M_absolute (카드 클릭 가능). 카드 클릭 후 큐 비면 player._capture_mouse() + _first_mouse=True 로 게임 시점 복귀
+
+#### HUD XP UI (`src/ui.py`)
+- XP 바: render2d 화면 전폭(X=-1..+1)에 부착. 배경(회색) + 채우기 pivot(왼쪽 정렬 setSx) 패턴 — 좀비 체력바와 동일. 채우기 색은 황금 노란색
+- Lv 텍스트: `a2dTopLeft` 좌상단 안쪽 (XP 바 바로 아래)
+- `set_xp(level, xp, xp_to_next)` — 폭과 텍스트 동시 갱신. setSx(0) singular 경고 회피 위해 0.001 클램프
+- hide/show_gameplay 토글에 xp_bar_bg/fill_pivot/level_text 포함
+
 ### 일시정지 + 설정 (`src/settings_menu.py`)
 - Esc로 토글. paused 플래그가 True면 player/pistol/zombies update 모두 정지
 - 토글 시 마우스 커서 표시 + M_absolute → UI 클릭 가능. resume 시 _first_mouse=True로 첫 프레임 델타 무시
@@ -105,7 +160,7 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 - **명중 hitmarker**: 좀비 맞췄을 때 크로스헤어 깜빡
 - **무기 교체 / 추가 무기** (소총, 산탄총 등)
 - **벽 충돌**: 현재 지면만 충돌. 벽은 통과됨
-- **게임오버 / 리스폰 UI**: hp=0 시점 처리. 10웨이브 클리어 후 VICTORY → 재시작 흐름도 같이
+- **게임오버 / 리스폰 UI**: hp=0 시점 처리. 10웨이브 클리어 후 VICTORY → 시작 화면 복귀/재시작 흐름도 같이
 - **환경 복원**: 나무/대나무/바위/잎/실린더 다시 추가 (현재 시인성 위해 Ground만 남김)
 - Bullet 물리 도입은 적/투사체 단계에서 검토 예정
 
@@ -143,6 +198,25 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 | `src/zombie.py` | `WAVE_INTERMISSION_SEC` | `3.0` | 웨이브 종료 ~ 다음 웨이브 시작 텀 (초) |
 | `src/zombie.py` | `WAVE_SPAWN_MIN_DIST_FROM_PLAYER` | `6.0` | 좀비 스폰 시 플레이어 최소 거리 (m) |
 | `src/zombie.py` | `WAVE_SPAWN_X_RANGE` / `_Y_RANGE` | `(-11,10)` / `(-10,11)` | Ground 메시 안 좌표 범위 |
+| `src/zombie.py` | `TELEGRAPH_SEC` | `1.2` | 흙더미만 보이는 경고 시간 (초) |
+| `src/zombie.py` | `EMERGE_SEC` | `1.5` | 좀비가 솟아오르는 시간 (초) |
+| `src/zombie.py` | `EMERGE_BURIED_Z` / `EMERGE_GROUND_Z` | `-1.9` / `0.0` | waiting/telegraph 동안 root Z / 솟은 직후 root Z |
+| `src/zombie.py` | `SPAWN_STAGGER_MAX_SEC` | `1.5` | 같은 웨이브 내 스폰 무작위 지연 최댓값 (초) |
+| `src/zombie.py` | `DIRT_MOUND_HALF_SIZE` | `0.7` | 흙더미 카드 반폭 (m) — 1.4m × 1.4m |
+| `src/zombie.py` | `EMERGE_DIRT_PERIOD` / `_INTENSITY` | `0.15` / `0.35` | emerging 중 지속 흙 분출 간격(초) / 개수 배율 |
+| `src/effects.py` | `DIRT_PARTICLE_COUNT_BASE` | `14` | intensity=1.0 시 흙 파티클 개수 |
+| `src/effects.py` | `DIRT_LIFETIME` | `0.55` | 흙 파티클 수명 (초) |
+| `src/level_up.py` | `ZOMBIE_XP_REWARD` | `10` | 좀비 1 마리 처치 XP (xp_multiplier 적용 전) |
+| `src/level_up.py` | `XP_BASE` / `XP_PER_LEVEL` / `XP_QUADRATIC` | `30` / `20` / `5` | `xp_to_next(L) = 30 + (L-1)*20 + (L-1)^2*5` (2 차 곡선) |
+| `src/level_up.py` | `RARITY_WEIGHTS` | common 50 / rare 30 / epic 15 / legendary 5 | 카드 1 장당 독립 굴림 |
+| `src/level_up.py` | 데미지 perk amounts | `(2, 5, 10, 20)` | `base_damage` 가산 |
+| `src/level_up.py` | 연사 속도 perk amounts | `(0.05, 0.12, 0.25, 0.45)` | `cooldown_time` 곱연산 감소 비율 |
+| `src/level_up.py` | 탄창 perk amounts | `(2, 4, 8, 16)` | `mag_size` + 현재 ammo 동시 증가 |
+| `src/level_up.py` | 신속 재장전 perk amounts | `(0.08, 0.18, 0.35, 0.60)` | `reload_time` 곱연산 감소 비율 |
+| `src/level_up.py` | 이동 속도 perk amounts | `(0.05, 0.12, 0.25, 0.45)` | `walk_speed` 곱연산 증가 비율 |
+| `src/level_up.py` | 최대 체력 perk amounts | `(10, 25, 50, 100)` | `max_hp` 가산 + 현재 hp 동량 증가 |
+| `src/level_up.py` | 즉시 회복 perk amounts | `(20, 50, 100, None)` | 정수면 회복 / `None` 이면 풀 회복 |
+| `src/level_up.py` | 경험치 perk amounts | `(0.10, 0.25, 0.50, 1.00)` | `xp_multiplier` 곱연산 증가 비율 |
 | `src/damage_numbers.py` | `DAMAGE_TEXT_HOLD_SEC` / `_FADE_SEC` | `0.3` / `0.4` | 풀 알파 / 페이드 (초) |
 | `src/damage_numbers.py` | `DAMAGE_TEXT_RISE` | `0.8` | 수명 동안 위로 떠오르는 거리 (m) |
 | `src/damage_numbers.py` | `DAMAGE_TEXT_SCALE` / `HEADSHOT_SCALE_MULT` | `0.6` / `1.3` | 기본 크기 / 헤드샷 배수 |
@@ -170,3 +244,4 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 - **재장전 중 ADS 진입 시 권총 점프**: ADS lerp가 reload Sequence의 마지막 keyframe과 다른 노드 값으로 종료 → reload 중 ADS 무시(`set_ads`에서 early return)
 - **공격 도중 좀비 사망 시 어깨 각도 박제**: `_start_death`에서 `arm_right_pivot.setHpr(0, REST_PITCH, 0)`으로 명시적 리셋
 - **ADS 머즐 ↔ 크로스헤어 X/Z 어긋남**: pistol-local 에서 barrel/머즐 플래시가 `(0.0195, *, 0.013)` 만큼 그립 우상단으로 오프셋되어 있어서, `ADS_GUN_POS.x/z` 를 0 으로 두면 화면 중앙에 와도 총구는 크로스헤어 오른쪽-아래에 놓인다. `ADS_GUN_POS = Vec3(-0.0195, 0.85, -0.013)` 로 barrel offset 만큼 음수 보정해 머즐이 카메라 광축에 정확히 오게 함 (raycast 는 카메라 정면이라 명중에는 영향 없음, 순수 시각 정렬)
+- **DirectGUI 버튼 클릭 → 전역 mouse1 발동**: 시작 화면의 Start 버튼을 클릭하면 DirectButton 의 클릭 처리와 별개로 전역 `"mouse1"` 이벤트도 함께 발생해 `pistol.shoot` 가 트리거됨. main 에 `_on_mouse1/_on_mouse3/_on_reload` 디스패처를 두고 `started and not paused` 조건에서만 통과시키도록 게이트 (R/우클릭도 동일 패턴)

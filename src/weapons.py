@@ -62,6 +62,9 @@ def _find_zombie_and_part(entry):
     return zombie, hit_part
 
 
+# 모듈 상수는 *초기값 source* 로만 남기고, 런타임 튜닝(레벨업 특성 등)이 가능하도록
+# Pistol.__init__ 에서 인스턴스 속성으로 복사한다. shoot/reload/HUD 갱신은 인스턴스
+# 속성을 참조해야 카드 선택 효과가 즉시 반영된다.
 MAG_SIZE = 12
 COOLDOWN = 0.2
 RELOAD_TIME = 2.0  # 검사 자세(inspect) 안무가 충분히 보이도록 1.8 → 2.0
@@ -134,9 +137,20 @@ class Pistol:
         self.game = game
         self.base = game
 
-        self.ammo = MAG_SIZE
+        # 모듈 상수의 인스턴스 사본 — 레벨업 특성이 직접 가감.
+        # shoot/reload/HUD 모두 이 인스턴스 속성을 참조해야 효과가 런타임에 반영된다.
+        self.base_damage = BASE_DAMAGE
+        self.cooldown_time = COOLDOWN
+        self.mag_size = MAG_SIZE
+        self.reload_time = RELOAD_TIME
+
+        self.ammo = self.mag_size
         self.cooldown = 0.0
         self.reloading = False
+        # 재장전 완료까지 남은 시간(초). update(dt) 가 0 이하로 만들면 _finish_reload.
+        # doMethodLater 가 paused/level_up_active 와 무관하게 흘러가는 문제를 피하려고
+        # _weapons_update_task 와 같은 dt 기반 타이머로 변경.
+        self._reload_remaining = 0.0
 
         # 진행 중인 모션 핸들 — 새 모션 시작 시 .finish()로 정리해 점프/충돌 방지
         self._current_recoil = None
@@ -173,18 +187,26 @@ class Pistol:
         # 경우를 막기 위해 권총만 라이팅을 끄고 setColor 그대로 보이게 한다.
         self.np.setLightOff()
 
-        # 그립 — 안 움직임 (Doom 구도용 1.3배 확대)
+        # 그립 — 안 움직임 (Doom 구도용 1.3배 확대).
+        # Z 스택: slide(Z=0.0~0.052) 아래에 frame(Z=-0.032~0.0), 그 아래에 grip.
+        # 이전 setPos.z=-0.13 일 땐 grip Z[-0.13, 0.0] 가 frame Z[-0.0325, -0.0005]
+        # 와 볼륨을 공유해 z-fight 가 발생 → grip 을 frame 두께만큼 더 내려서 분리.
         self.grip = self.base.loader.loadModel("models/box")
         self.grip.reparentTo(self.np)
         self.grip.setScale(0.052, 0.065, 0.13)
-        self.grip.setPos(-0.026, -0.091, -0.13)
+        # extent: X[-0.026, 0.026] × Y[-0.091, -0.026] × Z[-0.162, -0.032]
+        self.grip.setPos(-0.026, -0.091, -0.162)
         self.grip.setColor(0.30, 0.30, 0.30, 1)
 
-        # 프레임 — 그립과 슬라이드 이음새, 안 움직임
+        # 프레임 — 그립과 슬라이드 이음새, 안 움직임.
+        # frame top = slide bottom = 0.0 으로 두께 0.032 를 -Z 방향으로 쌓는다 →
+        # slide 와는 coplanar (Z=0.0) 면 한 장으로만 접촉, grip 과도 coplanar(Z=-0.032)
+        # 면 한 장으로만 접촉 → 어느 쪽도 볼륨 내부에 들어가지 않음.
         self.frame = self.base.loader.loadModel("models/box")
         self.frame.reparentTo(self.np)
         self.frame.setScale(0.058, 0.21, 0.032)
-        self.frame.setPos(-0.0293, -0.078, -0.0325)
+        # extent: X[-0.0293, 0.0287] × Y[-0.078, 0.132] × Z[-0.032, 0.0]
+        self.frame.setPos(-0.0293, -0.078, -0.032)
         self.frame.setColor(0.35, 0.35, 0.35, 1)
 
         # 슬라이드 — anchor 노드. scale 없음. 보이는 박스는 자식 slide_mesh가 담당.
@@ -221,10 +243,20 @@ class Pistol:
 
         # 탄창 — 재장전 시 아래로 빠졌다 돌아옴 (1.3배 확대).
         # 색은 약간 푸른빛 도는 어두운 회색 — 다른 부품과 대비로 낙하가 잘 보이게.
+        # Z-fight 회피 설계:
+        #   - XY footprint 를 grip XY (X[-0.026,0.026], Y[-0.091,-0.026]) 안에 *완전*
+        #     포함 (pos.x=-0.0225, pos.y=-0.0875 로 중앙 정렬). grip 표면과 mag 표면이
+        #     coplanar 가 되는 일이 없어 z-fight 안 일어남.
+        #   - Z 는 [-0.20, -0.05] — top(-0.05) 가 frame bottom(-0.032) 보다 아래에
+        #     있어 frame 과 겹치지 않고, grip 안쪽으로 0.112m 들어가 있으며 (mag 위쪽이
+        #     grip 의 X/Y 안에 fully contained 이므로 grip 표면이 가려 z-fight 없음),
+        #     grip bottom(-0.162) 보다 0.038m 아래로 노출되어 Glock 식으로 살짝 보임.
+        #   - 새 두께 = 0.15 (이전 0.091). MAG_DROP_OFFSET 은 상대 오프셋이라 영향 없음.
         self.magazine = self.base.loader.loadModel("models/box")
         self.magazine.reparentTo(self.np)
-        self.magazine.setScale(0.045, 0.058, 0.091)
-        self._mag_rest_pos = Vec3(-0.0228, -0.078, -0.065)
+        self.magazine.setScale(0.045, 0.058, 0.15)
+        # extent: X[-0.0225, 0.0225] × Y[-0.0875, -0.0295] × Z[-0.20, -0.05]
+        self._mag_rest_pos = Vec3(-0.0225, -0.0875, -0.20)
         self.magazine.setPos(self._mag_rest_pos)
         self.magazine.setColor(0.20, 0.22, 0.30, 1)
 
@@ -256,7 +288,7 @@ class Pistol:
         if self.reloading or self.cooldown > 0 or self.ammo <= 0:
             return
         self.ammo -= 1
-        self.cooldown = COOLDOWN
+        self.cooldown = self.cooldown_time
         self._play_recoil()
         self._flash_muzzle()
 
@@ -267,7 +299,9 @@ class Pistol:
             if hit_zombie is not None:
                 # 부위별 배율은 take_damage 안에서 적용 후 final_damage 반환.
                 # 파티클은 부위 카테고리별 양/색, 데미지 숫자는 hit_pos 월드 공간에 표시.
-                final_damage = hit_zombie.take_damage(BASE_DAMAGE, hit_part=hit_part)
+                final_damage = hit_zombie.take_damage(
+                    self.base_damage, hit_part=hit_part
+                )
                 spawn_hit_particles(self.base, hit_pos, hit_part)
                 spawn_damage_number(self.base, hit_pos, final_damage, hit_part)
             else:
@@ -276,10 +310,10 @@ class Pistol:
             tracer_distance = MAX_RANGE
         self._spawn_tracer(tracer_distance)
 
-        self.game.hud.update_ammo(self.ammo, MAG_SIZE, False)
+        self.game.hud.update_ammo(self.ammo, self.mag_size, False)
 
     def reload(self):
-        if self.reloading or self.ammo == MAG_SIZE:
+        if self.reloading or self.ammo == self.mag_size:
             return
         # 재장전 시작 시 ADS lerp가 진행 중이면 종료 — np_seq 와 같은 노드를 다투면
         # 마지막 keyframe 값에 따라 권총이 엉뚱한 위치로 튀어버림.
@@ -294,19 +328,20 @@ class Pistol:
         # 재장전 시작 시 강제 페이드인.
         self._fade_hands(1.0)
         self.reloading = True
-        self.game.hud.update_ammo(self.ammo, MAG_SIZE, True)
+        self.game.hud.update_ammo(self.ammo, self.mag_size, True)
         self._play_reload_anim()
-        self.base.taskMgr.doMethodLater(
-            RELOAD_TIME, self._finish_reload, "pistol_reload_finish"
-        )
+        # dt 기반 카운트다운 — update(dt) 안에서 0 으로 떨어지면 _finish_reload.
+        # doMethodLater 를 안 쓰는 이유: paused / level_up_active 동안에도 흐르는 문제.
+        # 인스턴스 reload_time 을 매번 새로 읽어 신속 재장전 특성 효과가 즉시 반영.
+        self._reload_remaining = self.reload_time
 
-    def _finish_reload(self, task):
-        self.ammo = MAG_SIZE
+    def _finish_reload(self):
+        self.ammo = self.mag_size
         self.reloading = False
-        self.game.hud.update_ammo(self.ammo, MAG_SIZE, False)
+        self._reload_remaining = 0.0
+        self.game.hud.update_ammo(self.ammo, self.mag_size, False)
         # cleanup 은 헬퍼로 위임 — Sequence 끝 Func / abort_reload 와 동일 로직 공유.
         self._reset_left_hand()
-        return task.done
 
     def _reset_left_hand(self):
         """왼손을 pistol 자식으로 되돌리고 정확히 rest pose 로 강제 보정.
@@ -334,11 +369,11 @@ class Pistol:
             # finish() 는 모든 LerpInterval 을 마지막 keyframe 으로 스냅 + 끝 Func 실행.
             self._current_reload.finish()
             self._current_reload = None
-        # 2초 후 ammo 자동 충전 타이머 취소 — 안 그러면 맞고도 보상받는 꼴.
-        self.base.taskMgr.remove("pistol_reload_finish")
+        # 잔여 카운트다운 클리어 — 안 그러면 맞고도 ammo 자동 충전 보상받는 꼴.
+        self._reload_remaining = 0.0
         self.reloading = False
         self._reset_left_hand()
-        self.game.hud.update_ammo(self.ammo, MAG_SIZE, False)
+        self.game.hud.update_ammo(self.ammo, self.mag_size, False)
 
     def set_ads(self, active):
         """우클릭 ADS — 권총 루트를 ADS_GUN_POS (중앙) 또는 _rest_pos (우측 hip) 로 lerp.
@@ -375,6 +410,10 @@ class Pistol:
     def update(self, dt):
         if self.cooldown > 0:
             self.cooldown -= dt
+        if self.reloading and self._reload_remaining > 0.0:
+            self._reload_remaining -= dt
+            if self._reload_remaining <= 0.0:
+                self._finish_reload()
         self._update_sway(dt)
 
     def _update_sway(self, dt):
