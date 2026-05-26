@@ -39,9 +39,13 @@ class HUD:
     def __init__(self, base):
         self.base = base
 
+        # OnscreenText 는 baseline 기준 앵커링이라 pos=(0,0) 이면 baseline 이 화면 중앙에
+        # 놓이고 글리프 시각 중심은 ~capHeight/2 만큼 위로 떠 있다 → 플레이어가 +
+        # 시각 중심을 보고 조준하면 raycast (camera +Y, 정중앙) 가 + 아래에 hit.
+        # CROSSHAIR_SCALE × 0.30 만큼 Z 를 내려 + 의 가운데가 정확히 (0, 0) 에 오게 보정.
         self.crosshair = OnscreenText(
             text="+",
-            pos=(0, 0),
+            pos=(0, -CROSSHAIR_SCALE * 0.30),
             scale=CROSSHAIR_SCALE,
             fg=AMMO_COLOR,
             mayChange=False,

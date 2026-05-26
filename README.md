@@ -101,6 +101,18 @@ PowerShell 실행 정책 오류가 나면:
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 
+### PBR 에셋 다운로드 (처음 한 번)
+
+게임은 PBR(physically-based rendering) 텍스처와 HDRI 라이팅을 사용한다. 에셋
+파일은 외부 CC0 라이선스로 받아오므로 git 에 안 들어 있다. 최초 클론 후 한 번:
+
+```powershell
+python scripts/download_assets.py
+```
+
+→ `assets/textures/ground/*.jpg` (Ground037 PBR 셋) + `assets/hdri/sky.hdr`
+(흐린 하늘 HDRI). idempotent — 이미 받았으면 건너뜀.
+
 ### 설치 검증
 
 ```powershell

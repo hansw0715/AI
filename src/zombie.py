@@ -42,8 +42,10 @@ from panda3d.core import (
     ClockObject,
     CollisionNode,
     CollisionSphere,
+    Material,
     TransparencyAttrib,
     Vec3,
+    Vec4,
 )
 
 from .effects import spawn_dirt_burst
@@ -54,12 +56,29 @@ from .physics import ZOMBIE_MASK
 _clock = ClockObject.getGlobalClock()
 
 
-# 색 ---------------------------------------------------------------
-_BODY_COLOR = (0.30, 0.35, 0.25, 1)   # 어두운 녹색
-_HEAD_COLOR = (0.40, 0.45, 0.30, 1)   # 약간 더 밝은 녹색
-_ARM_COLOR  = (0.30, 0.35, 0.25, 1)
-_LEG_COLOR  = (0.20, 0.20, 0.15, 1)   # 진한 색 (바지)
-_HIT_COLOR  = (1.0, 0.2, 0.2, 1)
+# PBR 머티리얼 -----------------------------------------------------
+# Last of Us 풍 톤다운된 더러운 색감. 머리는 피부톤(밝은 갈색), 몸/팔은 더러운
+# 옷 톤, 다리는 진한 바지 톤. metallic 0 + 거친 roughness (의류/피부 특성).
+_BODY_MAT = Material("zombie_body")
+_BODY_MAT.setBaseColor(Vec4(0.30, 0.20, 0.18, 1))
+_BODY_MAT.setMetallic(0.0)
+_BODY_MAT.setRoughness(0.85)
+
+_HEAD_MAT = Material("zombie_head")
+_HEAD_MAT.setBaseColor(Vec4(0.55, 0.45, 0.40, 1))
+_HEAD_MAT.setMetallic(0.0)
+_HEAD_MAT.setRoughness(0.80)
+
+_ARM_MAT = _BODY_MAT
+
+_LEG_MAT = Material("zombie_legs")
+_LEG_MAT.setBaseColor(Vec4(0.20, 0.15, 0.13, 1))
+_LEG_MAT.setMetallic(0.0)
+_LEG_MAT.setRoughness(0.85)
+
+# hit-flash: wrapper 에 priority=1 로 setColor 가 ColorAttrib 을 박아 PBR 셰이더가
+# baseColor 와 곱해 빨갛게 보이게 한다. Material/Color 호환을 위해 setColor 만 유지.
+_HIT_COLOR = (1.0, 0.2, 0.2, 1)
 
 # 피격/사망 -------------------------------------------------------
 _FLASH_DURATION = 0.1
@@ -234,10 +253,11 @@ class Zombie:
 
     # ---------- 모델 빌드 ----------
 
-    def _make_box(self, name, parent, size, center, color):
+    def _make_box(self, name, parent, size, center, material):
         """models/box(corner-origin)를 박스 중심 = wrapper 원점이 되도록 정규화한 부품.
 
         size: 박스 실제 크기 (m). center: wrapper가 부모 안에 놓일 좌표 (박스 중심).
+        material: PBR Material — baseColor + metallic + roughness 로 색/재질 결정.
         반환 wrapper 노드는 곧 박스 기하학적 중심의 위치/회전.
         """
         wrapper = parent.attachNewNode(name)
@@ -247,7 +267,10 @@ class Zombie:
         box.setScale(size[0], size[1], size[2])
         # 박스 origin이 corner라 wrapper 원점에 박스 중심을 맞추려면 -size/2 offset.
         box.setPos(-size[0] / 2.0, -size[1] / 2.0, -size[2] / 2.0)
-        box.setColor(*color)
+        # models/box 의 기본 텍스처가 PBR base color 와 곱해져 머티리얼 색이 깨지지
+        # 않도록 텍스처 stage 강제 off. weapons/hands 와 동일 패턴.
+        box.setTextureOff(1)
+        box.setMaterial(material)
         return wrapper
 
     def _build_model(self):
@@ -256,27 +279,27 @@ class Zombie:
         # 머리 Z=1.45~1.75 (중심 1.60), 팔은 어깨(1.40)에서 손(0.85)까지 (중심 1.10).
         self.leg_left  = self._make_box(
             "leg_left",  self.np,
-            (0.16, 0.16, _LEG_SIZE_Z), Vec3(-0.10, 0, 0.40), _LEG_COLOR,
+            (0.16, 0.16, _LEG_SIZE_Z), Vec3(-0.10, 0, 0.40), _LEG_MAT,
         )
         self.leg_right = self._make_box(
             "leg_right", self.np,
-            (0.16, 0.16, _LEG_SIZE_Z), Vec3( 0.10, 0, 0.40), _LEG_COLOR,
+            (0.16, 0.16, _LEG_SIZE_Z), Vec3( 0.10, 0, 0.40), _LEG_MAT,
         )
         self.body = self._make_box(
             "body", self.np,
-            (0.45, 0.25, 0.65), Vec3(0, 0, 1.125), _BODY_COLOR,
+            (0.45, 0.25, 0.65), Vec3(0, 0, 1.125), _BODY_MAT,
         )
         self.head = self._make_box(
             "head", self.np,
-            (0.25, 0.25, 0.30), Vec3(0, 0, 1.60), _HEAD_COLOR,
+            (0.25, 0.25, 0.30), Vec3(0, 0, 1.60), _HEAD_MAT,
         )
         self.arm_left = self._make_box(
             "arm_left", self.np,
-            (0.13, 0.13, _ARM_SIZE_Z), Vec3(-0.30, 0, 1.10), _ARM_COLOR,
+            (0.13, 0.13, _ARM_SIZE_Z), Vec3(-0.30, 0, 1.10), _ARM_MAT,
         )
         self.arm_right = self._make_box(
             "arm_right", self.np,
-            (0.13, 0.13, _ARM_SIZE_Z), Vec3( 0.30, 0, 1.10), _ARM_COLOR,
+            (0.13, 0.13, _ARM_SIZE_Z), Vec3( 0.30, 0, 1.10), _ARM_MAT,
         )
 
     def _setup_pivots(self):

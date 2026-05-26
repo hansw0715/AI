@@ -19,6 +19,8 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 | `src/start_screen.py` | 게임 시작 화면 — 타이틀 "Game" + Start/Settings/Controls 패널 |
 | `src/level_up.py` | 레벨업 시스템 — XP/레벨 매니저 + 4 장 카드 선택 화면 + 8 특성 풀 |
 | `src/physics.py` | 충돌 마스크 상수 + 지면 ray 헬퍼 |
+| `src/cubemap.py` | Equirect HDR → in-memory cubemap Texture 변환 (simplepbr IBL/skybox 용) |
+| `scripts/download_assets.py` | ambientcg PBR 셋 + polyhaven HDRI 다운로드 (idempotent) |
 
 ## 구현 완료
 
@@ -65,13 +67,32 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
   - 인터미션은 3초. 카운트다운은 `update(dt)` 안에서 dt 누적 → 일시정지 시 함께 멈춤 (별도 doMethodLater 안 씀)
   - 마지막 웨이브(10) 클리어 시 `cleared` 상태 + VICTORY 표시. 그 후 종료/리스폰 UI 는 별도 작업
 
-### 환경 (`src/main.py`)
-- Panda3D 기본 `models/environment` 사용
-- `ENVIRONMENT_SCALE = 0.05`. `ENVIRONMENT_POS`는 스케일에 비례해 자동 조정
-- 좀비 시인성 위해 Ground/Ground01 메시만 남기고 나머지 자식 제거. 다음 단계에서 나무/바위 등 복원 예정
-- `setTwoSided(True)`로 풀/나무 뒷면 렌더링
-- AmbientLight + DirectionalLight
-- `camLens.setNear(0.05)` — 권총이 카메라 가까이 있어 기본 near=1.0이면 클립됨
+### 렌더링 파이프라인 (`src/main.py`, `src/cubemap.py`)
+- **simplepbr 0.13.1 활성화** — `simplepbr.init(use_normal_maps=True, use_emission_maps=True, enable_shadows=True, msaa_samples=4, max_lights=8, exposure=1.0)` 를 ShowBase 직후 호출. PBR 자체 GLSL 셰이더가 fixed-function 을 완전히 대체하므로 `render.setShaderAuto()` 는 호출 금지 (둘 다 같은 셰이더 슬롯을 점유)
+- **HDRI IBL + skybox** — assets/hdri/sky.hdr (cloudy_vondelpark 1K equirectangular) 를 `src/cubemap.py:equirect_to_cubemap` 으로 in-memory cubemap Texture 로 변환 (face_size=128, 부팅 시 2~4s 소요) → `EnvMap(cubemap, blocking_prepare=True)` 로 PBR 의 ambient/specular 환경 항 활성, `simplepbr.utils.make_skybox(cubemap)` 으로 시각 skybox 생성. Panda3D `load_cube_map` 이 equirect 단일 파일을 안 받기 때문에 직접 변환 필수
+- **카메라 near/far** — 0.1 / 200 (ratio 2000). near 가 너무 작고 far 가 크면 24-bit depth 도 정밀도가 깨져 무지개 z-fight streak 발생
+- **백버퍼 강제 클리어** — `setClearColorActive/DepthActive/StencilActive(True)` + 어두운 회청색 배경 (skybox 실패 fallback)
+- **prc 설정** — `framebuffer-depth-bits 24`, `sync-video 1`. MSAA 는 simplepbr 가 내부 buffer 에서 처리하므로 prc-MSAA 는 비활성 (RTX 50 시리즈 + Panda 1.10 의 fb-MSAA resolve 깨짐 회피)
+- **지면** — `CardMaker` 60m × 60m 평면 (`models/environment` UV 가 PBR 타일링에 부적합해 폐기). PBR 텍스처: albedo (Ground037 ambientcg, M_modulate stage), normal (M_normal stage). 둘 다 `WMRepeat` + `setTexScale(20, 20)` 으로 타일링. Material(metallic=0, roughness=1.0). roughness/AO 단일 채널 분리본도 다운로드 되지만 simplepbr 가 ORM 패킹 단일 텍스처를 기대해서 현재 미사용 (향후 ORM 패킹 헬퍼 만들 때 활성)
+- **조명 — Last of Us 풍 흐린 톤**
+  - AmbientLight `(0.15, 0.17, 0.20)` — 푸르스름한 어두운 베이스
+  - Key DirectionalLight `(0.55, 0.50, 0.42)`, HPR `(-45, -30, 0)`, `setShadowCaster(True, 1024, 1024)`, lens filmSize 40×40, nearFar 0.1~100 → 그림자 캐스터
+  - Fill DirectionalLight `(0.10, 0.13, 0.18)`, HPR `(135, 60, 0)` — 푸른 하늘 반사광 (그림자 없음)
+- **무기/손 라이트 — 카메라 자식 한정 부착** — `weapon_key (DirectionalLight)` + `weapon_fill (AmbientLight)` 를 `self.camera.attachNewNode(...)` 로 카메라 트리에 두고, `self.pistol.np.setLight(weapon_key_np/weapon_fill_np)` 로 권총 서브트리에만 적용. 손은 권총 자식이라 자동 상속. 씬 전체에 setLight 하면 카메라 회전 따라 환경 라이팅이 흔들림
+- **PBR Material 패턴** — `setColor` 폐기, `Material.setBaseColor/setMetallic/setRoughness` 로 통일. 부품별:
+  - 권총 metal (slide/barrel) — baseColor 0.55, metallic 0.85, roughness 0.45
+  - 권총 polymer (grip/frame) — 0.28, 0, 0.65
+  - 권총 magazine — `(0.20, 0.22, 0.28)`, 0.6, 0.55
+  - 손 skin (fist/forearm) — `(0.75, 0.55, 0.45)`, 0, 0.75
+  - 소매 — `(0.20, 0.23, 0.25)`, 0, 0.90
+  - 좀비 body/arm — `(0.30, 0.20, 0.18)`, 0, 0.85
+  - 좀비 head — `(0.55, 0.45, 0.40)`, 0, 0.80
+  - 좀비 legs — `(0.20, 0.15, 0.13)`, 0, 0.85
+- **hit-flash 호환** — 좀비 피격 시 wrapper 의 `setColor((1,0.2,0.2,1), 1)` 가 ColorAttrib 으로 박혀 PBR 셰이더의 baseColor 와 곱해져 빨간 톤. Material 와 동시 적용해도 ColorAttrib 우선 → 기존 hit-flash 로직 그대로 작동
+- **에셋 디렉토리**
+  - `assets/textures/ground/` — Ground037 PBR 셋 (albedo/normal/roughness/AO, JPG)
+  - `assets/hdri/sky.hdr` — cloudy_vondelpark 1K equirectangular HDR
+  - 둘 다 git ignore. 처음 클론 후 `python scripts/download_assets.py` 1 회 실행 (CC0 라이선스)
 
 ### HUD (`src/ui.py`)
 - 중앙 크로스헤어 `"+"`
@@ -226,6 +247,11 @@ Panda3D 1.10.16 기반 1인칭 FPS 프로젝트. Python 3.11.9 / Windows.
 
 - **첫 프레임 dt 폭주 → 터널링**: 모델 로딩/셰이더 컴파일로 첫 프레임 dt가 1초 가까이 됨. `dt = min(dt, MAX_DT)`로 클램프 + 스폰 시 즉시 ground snap
 - **near plane 1.0m 기본값**: 화면에 가까이 둔 1인칭 무기가 통째로 클립됨. `camLens.setNear(0.05)` 필수
+- **near plane 만 줄이고 far 안 줄이면 depth buffer precision 박살나 1인칭 무기/씬 전체에 무지개 z-fight**: near=0.1 + far=200 으로 ratio 2000 이하 유지. ShowBase.__init__ *전* 에 `loadPrcFileData("", "framebuffer-depth-bits 24")` 강제 + GSG/depth bits 진단 출력으로 재발 시 즉시 확인
+- **`setLightOff()` 빼면 카메라 자식 라이트가 필수**: PBR 도입 후 1인칭 무기/손에 라이팅이 없으면 음영이 무너져 박스 면별 명암이 사라짐. `weapon_key/weapon_fill` 을 카메라 자식 노드에 두고 `pistol.np.setLight(...)` 로 권총 서브트리에만 한정 부착 (씬 전체에 걸면 카메라 회전 시 환경 라이팅 요동)
+- **`simplepbr.init()` 가 자체 GLSL 셰이더를 박으므로 `render.setShaderAuto()` 호출 금지**: 둘 다 같은 셰이더 슬롯을 점유 → 충돌해 셰이더가 깨지거나 simplepbr 의 PBR 항이 무력화. setShaderAuto 는 PBR 도입과 함께 제거
+- **`models/environment` 의 Ground 메시는 PBR 타일링 부적합**: UV 가 큰 환경 메시 전체용이라 albedo/normal 타일링이 부자연스러움. `CardMaker` 평면으로 교체하고 `setTexScale(N, N)` 로 직접 타일링 제어
+- **Panda3D `load_cube_map` 은 equirect HDR 못 읽음**: `Filename requires a hash mark` 에러로 실패. `#` 치환 6 face 경로나 DDS cubemap 만 받음. polyhaven 식 equirect 단일 파일은 `src/cubemap.py:equirect_to_cubemap` 으로 직접 변환해 in-memory Texture 로 `EnvMap(texture)` 생성자에 넘김
 - **좁은 기본 FOV (39°h/30°v)**: 카메라에서 가까운 위치의 X/Z 오프셋은 frustum 밖이 되기 쉬움. 무기는 y≥1.0 정도 거리에 둬야 안전 → 현재는 ADS 도입과 함께 `setFov(70)` 적용
 - **directional light + dark color**: 1인칭 무기에 라이팅 적용되면 카메라 회전에 따라 거의 검정이 됨. `setLightOff()` + 적당히 밝은 setColor
 - **트레이서 잔상**: world 공간에 그리면 카메라가 옆을 지나가며 잔상처럼 보임. **camera-local 공간**에 부착해 해결. raycast가 카메라 정면이라 hit point는 camera-local에서 `(0, distance, 0)`

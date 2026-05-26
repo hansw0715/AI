@@ -26,6 +26,9 @@ self.slide가 scale 없는 anchor인 이유:
 """
 
 import math
+import os
+
+import gltf
 
 from direct.interval.IntervalGlobal import (
     Func,
@@ -42,9 +45,33 @@ from panda3d.core import (
     CollisionNode,
     CollisionRay,
     CollisionTraverser,
+    Filename,
     LineSegs,
+    Material,
+    NodePath,
+    Point3,
     Vec3,
+    Vec4,
 )
+
+
+# PBR Material 정의 — setBaseColor 가 텍스처 없이도 기본 색을 결정.
+# simplepbr 가 metallic/roughness 를 PBR 셰이더에서 직접 사용.
+_GUN_METAL_MAT = Material("gun_metal")
+_GUN_METAL_MAT.setBaseColor(Vec4(0.55, 0.55, 0.55, 1))
+_GUN_METAL_MAT.setMetallic(0.85)
+_GUN_METAL_MAT.setRoughness(0.45)
+
+_GUN_POLYMER_MAT = Material("gun_polymer")
+_GUN_POLYMER_MAT.setBaseColor(Vec4(0.28, 0.28, 0.28, 1))
+_GUN_POLYMER_MAT.setMetallic(0.0)
+_GUN_POLYMER_MAT.setRoughness(0.65)
+
+_GUN_MAG_MAT = Material("gun_mag")
+# 검은 폴리머 — Glock/Beretta 매그는 무광 검정. 이전 푸르스름한 회색은 글록 매그 톤 아님.
+_GUN_MAG_MAT.setBaseColor(Vec4(0.04, 0.04, 0.04, 1))
+_GUN_MAG_MAT.setMetallic(0.0)
+_GUN_MAG_MAT.setRoughness(0.70)
 
 from .damage_numbers import spawn_damage_number
 from .effects import spawn_hit_particles
@@ -108,11 +135,11 @@ RECOIL_PITCH_DEG = 2.0
 #  - 오른손: 그립 위치와 동일 좌표 (그립을 감싼 자세).
 #  - 왼손: 오른손 바로 옆/아래에서 받치는 양손 그립 자세 (Weaver/Isosceles 스탠스).
 #    오른손 (-0.026, -0.091, -0.13) 기준 살짝 왼쪽/아래로 두고, HPR은 좌우 미러.
-RIGHT_HAND_REST_POS = Vec3(-0.026, -0.091, -0.13)
+RIGHT_HAND_REST_POS = Vec3(-0.100, -0.070, -0.15)
 RIGHT_HAND_REST_HPR = (15, -25, 0)
 # 왼손을 오른손 (-0.026, -0.091, -0.13) 바로 밑에 배치 — X/Y 거의 일치, Z만 7cm 아래.
 # HPR도 완화해 팔이 화면을 가리는 정도 줄임.
-LEFT_HAND_REST_POS = Vec3(-0.03, -0.09, -0.20)
+LEFT_HAND_REST_POS = Vec3(-0.145, 0.000, -0.13)
 LEFT_HAND_REST_HPR = (-10, -10, 10)
 
 HIT_MARKER_LIFETIME = 0.5
@@ -126,6 +153,25 @@ BARREL_TIP_LOCAL = Vec3(0.5, 0.6, 0.5)
 MUZZLE_FLASH_DURATION = 0.04
 MUZZLE_FLASH_SCALE = 0.05
 MUZZLE_FLASH_COLOR = (1.0, 0.9, 0.3, 1)
+
+
+# 외부 권총 glb 경로 (scripts/download_assets.py 가 받아둠).
+# 파일이 없거나 로드가 실패하면 자동으로 박스 조립 폴백.
+_PISTOL_GLB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "assets", "models", "pistol", "pistol.glb",
+)
+# 외부 모델 사용 여부 — False 로 두면 박스 조립 권총 유지.
+USE_EXTERNAL_MODEL = True
+
+# Quaternius 9mm Beretta calibration:
+#   원본 모델은 X 축이 길이 방향(머즐이 -X), Z 가 위, Y 가 width. 내부에 scale=100
+#   transform 이 박혀 있어 bounds 는 2.2 × 0.32 × 1.5m. setH(-90) 으로 X 축을
+#   pistol-local Y(전방) 으로 돌리고 scale 0.118 로 ~26cm 길이에 맞춤.
+#   setPos 는 grip 이 RIGHT_HAND_REST_POS 근처에 오도록 미세 조정.
+_GLB_SCALE = 0.158
+_GLB_HPR = (-90, 0, 0)
+_GLB_POS = Vec3(-0.026, -0.05, -0.06)
 
 TRACER_DURATION = 0.05
 TRACER_THICKNESS = 2.0
@@ -174,18 +220,50 @@ class Pistol:
     def _build_model(self):
         # 카메라 자식 계층 3단:
         #   np_anchor — player 의 view bob 이 매 프레임 setPos (걷기 시 카메라 카운터-bob).
-        #   np_sway   — 본 클래스의 _update_sway 가 ADS-aware 보행 sway 적용 (신규).
-        #               별도 노드라 ADS lerp / reload Sequence (self.np 를 조작) 과
-        #               충돌하지 않음.
+        #   np_sway   — 본 클래스의 _update_sway 가 ADS-aware 보행 sway 적용.
         #   self.np   — 권총 루트. ADS lerp / recoil / reload 가 pos/hpr 을 점유.
         self.np_anchor = self.base.camera.attachNewNode("pistol_bob_anchor")
         self.np_sway = self.np_anchor.attachNewNode("pistol_sway")
         self.np = self.np_sway.attachNewNode("pistol_root")
         self.np.setPos(PISTOL_REST_POS)
         self._rest_pos = Vec3(PISTOL_REST_POS)
-        # 카메라 회전에 따라 directional light가 권총을 거의 검정에 가깝게 만드는
-        # 경우를 막기 위해 권총만 라이팅을 끄고 setColor 그대로 보이게 한다.
-        self.np.setLightOff()
+
+        # GLB 모델이 있으면 외부 모델로, 실패 시 박스 조립 폴백.
+        built = False
+        if USE_EXTERNAL_MODEL and os.path.exists(_PISTOL_GLB_PATH):
+            try:
+                self._build_glb_parts()
+                built = True
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[weapons] GLB load failed — fallback to box model: {e}",
+                    flush=True,
+                )
+                # 부분적으로 박혀있을 수 있는 자식 노드 정리.
+                for child in list(self.np.getChildren()):
+                    child.removeNode()
+        if not built:
+            self._build_box_parts()
+
+        # 오른손 — 항상 pistol 자식, 그립을 잡은 자세
+        self.right_hand = Hand("right", self.np, self.base)
+        self.right_hand.np.setPos(RIGHT_HAND_REST_POS)
+        self.right_hand.np.setHpr(*RIGHT_HAND_REST_HPR)
+
+        # 왼손 — 평상시 pistol 자식 (재장전 중에는 camera로 reparent)
+        self.left_hand = Hand("left", self.np, self.base)
+        self.left_hand.np.setPos(LEFT_HAND_REST_POS)
+        self.left_hand.np.setHpr(*LEFT_HAND_REST_HPR)
+
+    def _build_box_parts(self):
+        """기존 박스 조립 권총 — GLB 폴백 또는 USE_EXTERNAL_MODEL=False 일 때."""
+        # 박스 권총용 ADS_GUN_POS (calibration 으로 잡아둔 모듈 상수). GLB 경로에선
+        # _build_glb_parts 에서 머즐 진단치로 덮어쓴다.
+        self._ads_gun_pos = Vec3(ADS_GUN_POS)
+        # 무기는 PBR Material + 카메라 자식 weapon_key/fill 라이트로 음영을 만든다.
+        # models/box 의 기본 텍스처가 PBR base color 와 곱해져 회색 톤이 깨지지 않게
+        # 텍스처 stage 만 강제 off (priority=1). Material 의 baseColor 만 적용.
+        self.np.setTextureOff(1)
 
         # 그립 — 안 움직임 (Doom 구도용 1.3배 확대).
         # Z 스택: slide(Z=0.0~0.052) 아래에 frame(Z=-0.032~0.0), 그 아래에 grip.
@@ -196,7 +274,7 @@ class Pistol:
         self.grip.setScale(0.052, 0.065, 0.13)
         # extent: X[-0.026, 0.026] × Y[-0.091, -0.026] × Z[-0.162, -0.032]
         self.grip.setPos(-0.026, -0.091, -0.162)
-        self.grip.setColor(0.30, 0.30, 0.30, 1)
+        self.grip.setMaterial(_GUN_POLYMER_MAT)
 
         # 프레임 — 그립과 슬라이드 이음새, 안 움직임.
         # frame top = slide bottom = 0.0 으로 두께 0.032 를 -Z 방향으로 쌓는다 →
@@ -207,7 +285,7 @@ class Pistol:
         self.frame.setScale(0.058, 0.21, 0.032)
         # extent: X[-0.0293, 0.0287] × Y[-0.078, 0.132] × Z[-0.032, 0.0]
         self.frame.setPos(-0.0293, -0.078, -0.032)
-        self.frame.setColor(0.35, 0.35, 0.35, 1)
+        self.frame.setMaterial(_GUN_POLYMER_MAT)
 
         # 슬라이드 — anchor 노드. scale 없음. 보이는 박스는 자식 slide_mesh가 담당.
         self.slide = self.np.attachNewNode("slide")
@@ -218,7 +296,7 @@ class Pistol:
         slide_mesh.reparentTo(self.slide)
         slide_mesh.setScale(0.065, 0.26, 0.052)
         slide_mesh.setPos(-0.0325, -0.13, 0.0)
-        slide_mesh.setColor(0.55, 0.55, 0.55, 1)
+        slide_mesh.setMaterial(_GUN_METAL_MAT)
 
         # 총신 — slide anchor의 자식. 슬라이드 모션과 함께 움직임.
         # corner-origin 보정: scale X=0.026 → setPos.x = -0.013 으로 두면 barrel 박스가
@@ -231,7 +309,7 @@ class Pistol:
         self.barrel.reparentTo(self.slide)
         self.barrel.setScale(0.026, 0.052, 0.026)
         self.barrel.setPos(-0.013, 0.12, 0.013)
-        self.barrel.setColor(0.45, 0.45, 0.45, 1)
+        self.barrel.setMaterial(_GUN_METAL_MAT)
 
         # 머즐 플래시 — barrel의 자식. 슬라이드/총신 모션을 모두 따라감.
         self._muzzle_flash = self.base.loader.loadModel("models/misc/sphere")
@@ -258,17 +336,101 @@ class Pistol:
         # extent: X[-0.0225, 0.0225] × Y[-0.0875, -0.0295] × Z[-0.20, -0.05]
         self._mag_rest_pos = Vec3(-0.0225, -0.0875, -0.20)
         self.magazine.setPos(self._mag_rest_pos)
-        self.magazine.setColor(0.20, 0.22, 0.30, 1)
+        self.magazine.setMaterial(_GUN_MAG_MAT)
 
-        # 오른손 — 항상 pistol 자식, 그립을 잡은 자세
-        self.right_hand = Hand("right", self.np, self.base)
-        self.right_hand.np.setPos(RIGHT_HAND_REST_POS)
-        self.right_hand.np.setHpr(*RIGHT_HAND_REST_HPR)
+    def _build_glb_parts(self):
+        """외부 glTF 권총 모델 로드 + 계약 노드 매핑.
 
-        # 왼손 — 평상시 pistol 자식 (재장전 중에는 camera로 reparent)
-        self.left_hand = Hand("left", self.np, self.base)
-        self.left_hand.np.setPos(LEFT_HAND_REST_POS)
-        self.left_hand.np.setHpr(*LEFT_HAND_REST_HPR)
+        Quaternius 9mm Beretta (CC-BY) 기준:
+          - "Slide" 서브노드 분리됨 → wrtReparentTo(self.slide) 로 슬라이드 후퇴
+            모션이 실제 시각적으로 보임.
+          - Magazine 분리 안 됨 → 박스 mesh 로 폴백 (기존 stylized 매그 박스).
+          - Trigger / Hammer 서브노드도 분리돼 있지만 본 게임에선 따로 모션 없음 — 본체에
+            함께 그대로 붙어 있음.
+          - 본체 단일 mesh 부분 (9mmBeretta GeomNode) 은 self.np 직속.
+          - 머즐 위치는 bound 의 전방 (+Y) 끝, X/Z 중심으로 자동 계산.
+
+        모델 좌표계 변환: 원본 X 축(머즐 −X) → pistol-local Y(전방). setH(-90) 적용.
+        """
+        pistol_model = NodePath(gltf.load_model(_PISTOL_GLB_PATH))
+        pistol_model.reparentTo(self.np)
+        pistol_model.setScale(_GLB_SCALE)
+        pistol_model.setHpr(*_GLB_HPR)
+        pistol_model.setPos(_GLB_POS)
+        self._pistol_model = pistol_model  # cleanup/debug 용 핸들
+
+        # ----- slide anchor + 실제 Slide 서브노드 reparent -----
+        # self.slide 는 setPos(0,0,0) anchor. Slide 서브노드는 wrtReparentTo 로
+        # 월드 변환 보존하며 anchor 자식 편입 → slide.setPos(_slide_rest_pos +
+        # SLIDE_RECOIL_OFFSET) 호출 시 슬라이드 mesh 가 함께 후퇴.
+        self.slide = self.np.attachNewNode("slide")
+        self._slide_rest_pos = Vec3(0, 0, 0)
+        self.slide.setPos(self._slide_rest_pos)
+        slide_node = pistol_model.find("**/Slide")
+        if not slide_node.isEmpty():
+            slide_node.wrtReparentTo(self.slide)
+
+        # ----- 머즐 위치 — Slide 서브노드만의 bbox 로 계산 -----
+        # 본체+슬라이드 전체 bbox 의 중심 Z 는 그립까지 포함해 너무 낮음.
+        # 실총은 배럴이 슬라이드 안에 있어 슬라이드 자체의 중심선이 배럴 축. 슬라이드
+        # 서브노드를 우선 시도, 없으면 전체 bbox 로 폴백.
+        if not slide_node.isEmpty():
+            sb_min, sb_max = slide_node.getTightBounds(self.np)
+        else:
+            sb_min, sb_max = self.np.getTightBounds(self.np)
+        muzzle_local = Point3(
+            (sb_min.x + sb_max.x) * 0.5,
+            sb_max.y,
+            (sb_min.z + sb_max.z) * 0.5,
+        )
+
+        # ----- barrel: slide 자식 anchor + 머즐 -----
+        # barrel anchor 위치 = 머즐 X/Z, Y 는 slide-local 0. _muzzle_flash 가
+        # barrel-local Y=머즐오프셋 으로 들어가 정확히 총구 끝에 위치.
+        self.barrel = self.slide.attachNewNode("barrel")
+        self.barrel.setPos(muzzle_local.x, 0, muzzle_local.z)
+
+        self._muzzle_flash = self.base.loader.loadModel("models/misc/sphere")
+        self._muzzle_flash.reparentTo(self.barrel)
+        self._muzzle_flash.setPos(0, muzzle_local.y, 0)
+        self._muzzle_flash.setScale(MUZZLE_FLASH_SCALE)
+        self._muzzle_flash.setColor(*MUZZLE_FLASH_COLOR)
+        self._muzzle_flash.hide()
+
+        # ----- magazine 폴백: 박스 mesh (모델에 magazine 노드 없음) -----
+        # Glock/Beretta 매그 — 슬림하고 그립 안쪽에 거의 들어가 손 밑으로 안 튀어나옴.
+        # Z 두께 0.045 → 그립 바닥(Z=-0.128) 으로부터 약 4.5cm 만 노출. 손이 Z=-0.13
+        # 근처라 매그가 살짝만 보임.
+        self.magazine = self.base.loader.loadModel("models/box")
+        self.magazine.reparentTo(self.np)
+        self.magazine.setTextureOff(1)
+        self.magazine.setScale(0.026, 0.035, 0.045)
+        self._mag_rest_pos = Vec3(-0.039, -0.093, -0.173)
+        self.magazine.setPos(self._mag_rest_pos)
+        self.magazine.setMaterial(_GUN_MAG_MAT)
+
+        # ----- grip / frame placeholders -----
+        self.grip = self.np.attachNewNode("grip_placeholder")
+        self.frame = self.np.attachNewNode("frame_placeholder")
+
+        # ----- ADS 자동 calibration -----
+        # 머즐의 pistol-local (x, z) 만큼 반대로 pistol root 를 옮겨 ADS 자세에서
+        # 머즐이 카메라 광축 (크로스헤어 = (0, _, 0) camera-local) 과 정렬됨.
+        # _ADS_GUN_LOWER 만큼 추가로 권총 전체를 아래로 내려 "iron sight 너머로 보는"
+        # 자세 — 머즐을 정확히 크로스헤어에 맞추면 권총 본체가 중앙을 가려 답답함.
+        _ADS_GUN_LOWER = 0.04
+        self._ads_gun_pos = Vec3(
+            -muzzle_local.x,
+            ADS_GUN_POS.y,
+            -muzzle_local.z - _ADS_GUN_LOWER,
+        )
+
+        print(
+            f"[weapons] glb model loaded (Quaternius 9mm). muzzle pistol-local = "
+            f"({muzzle_local.x:.4f}, {muzzle_local.y:.4f}, {muzzle_local.z:.4f})  "
+            f"ads_gun_pos = {self._ads_gun_pos}",
+            flush=True,
+        )
 
     def _setup_raycast(self):
         self.traverser = CollisionTraverser("pistol_shoot")
@@ -388,7 +550,7 @@ class Pistol:
             return
         if self._current_ads is not None:
             self._current_ads.finish()
-        target = ADS_GUN_POS if active else self._rest_pos
+        target = self._ads_gun_pos if active else self._rest_pos
         self._current_ads = LerpPosInterval(self.np, ADS_LERP_TIME, target)
         self._current_ads.start()
         self._fade_hands(0.0 if active else 1.0)
