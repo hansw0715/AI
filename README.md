@@ -1,198 +1,129 @@
-# fps_game
+# zombie_game
 
-Panda3D 기반 1인칭 FPS 좀비 서바이벌 게임. **Vampire Survivors 풍의 레벨업 시스템** + 부위별 데미지 + 두더지처럼 땅을 파고 등장하는 좀비 연출.
+Mirror's Edge 스타일 1인칭 좀비 슈터 프로토타입 (Panda3D).
+풀바디 Mixamo Y Bot 캐릭터를 그대로 두고 카메라를 머리 본에 attach해서 — 아래 보면 자기 몸/다리, 옆 보면 어깨가 보이는 시점.
 
-> 파이썬 기말 프로젝트 — 바이브코딩 기반 자유 주제
-
----
-
-## 팀원 및 역할
-
-| 이름 | GitHub | 역할 / 기여 |
-|------|--------|------------|
-| hansw0715 | [@hansw0715](https://github.com/hansw0715) | _(역할 추후 기입)_ |
-| 임우찬 | _(GitHub ID 추후 기입)_ | _(역할 추후 기입)_ |
-| 문건녕 | _(GitHub ID 추후 기입)_ | _(역할 추후 기입)_ |
-
-> 협업 흔적은 각 팀원의 작업 브랜치(`feat/*`)와 main 으로 머지된 PR 에서 확인 가능합니다.
-
----
-
-## 실행 모습
-
-> 스크린샷 / GIF 는 발표 직전에 캡처해서 `assets/` 에 추가하고 아래에 링크합니다.
-
-- ![게임 플레이](assets/gameplay.gif) ← _(녹화 후 추가)_
-- ![레벨업 카드](assets/levelup.png) ← _(녹화 후 추가)_
-- ![좀비 등장](assets/emerge.png) ← _(녹화 후 추가)_
-
----
-
-## 기획 요약
-
-평범한 좀비 슈팅에 **로그라이크 성장 루프**를 결합. 한 마리 죽일 때마다 XP 가 누적되고, 레벨업 시 4 장의 특성 카드 중 1 장을 골라 권총·이동·체력 등을 강화한다. 좀비는 한 곳에서 펑 하고 나타나는 대신 흙더미 텔레그래프 → 솟아오름 순으로 등장해 위치 예측 + 긴장감을 준다.
-
-- **장르**: 1인칭 FPS + 로그라이크 성장
-- **목표**: 10 웨이브를 클리어. 후반 웨이브로 갈수록 좀비가 늘고 XP 곡선이 가파라져 어떤 특성을 고르느냐가 승패를 가른다.
-- **기대 효과**: 단순 사격 반복이 아니라, *내 빌드를 어떻게 키울까* 라는 작은 의사결정이 매 레벨마다 발생.
-
----
-
-## 주요 기능 / 코드 설명
-
-### 1. 1인칭 권총 시스템 (`src/weapons.py`)
-- 그립 / 프레임 / 슬라이드 / 총신 / 탄창 / 양손 부품 박스 조립
-- 발사 raycast (부위별 데미지 배율), 머즐 플래시, 트레이서, 슬라이드 후퇴, 반동
-- ADS (우클릭 줌), 보행 sway, 검사 자세 재장전 안무 (2.0초)
-- **레벨업 호환:** `BASE_DAMAGE / COOLDOWN / MAG_SIZE / RELOAD_TIME` 을 모듈 상수가 아닌 인스턴스 속성으로 보관해 런타임에 강화 가능. 재장전 타이머도 `doMethodLater` 대신 `update(dt)` 카운트다운 — paused / 레벨업 카드 동안 자동 정지.
-
-### 2. 좀비 AI + 등장 연출 (`src/zombie.py`)
-- 사람 형태 박스 조립 + 어깨/엉덩이 pivot 워킹 애니메이션
-- 추적 → windup → strike → recover 공격 상태머신
-- **등장 연출 (waiting → telegraph → emerging → alive)**:
-  - 흙더미 카드 1.4m × 1.4m + 갈색 흙 파티클 분수
-  - root Z 를 `-1.9` → `0.0` 으로 ease-out 1.5 초 lerp
-  - 같은 웨이브 N 마리가 한꺼번에 솟지 않도록 무작위 `spawn_delay` staggering
-- 부위별 hit-sphere (`head / body / 팔 / 다리`) + DAMAGE_MULTIPLIER
-
-### 3. 레벨업 시스템 (`src/level_up.py`)
-- `LevelUpManager` — XP 누적, 레벨 큐 처리, `xp_multiplier`
-- `LevelUpScreen` — DirectGUI 4 카드 화면 + 마우스 모드 토글
-- 8 특성: 데미지 / 연사 / 탄창 / 신속 재장전 / 이동 속도 / 최대 체력 / 즉시 회복 / 경험치 획득
-- 4 단계 효과량 (common / rare / epic / legendary) — 카드별 독립 굴림
-- **XP 곡선**: `30 + (L-1)*20 + (L-1)^2 * 5` (2차) — 후반일수록 가파르게 어려워짐
-
-### 4. HUD / UI (`src/ui.py`)
-- 크로스헤어, 탄약, HP, 피격 비네트
-- 웨이브 정보 + 인터미션 카운트다운
-- 좌상단 `Lv N` + render2d 전폭 노란 XP 바
-- 한글 폰트 동적 로드 (맑은 고딕) — 모든 OnscreenText / DirectGUI 자동 적용
-
-### 5. 그 외
-- `src/player.py` — 마우스룩, 이동, 점프, 중력, 지면 ray, ADS FOV, view bob
-- `src/effects.py` — 피격 파티클 + 흙 분수 파티클 (같은 task-loop 패턴)
-- `src/damage_numbers.py` — 월드 공간 데미지 숫자 (빌보드, 페이드)
-- `src/start_screen.py`, `src/settings_menu.py` — 시작 / 일시정지 메뉴
-
----
-
-## 기술 스택
-
-- **언어**: Python 3.11.9
-- **엔진**: Panda3D 1.10.16
-- **OS**: Windows 10/11
-- **에디터 / AI 도구**: VS Code + Claude Code (Anthropic Opus 4.7)
-
----
-
-## 실행 방법
-
-### 환경 셋업
-
-```powershell
-py -3.11 -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-PowerShell 실행 정책 오류가 나면:
-
-```powershell
-Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
-
-### PBR 에셋 다운로드 (처음 한 번)
-
-게임은 PBR(physically-based rendering) 텍스처와 HDRI 라이팅을 사용한다. 에셋
-파일은 외부 CC0 라이선스로 받아오므로 git 에 안 들어 있다. 최초 클론 후 한 번:
-
-```powershell
-python scripts/download_assets.py
-```
-
-→ `assets/textures/ground/*.jpg` (Ground037 PBR 셋) + `assets/hdri/sky.hdr`
-(흐린 하늘 HDRI). idempotent — 이미 받았으면 건너뜀.
-
-### 설치 검증
-
-```powershell
-python test_install.py
-```
-
-### 실행
-
-```powershell
-python -m src.main
-```
-
----
+> 이전 ursina 기반 FPS 프로토타입은 `zombie_game_ursina.py` 로 보존 (참고용).
+> 메인 코드는 `zombie_game.py` (Panda3D 직접 사용).
 
 ## 조작
 
-| 키 | 동작 |
-|----|------|
-| WASD | 이동 |
-| Shift | 달리기 (1.5x) |
+| 입력 | 동작 |
+| --- | --- |
+| W / S | 전진 / 후진 (Run) |
+| A / D | 좌 / 우 스트레이프 |
+| 마우스 | 시선 (yaw / pitch) |
 | Space | 점프 |
-| Mouse | 시점 |
-| Mouse1 | 발사 |
-| Mouse3 (우클릭) | ADS (조준) |
-| R | 재장전 |
-| Esc | 일시정지 / 설정 |
+| Ctrl | 무릎 자세 토글 (Kneel) |
+| 좌클릭 | Shoot (현재는 카메라 반동만, 별도 사격 애니 없음) |
+| F | Punch |
+| F2 | 3인칭 디버그 카메라 토글 |
+| ESC | 종료 |
 
-레벨업 카드가 뜨면 4 장 중 한 장을 **클릭**해서 효과를 적용 + 게임 재개.
+## 실행
 
----
+```powershell
+pip install -r requirements.txt
+python zombie_game.py
+```
 
-## 디렉토리 구조
+`assets/ybot/scene.bam` 이 이미 레포에 포함되어 있어서 위 두 줄이면 끝.
+
+## 의존성
+
+- **Python 3.11+** (테스트 환경: 3.14.3)
+- **panda3d** ≥ 1.10.16 — 런타임 엔진
+- **panda3d-gltf** ≥ 1.3.0 — bam 의 glTF 자산 import
+- **panda3d-blend2bam** ≥ 0.26.0 — 자산 재빌드용 (런타임 불필요)
+- **Blender 5.1+** — 자산 재빌드용 (런타임 불필요)
+
+`assets/ybot/scene.bam` 가 정상이면 Blender 와 blend2bam 은 설치 안 해도 됨.
+
+## 자산 — Mixamo
+
+게임에 들어간 9 개 애니메이션은 모두 [Mixamo](https://www.mixamo.com) 에서 무료로 받을 수 있다. Adobe 계정만 있으면 됨.
+
+### 필요한 파일
+
+1. **Y Bot** (캐릭터)
+   - Mixamo 첫 화면 → CHARACTERS → "Y Bot" 검색 → **DOWNLOAD** → FBX Binary, **Without Animation**, T-Pose
+   - 저장명: `Y Bot.fbx`
+
+2. **애니메이션** — Y Bot 을 선택한 상태에서 ANIMATIONS 탭에서 검색 후 각각 다운로드.
+   FBX Binary / 30 fps / **Without Skin** / In Place 옵션은 체크하지 않아도 됨 (어차피 본 프로젝트가 root motion 을 제거함).
+
+   | 검색 키워드 | 저장명 | 게임 내 이름 |
+   | --- | --- | --- |
+   | Pistol Idle | `pistol idle.fbx` | Idle, Shoot |
+   | Pistol Run | `pistol run.fbx` | RunForward |
+   | Pistol Run Backward | `pistol run backward.fbx` | RunBackward |
+   | Pistol Strafe (왼쪽) | `pistol strafe (2).fbx` | StrafeL |
+   | Pistol Strafe (오른쪽) | `pistol strafe.fbx` | StrafeR |
+   | Pistol Jump | `pistol jump.fbx` | Jump |
+   | Pistol Kneeling Idle | `pistol kneeling idle.fbx` | KneelIdle |
+   | Punching | `Punching.fbx` | Punch |
+
+   > 참고: 본 프로젝트는 Mixamo 의 *Pistol_Handgun Locomotion Pack* 파일명을 그대로 사용했다. 같은 모션을 다른 이름으로 받았다면 빌드 명령어의 경로만 맞춰주면 됨.
+
+### 자산 재빌드
+
+다운받은 9 개 FBX 를 한 폴더에 모은 뒤 (예: `C:\fbx\`):
+
+```powershell
+$blender = "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+$fbx     = "C:\fbx"
+
+# (1) Y Bot + 8 개 anim FBX 를 단일 scene.blend 로 머지
+& $blender --background --python scripts/blender_merge_ybot.py -- `
+  "$fbx\Y Bot.fbx" `
+  "assets/ybot/scene.blend" `
+  "Idle=$fbx\pistol idle.fbx" `
+  "RunForward=$fbx\pistol run.fbx" `
+  "RunBackward=$fbx\pistol run backward.fbx" `
+  "StrafeL=$fbx\pistol strafe (2).fbx" `
+  "StrafeR=$fbx\pistol strafe.fbx" `
+  "Jump=$fbx\pistol jump.fbx" `
+  "KneelIdle=$fbx\pistol kneeling idle.fbx" `
+  "Shoot=$fbx\pistol idle.fbx" `
+  "Punch=$fbx\Punching.fbx"
+
+# (2) locomotion 액션들에서 Hips 본 location 키프레임 제거 (사이클 끝 깜빡임 방지)
+& $blender --background --python scripts/blender_strip_root.py -- `
+  "assets/ybot/scene.blend" RunForward RunBackward StrafeL StrafeR Jump
+
+# (3) .blend → .bam 변환
+blend2bam --blender-dir "C:\Program Files\Blender Foundation\Blender 5.1" `
+  "assets/ybot/scene.blend" "assets/ybot/scene.bam"
+```
+
+## 파일 구조
 
 ```
-fps_game/
-├── README.md
-├── PROGRESS.md           # 상세 구현 노트 + 함정 메모
-├── PROMPTS.md            # 바이브코딩 프롬프트 기록
+.
+├── zombie_game.py             # 메인 게임 (Panda3D)
+├── zombie_game_ursina.py      # 이전 ursina 프로토타입 (legacy)
 ├── requirements.txt
-├── test_install.py
-├── assets/               # 모델/텍스처/사운드/폰트 (현재 비어 있음)
-├── config/
-└── src/
-    ├── main.py           # 진입점, 상태 플래그(started/paused/level_up_active)
-    ├── player.py         # 1인칭 컨트롤러
-    ├── weapons.py        # 권총 + 양손
-    ├── zombie.py         # 좀비 AI + 등장 연출
-    ├── level_up.py       # 레벨업 매니저 + 카드 화면 + 특성 풀
-    ├── hands.py
-    ├── effects.py        # 피격 파티클 + 흙 분수
-    ├── damage_numbers.py
-    ├── ui.py             # HUD
-    ├── start_screen.py
-    ├── settings_menu.py
-    └── physics.py
+├── README.md
+├── assets/
+│   └── ybot/
+│       ├── scene.bam          # 9 개 anim + 메쉬, 게임이 직접 로드
+│       └── scene.blend        # Blender 소스 (재빌드용)
+└── scripts/
+    ├── blender_merge_ybot.py  # FBX 머지 → scene.blend
+    └── blender_strip_root.py  # 액션에서 Hips XYZ location 제거
 ```
 
----
+## 구현 메모
 
-## 협업 / 브랜치 전략
+- **카메라**: `mixamorig:Head` 본의 월드 좌표에 매 프레임 attach (0.22 m 전방 오프셋). 시선 yaw/pitch 는 마우스 입력 — head 본 자체 회전은 무시.
+- **애니메이션 블렌딩**: `Actor.enableBlend()` + 매 프레임 지수 평활로 weight 수렴. 액션 전환 시 움찔거림 제거.
+- **Root motion 제거**: locomotion 애니들의 `mixamorig:Hips` location fcurve 를 Blender 단계에서 통째로 잘라냄. 캐릭터는 제자리에서 뛰고, 실제 이동은 코드가 `player_pos` 로 처리.
+- **Hips XY anchor**: 액션 간 rest pose 차이 (Idle Y=-0.94, Shoot Y=-0.89 식) 도 anchor 코드로 보정 → 액션 전환 시 머리가 카메라 안으로 밀려들어와 뒤통수 보이는 버그 차단.
+- **사격 반동**: Shoot 애니 자체에 팔 움직임이 없어서 카메라 pitch 킥 + 전방 오프셋 감소로 시뮬레이션. 지수 감쇠로 자연 복귀.
 
-- `main` : 최종 머지 대상. 모든 변경은 PR 을 거쳐 들어옵니다.
-- `feat/*` : 팀원별 작업 브랜치. 예) `feat/level-up-screen`, `feat/zombie-emerge`, `feat/audio`
-- PR 제목: `[기능] 한 줄 요약`
-- 머지 전 다른 팀원 1 명 이상의 리뷰 권장
+## 다음 단계
 
----
-
-## 바이브코딩 프롬프트 기록
-
-전체 프롬프트와 단계별 의사결정은 [`PROMPTS.md`](PROMPTS.md) 에서 확인.
-
----
-
-## 진행 상태 / 다음 단계
-
-세부 구현 노트, 튜닝 상수, 해결됐던 함정들은 [`PROGRESS.md`](PROGRESS.md) 에 정리되어 있습니다.
-
-남은 작업 후보:
-- 사운드 (발사음, 좀비 신음, 재장전음)
-- 게임오버 / 리스폰 UI
-- 벽 충돌 (현재 지면만)
-- 환경 복원 (나무/바위 등)
+- [ ] 손에 무기 메쉬 attach (mark_23 등)
+- [ ] 좀비 적 spawn + 단순 AI
+- [ ] 층 전환 시스템 (고층 → 저층)
+- [ ] 정식 권총 발사 애니 (Mixamo "Firing Rifle" 의 Pistol 옵션 등) — 현재의 카메라 반동만 의존하는 사격을 대체

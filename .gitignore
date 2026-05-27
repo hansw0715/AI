@@ -1,14 +1,15 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 .vscode/
+.idea/
 *.log
 build/
 dist/
 .DS_Store
 
-# 외부 PBR 에셋 — scripts/download_assets.py 로 처음 클론 후 한 번만 받는다.
-# 사이즈 큰 바이너리(JPG/HDR/GLB) 라 git 에 안 올림.
-assets/textures/
-assets/hdri/
-assets/models/
+# Blender / asset 백업
+*.bak
+*.blend1
+*.blend@
