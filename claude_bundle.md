@@ -1,3 +1,219 @@
+# zombie_game — Claude Project Bundle
+
+학교 그룹 프로젝트 (`hansw0715/AI` GitHub, branch `2693044한승원`).
+Mirror's Edge 스타일 1인칭 좀비 슈터 프로토타입.
+
+> **현재 스냅샷 기준:** `backups/20260530-011714-reload-ok/` (zombie_game.py / scene.bam /
+> scene.blend / blender_scaffold_reload.py 4종 보존). 이후 작업하다 깨지면 이 백업으로 복귀.
+
+---
+
+## 1. 프로젝트 개요
+
+- **장르:** 1인칭 좀비 슈터
+- **엔진:** Panda3D 1.10.16
+- **캐릭터:** Mixamo Y Bot 풀바디 (카메라가 head 본에 attach)
+- **무기:** 9mm Beretta (Sketchfab), RightHand 본에 attach
+- **현재 단계:** Stage 1 — 1인칭 카메라 + 풀바디 + 권총 + 사격(Shoot+슬라이드 후퇴+반동) + 무릎 transition + ESC paused + R **재장전(IK 5단계 + 손등 위 자세)**
+
+## 2. 환경
+
+- OS: Windows 11
+- Python: 3.14.5 (`C:\Users\hansw\AppData\Local\Python\pythoncore-3.14-64\`)
+- Panda3D: `panda3d>=1.10.16`, `panda3d-gltf>=1.3.0`, `panda3d-blend2bam>=0.26.0`
+- Blender: 5.1.2 (`C:\Program Files\Blender Foundation\Blender 5.1\blender.exe`)
+
+### `blend2bam` ↔ Blender 5.x 패치 (재적용 필요)
+`blender_scripts/exportgltf.py` 약 309행:
+```python
+try:
+    addon_prefs['allow_embedded_format'] = True
+except (TypeError, KeyError):
+    pass
+```
+
+## 3. 디렉토리 구조
+
+```
+C:\Users\hansw\workspace\AI\
+├── zombie_game.py              # 메인 (Panda3D, 810 lines)
+├── requirements.txt
+├── README.md
+├── claude_bundle.md            # ← 이 파일
+├── assets/
+│   ├── ybot/
+│   │   ├── scene.bam           # Y Bot 메쉬 + 14개 anim (Reload 포함)
+│   │   ├── scene.blend         # Blender 소스
+│   │   ├── scene.backup.blend  # reload 작업 전 백업
+│   │   └── scene.backup.bam
+│   └── weapons/
+│       ├── 9mm_pistol.glb / .blend / .bam   # ← 게임이 로드 (127KB)
+│       └── animated_pistol.glb / .blend / .bam # 미사용 (Sketchfab view model)
+├── backups/
+│   └── 20260530-011714-reload-ok/           # Reload 완성 직후 스냅샷
+│       ├── zombie_game.py
+│       ├── scene.bam / scene.blend
+│       └── blender_scaffold_reload.py
+└── scripts/
+    ├── blender_merge_ybot.py
+    ├── blender_add_anims.py
+    ├── blender_strip_root.py
+    ├── blender_glb_to_blend.py
+    ├── blender_scaffold_reload.py   # ← reload anim 스캐폴드 (FK + IK + forearm roll)
+    └── peek_glb.py
+```
+
+## 4. 입력 매핑
+
+| 입력 | 동작 |
+| --- | --- |
+| W/S/A/D | 이동 |
+| 마우스 | 좌우 yaw만 (상하 고정) |
+| Space | 점프 |
+| Ctrl | 무릎 transition (StandToKneel ↔ KneelToStand) |
+| 좌클릭 | Shoot (hands 단발 + 슬라이드 후퇴 + 캐릭터 뒤로 반동) |
+| **R** | **Reload (upper+hands 단발, 1~4=FK + 5=IK + LeftForeArm roll)** |
+| F2 | free-cam |
+| ESC | paused 메뉴 (Resume / Quit) |
+| **I/J/K/L/U/O** | **슬라이드 IK target marker 튜닝 (RightHand local, 2cm step)** |
+| **P** | **현재 marker 좌표 dump + 화면 가운데 큰 글씨 3초 overlay** |
+
+## 5. anim 목록 (scene.bam)
+
+`Idle`, `RunForward`, `RunBackward`, `StrafeL`, `StrafeR`, `Jump`,
+`KneelIdle`, `StandToKneel`, `KneelToStand`,
+`WalkForward`, `WalkBackward`, `Shoot`, `Punch`, **`Reload`**,
+`Armature|mixamo.com|Layer0` (무시).
+
+## 6. 핵심 디자인 / Reload 시퀀스
+
+### 6.1 골격 3파트 (`makeSubpart`)
+```
+lower : Hips + 다리/발               → 항상 locomotion (달리며 reload 가능)
+upper : Spine + 자손 (손 제외)       → locomotion (reload 중엔 Reload)
+hands : 양손 + 손가락                → Shoot/Reload 단발
+```
+글로브 패턴: `*Hips`/`*Spine` 좁게, `*Spine*`/`*LeftHand*`/`*RightHand*` 로 exclude.
+
+### 6.2 권총 attach (Mixamo cm 잔재 우회)
+- `setScale(self.render, ...)` 로 world 절대 크기 박음 (hand world scale = 0.01).
+- `flattenLight()` 로 glTF RootNode self-transform 제거.
+- `weapon_anchor` NodePath (self.render 자식) 에 weapon reparent. `_update` 안에서
+  `ybot.update(force=True)` 직후 hand 본 world pos+hpr 복사 → 같은 프레임 sync (잔상 방지).
+- 최종 값: `SCALE=0.1195`, `POS=(0.0, 0.09, 0.04)`, `HPR=(22.5, -78.2, 108.9)`.
+
+### 6.3 사격 반동 = 카메라 안 흔들림
+- ybot 자체를 카메라 -forward 방향 `recoil_back=3cm` 만큼 뒤로 → 팔·손·권총 다 같이 뒤로
+- 카메라는 `+forward * recoil_back` 보정 → 시점 절대 위치 고정
+- Slide named node 후퇴: `weapon.find('**/Slide')` + 사격 시 `+X` 방향 후퇴 + 지수 감쇠
+
+### 6.4 Reload — v5 IK 5단계 시퀀스 + LeftForeArm roll
+
+**시퀀스 (총 2초, END=60f, FPS=30):**
+```
+f0   그립 (북엔드)
+f12  1) 오른손 총 살짝 기울임 + 왼손 탄창으로  ──── FK PHASES
+f22  2) 왼손 탄창 빼기 (아래로)              ──── FK PHASES
+f34  3) 왼손 탄창 다시 넣기 (위로)           ──── FK PHASES
+f42  4) 오른손 원위치 (총 그립 복귀)          ──── FK PHASES
+f48  5) 왼손 슬라이드로 (잡음)                ──── IK build_slide_ik + LFORE roll
+f53  5') 슬라이드 당김 + 게임 slide_recoil    ──── IK build_slide_ik + LFORE roll
+f57  5'') 그립으로 가는 중간                  ──── IK build_slide_ik + LFORE roll
+f60  그립 복귀 (북엔드)
+```
+
+**1~4단계 = FK 추가회전.** 그립 포즈에 본별 (axis, deg) 누적. Mixamo 본 로컬 축이 일관 안 돼서
+시도-수정 반복으로 잡힌 값들 (`scripts/blender_scaffold_reload.py` 의 `PHASES` 참조).
+
+**5단계 = IK + 손등 위 roll.** FK 회전값으로는 손끝을 특정 위치로 못 보내는 문제 →
+`build_slide_ik` 함수가 LeftForeArm 에 2본 IK constraint 임시로 걸어 target 위치로 자세 풀고,
+visual matrix 를 `pb.matrix = ...` 로 키프레임 박음 (constraint 제거). 그 다음 LeftForeArm
+local Y(길이축) 으로 `SLIDE_FOREARM_ROLL=90°` 추가 회전 → 손등이 위를 향함 (이전까지 손바닥이
+위로 가던 문제 해결). LeftHand 만 회전 따로 (IK 체인 밖, `SLIDE_WRIST`).
+
+**IK target = RightHand armature-space 위치 + offset (game 내 P-marker 로 잡음):**
+```python
+SLIDE_RIGHT        = 8.0    # X (좌우)
+SLIDE_FWD          = 20.0   # Y (총신 방향 — Mixamo 본 +Y = 캐릭터 뒤, 사용자 forward = -Y)
+SLIDE_UP           = 15.0   # Z (위)
+SLIDE_PULL         = 6.0    # 슬라이드 당길 때 -Y
+SLIDE_WRIST        = ((1, 0, 0), 20)   # 손목 회전 (IK 가 팔만 풀므로 따로)
+SLIDE_FOREARM_ROLL = 90                # LFORE local Y roll → 손등 위
+```
+
+**런타임 통합 (`_play_reload_oneshot`):**
+- upper+hands 두 파트에 `Reload` 단발. lower 는 locomotion 그대로 (달리며 reload OK, 단
+  Section 8 의 흔들림 이슈 있음).
+- `dur * 0.88` 시점에 `slide_recoil = slide_recoil_kick` (f53 ≈ 0.88) 동기.
+- `back_after` 콜백: `_reload_oneshot=False` + `current_anim='__reload_done__'` sentinel
+  → 다음 프레임 `_update_locomotion` 강제 재평가.
+- reload 중 Shoot/Ctrl 입력 잠금.
+
+### 6.5 ESC paused 메뉴
+`DirectFrame` + Resume/Quit `DirectButton`. paused = `_update` early return + cursor visible
++ absolute mode.
+
+### 6.6 카메라
+- head 본 world pos + `eye_forward_offset=0.18m` 시선 방향 + `eye_lateral_offset=0.10m`
+  왼쪽 (= 권총 우측 배치, FPS 표준)
+- 사격 시 ybot 뒤로 가는 만큼 `+forward * recoil_back` 보정 → 시점 고정
+- 1인칭 yaw 만, F2 free-cam 만 pitch 허용
+
+## 7. Reload 자산 재빌드
+
+```powershell
+$blender = "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+Set-Location "C:\Users\hansw\workspace\AI"
+
+# (a) Reload 액션 스캐폴드 (FK PHASES + IK build_slide_ik + LFORE roll)
+& $blender --background --python "scripts\blender_scaffold_reload.py" -- `
+  "assets/ybot/scene.blend" "assets/ybot/scene.blend"
+
+# (b) Reload 의 Hips location 키 제거 (in-place 화)
+& $blender --background --python "scripts\blender_strip_root.py" -- `
+  "assets/ybot/scene.blend" Reload
+
+# (c) .blend → .bam
+python -m blend2bam --blender-dir "C:\Program Files\Blender Foundation\Blender 5.1" `
+  "assets/ybot/scene.blend" "assets/ybot/scene.bam"
+```
+
+스캐폴드는 메쉬 안 건드림 → 반복 안전. `scene.backup.blend` 백업 보존.
+
+## 8. 알려진 이슈 / TODO
+
+- **Reload 완성 상태.** SLIDE IK + `SLIDE_FOREARM_ROLL=90` 로 손등 위 자세 잡힘.
+  좋은 상태가 `backups/20260530-011714-reload-ok/` 에 스냅샷으로 박혀 있음.
+  이후 변경하다 깨지면 이 폴더에서 `zombie_game.py`/`scene.bam`/`scene.blend`/
+  `blender_scaffold_reload.py` 를 다시 복사.
+- **걸으면서 R 누르면 권총·팔이 화면 밖으로 휘둘리는 버그.** RunForward 의 Hips
+  회전(Hips location 만 strip 되고 H/P/R 은 그대로) 이 Spine→Arm→Hand 에 전파되는데,
+  upper 파트가 Reload(정적 grip 포즈) 라 평소처럼 Spine 자체 sway 로 상쇄 안 됨.
+  → 머리는 Hips Z 축 위라 거의 안 움직이는데 손은 앞·옆 거리 때문에 큰 호 →
+  카메라(머리 따라감) 기준으로 권총·손이 화면 가장자리로 휘둘림. 가만히 있을 때는
+  Reload 모션이 그대로 잘 보임. 접근 후보:
+  - (a) reload 중 Hips HPR 을 ref(Idle 캡처값) 으로 ramp lock → 상체 안정, 다리는
+    children 이라 자기 swing 그대로 → "행진" 느낌 (실험 결과 카메라/총 안정성은 OK 였음)
+  - (b) lower 에 Idle 가중 섞어 Hips 흔들림 dampen (다리 swing 도 함께 줄어듦)
+  - (c) 카메라/weapon anchor 만 stabilized frame 에서 sample 하는 보정 (보이는 손/팔은
+    여전히 흔들려서 총이 손에서 떨어져 보이는 부작용 — 시도해봤지만 자연스럽지 못함)
+  현재 미해결, 다음 세션 과제.
+- marker 하네스 (I/J/K/L/U/O/P) 는 튜닝 끝나면 통째 제거 예정.
+- 좀비 spawn / AI, 머즐 플래시 / 사격음, 맵 디자인 — 미구현.
+
+## 9. 실행
+
+```powershell
+cd C:\Users\hansw\workspace\AI; python zombie_game.py
+```
+
+---
+
+# 10. 코드 전문
+
+## 10.1 `zombie_game.py`
+
+```python
 """
 zombie_game — Mirror's Edge style 1인칭 좀비 슈터 (Panda3D)
 Stage 1: 1인칭 카메라 + Y Bot 풀바디 + 기본 입력.
@@ -161,16 +377,6 @@ class ZombieGame(ShowBase):
         self.recoil_back = 0.0           # 현재 반동 양 (m, world 단위)
         self.recoil_decay = 10.0         # 1/sec, 클수록 빨리 복귀
         self.recoil_shoot_back = 0.03    # 발사 시 인가되는 뒤로 오프셋 (3cm — pistol 적당)
-
-        # Reload 중 W/S 걸을 때 lower 가 Idle 로 고정되어 몸이 미끄러지는 느낌
-        # → ybot 에 사인파 Z bob 을 더하고 카메라엔 같은 값을 빼서 상쇄. 화면은
-        # 정적, 자기 팔·손·총만 위아래로 까딱이는 효과. _walk_bob_t 로 reload+이동
-        # 조건일 때만 ramp in, 끝나면 ramp out.
-        self._walk_bob_t = 0.0
-        self._walk_bob_phase = 0.0
-        self._walk_bob_amp_z = 0.025     # peak ±2.5cm
-        self._walk_bob_freq = 10.0       # rad/s (≈ 1.6 Hz)
-        self._walk_bob_speed = 5.0       # in/out ramp 1/sec
 
         # Hips root motion 상쇄용. Mixamo 머지 .bam 은 각 액션의 Hips 시작 위치가
         # 미묘하게 달라서 (예: Idle Y=-0.944, Shoot Y=-0.892) 액션 전환 시 캐릭터
@@ -484,13 +690,6 @@ class ZombieGame(ShowBase):
         if self.kneel_state in ('going_down', 'going_up'):
             return
         target = self._target_anim()
-        # Reload 중 W/S = RunForward/RunBackward 는 Mixamo anim 의 Hips pitch
-        # (앞으로 숙임) 가 살아있어서 Spine→Arm→Hand 로 전파 → 권총·팔이 화면
-        # 아래로 빠짐. A/D 의 StrafeL/R 은 Hips pitch 가 없어 reload 가 정상으로
-        # 보이는 거. 같은 효과를 W/S 에도 주려고 lower 를 Idle 로 대체 — 다리는
-        # 멈추지만 player_pos 는 그대로 전진/후진. 1인칭이라 다리는 거의 안 보임.
-        if self._reload_oneshot and target in ('RunForward', 'RunBackward'):
-            target = 'Idle'
         loco_w = {a: (1.0 if a == target else 0.0) for a in self.anim_names}
         # lower: 항상 locomotion. Shoot 단발 중에도 다리는 안 멈춤.
         self._target_w['lower'] = dict(loco_w)
@@ -755,21 +954,7 @@ class ZombieGame(ShowBase):
         yr_recoil = radians(self.player_yaw)
         fwd_recoil = Vec3(-sin(yr_recoil), cos(yr_recoil), 0)
         recoil_offset = fwd_recoil * (-self.recoil_back)
-
-        # Walk bob (Z) — reload 중 + 이동키 눌렸을 때만 ramp in. 카메라에서 같은
-        # bob_z 를 빼서 화면은 정적, 자기 몸·팔·총만 까딱.
-        moving = any(self.keys[k] for k in ('w', 'a', 's', 'd'))
-        target_bob = 1.0 if (self._reload_oneshot and moving) else 0.0
-        self._walk_bob_t += ((target_bob - self._walk_bob_t)
-                             * min(1.0, dt * self._walk_bob_speed))
-        if self._walk_bob_t > 0.001:
-            self._walk_bob_phase += dt * self._walk_bob_freq
-        else:
-            self._walk_bob_phase = 0.0
-        bob_z = (self._walk_bob_amp_z * self._walk_bob_t
-                 * sin(self._walk_bob_phase))
-
-        self.ybot.setPos(self.player_pos + recoil_offset + Vec3(0, 0, bob_z))
+        self.ybot.setPos(self.player_pos + recoil_offset)
         self.ybot.setH(self.player_yaw + 180)
         # 애니메이션을 현재 시각으로 강제 동기화. 안 하면 joint 의 world 좌표가
         # 1프레임 lag 된 상태를 반환해서 카메라가 머리에서 떨림.
@@ -815,7 +1000,6 @@ class ZombieGame(ShowBase):
                     head_w
                     + forward * (self.eye_forward_offset + self.recoil_back)
                     - right_v * self.eye_lateral_offset
-                    - Vec3(0, 0, bob_z)   # ybot 의 Z bob 상쇄 → 카메라 정적
                 )
             else:
                 self.camera.setPos(self.player_pos + Vec3(0, 0, self.head_height))
@@ -840,3 +1024,356 @@ class ZombieGame(ShowBase):
 
 if __name__ == '__main__':
     ZombieGame().run()
+```
+
+## 10.2 `scripts/blender_scaffold_reload.py` — Reload anim 빌드
+
+```python
+"""
+scene.blend 에 'Reload' 액션을 스캐폴딩 (헤드리스 Blender) — 멀티페이즈 버전.
+
+시퀀스:
+  그립 → 오른손으로 총 살짝 기울임 + 왼손 탄창으로 → 빈 탄창 빼서 아래로
+       → 왼손 최저(새 탄창 집기) → 탄창 삽입 → 왼손 슬라이드로 → 슬라이드 당김 → 그립 복귀
+
+- 북엔드(f0 / END)는 GRIP_SOURCE_ANIM(기본 Idle) 그립 포즈 → locomotion 과 이음새 없음
+- 각 페이즈에서 명시한 본만 그립 포즈에 추가 회전, 나머지 본은 그립 유지
+- 오른손(총) tilt 는 '살짝'만 + 끝에서 그립 복귀 → 총이 화면에서 안정적
+- 슬라이드 래킹은 게임 코드의 slide_recoil 가 담당 (이 스크립트는 손 모션만)
+
+각 추가 회전은 Mixamo 로컬 축 기준이라 방향이 어긋날 수 있음 → PHASES 의 axis / deg 튜닝.
+
+사용:
+  blender --background --python scripts/blender_scaffold_reload.py -- \
+      assets/ybot/scene.blend assets/ybot/scene.blend [GRIP_SOURCE_ANIM]
+"""
+import sys
+from math import radians
+
+import bpy
+from mathutils import Quaternion, Vector
+
+# --- 튜닝 상수 ---------------------------------------------------------------
+FPS = 30
+END_FRAME = 60          # 2.0초
+PREFIX = 'mixamorig:'
+
+R_HAND = 'RightHand'
+L_ARM, L_FORE, L_HAND = 'LeftArm', 'LeftForeArm', 'LeftHand'
+
+LARM_J  = PREFIX + 'LeftArm'
+LFORE_J = PREFIX + 'LeftForeArm'
+LHAND_J = PREFIX + 'LeftHand'
+RHAND_J = PREFIX + 'RightHand'
+
+# 슬라이드 IK target = 그립 RightHand 위치 + 오프셋 (armature cm 단위).
+# 게임 안에서 P-marker 로 잡은 RightHand-local 좌표 (10, 16, 4).
+SLIDE_RIGHT = 8.0     # X
+SLIDE_FWD   = 20.0    # Y
+SLIDE_UP    = 15.0    # Z
+SLIDE_PULL  = 6.0     # 슬라이드 당길 때 -Y 로 뒤로
+SLIDE_WRIST = ((1, 0, 0), 20)        # 손목은 작은 회전만 (이전 좋은 값)
+SLIDE_FOREARM_ROLL = 90              # LeftForeArm 길이축 (Y) — 손등 위 향하게
+
+# 페이즈 키프레임. (frame, { 본접미사: ((axis), deg), ... })
+# 명시 안 된 본 = 그립 포즈 유지. deg = 그립 포즈에 누적할 로컬 추가 회전.
+# 방향/크기가 이상하면 해당 항목의 axis 벡터 / deg 부호·값만 바꾸면 됨.
+PHASES = [
+    (0,  {}),                                                    # 그립 (북엔드)
+    (12, {R_HAND: ((0, 1, 0), 14),
+          L_ARM:  ((1, 0, 0), -20), L_FORE: ((1, 0, 0), 38)}),   # 1) 총 기울임 + 왼손 탄창으로
+    (22, {R_HAND: ((0, 1, 0), 14),
+          L_ARM:  ((1, 0, 0), -32), L_FORE: ((1, 0, 0), 30),
+          L_HAND: ((1, 0, 0), -25)}),                            # 2) 탄창 빼기
+    (34, {R_HAND: ((0, 1, 0), 14),
+          L_ARM:  ((1, 0, 0), -22), L_FORE: ((1, 0, 0), 42),
+          L_HAND: ((1, 0, 0), 15)}),                             # 3) 탄창 넣기
+    (42, {R_HAND: ((0, 1, 0), 0),
+          L_ARM:  ((1, 0, 0), -18), L_FORE: ((1, 0, 0), 44)}),   # 4) 오른손 원위치
+    (60, {}),                                                    # 그립 복귀 (북엔드)
+    # 5) 슬라이드 페이즈는 build_slide_ik() 가 f48/f53/f57 에 IK 결과로 키 박음
+]
+# ----------------------------------------------------------------------------
+
+argv = sys.argv
+if '--' not in argv:
+    raise SystemExit('args required after --')
+argv = argv[argv.index('--') + 1:]
+in_blend = argv[0]
+out_blend = argv[1]
+grip_anim = argv[2] if len(argv) > 2 else 'Idle'
+
+bpy.ops.wm.open_mainfile(filepath=in_blend)
+
+scene = bpy.context.scene
+scene.render.fps = FPS
+scene.frame_start = 0
+scene.frame_end = END_FRAME
+
+arm = bpy.data.objects.get('YBot') or next(
+    (o for o in bpy.data.objects if o.type == 'ARMATURE'), None)
+if arm is None:
+    raise SystemExit('No armature found')
+
+bpy.context.view_layer.objects.active = arm
+arm.select_set(True)
+
+if not arm.animation_data:
+    arm.animation_data_create()
+ad = arm.animation_data
+
+for pb in arm.pose.bones:
+    pb.rotation_mode = 'QUATERNION'
+
+
+def bind_slot(action):
+    """slotted action(Blender 4.4+) 이면 첫 slot 을 active 로 bind."""
+    if hasattr(ad, 'action_slot') and ad.action_slot is None and len(action.slots):
+        ad.action_slot = action.slots[0]
+
+
+# --- 1) 그립 포즈 캡처 -------------------------------------------------------
+grip_action = bpy.data.actions.get(grip_anim)
+if grip_action is None:
+    raise SystemExit(f'grip source action {grip_anim!r} not found')
+
+ad.action = grip_action
+bind_slot(grip_action)
+scene.frame_set(int(grip_action.frame_range[0]))
+bpy.context.view_layer.update()
+
+grip = {}
+grip_pos = {}                      # armature-space 위치 (IK target 계산용)
+for pb in arm.pose.bones:
+    grip[pb.name] = (pb.rotation_quaternion.copy(), pb.location.copy())
+    grip_pos[pb.name] = pb.matrix.translation.copy()
+
+# --- 2) Reload 액션 생성 -----------------------------------------------------
+old = bpy.data.actions.get('Reload')
+if old is not None:
+    old.use_fake_user = False
+    bpy.data.actions.remove(old)
+
+reload_action = bpy.data.actions.new('Reload')
+reload_action.use_fake_user = True
+ad.action = reload_action
+bind_slot(reload_action)
+
+
+def apply_grip(pb):
+    q, loc = grip[pb.name]
+    pb.rotation_quaternion = q
+    pb.location = loc
+
+
+def key_bone(pb, frame):
+    pb.keyframe_insert(data_path='rotation_quaternion', frame=frame)
+    pb.keyframe_insert(data_path='location', frame=frame)
+
+
+def build_slide_ik(scene):
+    """슬라이드 페이즈(f48/f53/f57)를 2본 IK 로 풀어 visual rotation 으로 bake."""
+    from mathutils import Vector
+
+    # 진단: grip 포즈에서 LeftHand 본 armature-space 로컬축
+    for pb in arm.pose.bones:
+        apply_grip(pb)
+    bpy.context.view_layer.update()
+    lh = arm.pose.bones[LHAND_J]
+    print('[axis] LHAND x=', lh.bone.x_axis, ' y=', lh.bone.y_axis,
+          ' z=', lh.bone.z_axis, flush=True)
+
+    rhand_p = grip_pos[RHAND_J]
+    lhand_p = grip_pos[LHAND_J]
+    base = rhand_p + Vector((SLIDE_RIGHT, SLIDE_FWD, SLIDE_UP))   # 슬라이드 잡는 위치
+    targets = {
+        48: base,                                            # 잡음
+        53: base + Vector((0.0, -SLIDE_PULL, -7.0)),         # 뒤로 + 아래로 7cm
+        57: base * 0.5 + lhand_p * 0.5,                      # 놓고 그립으로 중간
+    }
+
+    tgt = bpy.data.objects.new('SlideIKTarget', None)
+    scene.collection.objects.link(tgt)
+
+    lfore = arm.pose.bones[LFORE_J]
+    ik = lfore.constraints.new('IK')
+    ik.target = tgt
+    ik.chain_count = 2
+    ik.use_tail = True
+
+    # Pass 1: IK 평가된 visual matrix 수집
+    collected = {}
+    for f, tpos in targets.items():
+        scene.frame_set(f)
+        tgt.location = arm.matrix_world @ tpos
+        bpy.context.view_layer.update()
+        collected[f] = {
+            LARM_J:  arm.pose.bones[LARM_J].matrix.copy(),
+            LFORE_J: arm.pose.bones[LFORE_J].matrix.copy(),
+        }
+        lh = arm.pose.bones[LHAND_J].matrix.translation
+        print(f'[ik] f{f} target={tpos} -> LeftHand={lh}', flush=True)
+
+    lfore.constraints.remove(ik)
+    bpy.data.objects.remove(tgt, do_unlink=True)
+    bpy.context.view_layer.update()
+
+    # Pass 2: 전체 본 그립 + 왼팔 IK visual 로 덮어쓰기
+    from mathutils import Quaternion, Vector as V
+    wrist_axis, wrist_deg = SLIDE_WRIST
+    for f, mats in collected.items():
+        scene.frame_set(f)
+        for pb in arm.pose.bones:
+            apply_grip(pb)
+        bpy.context.view_layer.update()
+        for pb in arm.pose.bones:
+            key_bone(pb, f)
+        # 부모(LARM) 먼저, update, 그 다음 LFORE
+        pb = arm.pose.bones[LARM_J]
+        pb.matrix = mats[LARM_J]
+        key_bone(pb, f)
+        bpy.context.view_layer.update()
+        pb = arm.pose.bones[LFORE_J]
+        pb.matrix = mats[LFORE_J]
+        bpy.context.view_layer.update()
+        # forearm 길이축(local Y) 기준 roll 추가 — position 은 유지, 손 회전됨
+        roll_q = Quaternion(V((0, 1, 0)), radians(SLIDE_FOREARM_ROLL))
+        pb.rotation_quaternion = pb.rotation_quaternion @ roll_q
+        key_bone(pb, f)
+        bpy.context.view_layer.update()
+        # 손목은 IK 체인 밖 → 작은 회전만
+        pb = arm.pose.bones[LHAND_J]
+        q_grip, _ = grip[LHAND_J]
+        pb.rotation_quaternion = q_grip @ Quaternion(V(wrist_axis), radians(wrist_deg))
+        key_bone(pb, f)
+
+
+# --- 3) 페이즈 키프레임 ------------------------------------------------------
+for frame, overrides in PHASES:
+    # 먼저 전체 본을 그립 포즈로
+    for pb in arm.pose.bones:
+        apply_grip(pb)
+    # 이 페이즈에서 지정된 본만 추가 회전
+    for suffix, (axis, deg) in overrides.items():
+        pb = arm.pose.bones.get(PREFIX + suffix)
+        if pb is None:
+            print(f'[scaffold] WARN bone not found: {PREFIX + suffix}', flush=True)
+            continue
+        q_grip, _ = grip[pb.name]
+        pb.rotation_quaternion = q_grip @ Quaternion(Vector(axis), radians(deg))
+    # 전체 본 키 (지정 안 된 본은 그립값으로 고정 → 정지)
+    for pb in arm.pose.bones:
+        key_bone(pb, frame)
+
+# --- 3') 슬라이드 페이즈: 2본 IK 로 풀어서 visual rotation 키 박음 -----------
+build_slide_ik(scene)
+
+# --- 4) NLA push down --------------------------------------------------------
+for t in list(ad.nla_tracks):
+    if t.name == 'Reload':
+        ad.nla_tracks.remove(t)
+track = ad.nla_tracks.new()
+track.name = 'Reload'
+track.strips.new('Reload', 0, reload_action)
+ad.action = None
+
+bpy.ops.wm.save_as_mainfile(filepath=out_blend)
+print('[scaffold] Reload action (multiphase) written OK', flush=True)
+```
+
+## 10.3 `scripts/blender_strip_root.py` (Reload 에도 사용)
+
+```python
+"""
+지정된 액션들에서 mixamorig:Hips 본의 location 키프레임을 모두 제거 — root motion
+제거 후 in-place 애니메이션으로 만든다. 캐릭터는 제자리에서 동작하고, 실제 이동은
+런타임 코드가 player_pos 로 처리.
+
+원본 위치 키프레임을 그대로 두면 사이클 끝에서 Hips Y 가 갑자기 0 으로 리셋되며,
+런타임의 hips anchor 코드가 1 프레임 동안 actor 를 큰 거리만큼 점프시키게 됨 →
+카메라가 머리 뒤로 빠지면서 자기 몸이 화면을 덮어 깜빡이는 현상.
+
+사용:
+    blender --background --python scripts/blender_strip_root.py -- \
+        IN_BLEND action1 action2 ...
+
+Blender 5.1 의 slotted action API 에 대응 (action.fcurves 직접 접근 X,
+layers / strips / channelbag 경유).
+"""
+import sys
+
+import bpy
+
+argv = sys.argv
+if '--' not in argv:
+    raise SystemExit('args required after --')
+argv = argv[argv.index('--') + 1:]
+in_blend = argv[0]
+target_anims = argv[1:]
+
+print(f'IN_BLEND: {in_blend}', flush=True)
+print(f'TARGETS : {target_anims}', flush=True)
+
+
+def iter_action_fcurves(action):
+    """Yield (container, fcurve) for any action format (legacy/slotted)."""
+    if hasattr(action, 'fcurves'):
+        try:
+            for fcu in action.fcurves:
+                yield action.fcurves, fcu
+            return
+        except Exception:
+            pass
+    # Blender 4.4+ slotted
+    for layer in action.layers:
+        for strip in layer.strips:
+            for slot in action.slots:
+                cbag = strip.channelbag(slot)
+                if cbag is None:
+                    continue
+                for fcu in cbag.fcurves:
+                    yield cbag.fcurves, fcu
+
+
+bpy.ops.wm.open_mainfile(filepath=in_blend)
+
+for anim_name in target_anims:
+    action = bpy.data.actions.get(anim_name)
+    if action is None:
+        print(f'WARN: action {anim_name} not found', flush=True)
+        continue
+    targets = [
+        (container, fcu)
+        for container, fcu in iter_action_fcurves(action)
+        if fcu.data_path == 'pose.bones["mixamorig:Hips"].location'
+    ]
+    for container, fcu in targets:
+        container.remove(fcu)
+    print(f'STRIPPED {anim_name}: removed {len(targets)} Hips.location fcurves', flush=True)
+
+bpy.ops.wm.save_mainfile()
+print('SAVED', flush=True)
+```
+
+## 10.4 다른 scripts (요약)
+
+- **`blender_add_anims.py`** — 기존 scene.blend 에 새 anim FBX 추가 (anim 별 1 NLA track).
+- **`blender_glb_to_blend.py`** — .glb import → anim 제거 (옵션 `--keep-anims`/`--remove pattern`)
+  → .blend 저장. panda3d-gltf BufferError 우회용.
+- **`peek_glb.py`** — .glb JSON 헤더만 파싱해서 nodes / meshes / animations 요약.
+- **`blender_merge_ybot.py`** — 처음부터 Y Bot.fbx + 8 anim FBX 머지 (정식 절차).
+
+## 11. requirements.txt
+
+```
+panda3d>=1.10.16
+panda3d-gltf>=1.3.0
+panda3d-blend2bam>=0.26.0
+```
+
+---
+
+**끝.** Reload 본체 (FK + IK + LeftForeArm Y-roll 90°) 는 완성 상태이고
+`backups/20260530-011714-reload-ok/` 에 보존됨. 남은 과제는 **걸으면서 R 누를 때
+RunForward 의 Hips 회전이 상체로 전파되어 권총·팔이 화면 밖으로 휘둘리는 문제** —
+가만히 있을 때 reload 모션은 정상.

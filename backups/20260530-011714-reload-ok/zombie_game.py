@@ -162,16 +162,6 @@ class ZombieGame(ShowBase):
         self.recoil_decay = 10.0         # 1/sec, 클수록 빨리 복귀
         self.recoil_shoot_back = 0.03    # 발사 시 인가되는 뒤로 오프셋 (3cm — pistol 적당)
 
-        # Reload 중 W/S 걸을 때 lower 가 Idle 로 고정되어 몸이 미끄러지는 느낌
-        # → ybot 에 사인파 Z bob 을 더하고 카메라엔 같은 값을 빼서 상쇄. 화면은
-        # 정적, 자기 팔·손·총만 위아래로 까딱이는 효과. _walk_bob_t 로 reload+이동
-        # 조건일 때만 ramp in, 끝나면 ramp out.
-        self._walk_bob_t = 0.0
-        self._walk_bob_phase = 0.0
-        self._walk_bob_amp_z = 0.025     # peak ±2.5cm
-        self._walk_bob_freq = 10.0       # rad/s (≈ 1.6 Hz)
-        self._walk_bob_speed = 5.0       # in/out ramp 1/sec
-
         # Hips root motion 상쇄용. Mixamo 머지 .bam 은 각 액션의 Hips 시작 위치가
         # 미묘하게 달라서 (예: Idle Y=-0.944, Shoot Y=-0.892) 액션 전환 시 캐릭터
         # 전체가 5cm 가량 카메라 방향으로 평행이동 → 머리가 카메라 안으로 밀려들어와
@@ -484,13 +474,6 @@ class ZombieGame(ShowBase):
         if self.kneel_state in ('going_down', 'going_up'):
             return
         target = self._target_anim()
-        # Reload 중 W/S = RunForward/RunBackward 는 Mixamo anim 의 Hips pitch
-        # (앞으로 숙임) 가 살아있어서 Spine→Arm→Hand 로 전파 → 권총·팔이 화면
-        # 아래로 빠짐. A/D 의 StrafeL/R 은 Hips pitch 가 없어 reload 가 정상으로
-        # 보이는 거. 같은 효과를 W/S 에도 주려고 lower 를 Idle 로 대체 — 다리는
-        # 멈추지만 player_pos 는 그대로 전진/후진. 1인칭이라 다리는 거의 안 보임.
-        if self._reload_oneshot and target in ('RunForward', 'RunBackward'):
-            target = 'Idle'
         loco_w = {a: (1.0 if a == target else 0.0) for a in self.anim_names}
         # lower: 항상 locomotion. Shoot 단발 중에도 다리는 안 멈춤.
         self._target_w['lower'] = dict(loco_w)
@@ -755,21 +738,7 @@ class ZombieGame(ShowBase):
         yr_recoil = radians(self.player_yaw)
         fwd_recoil = Vec3(-sin(yr_recoil), cos(yr_recoil), 0)
         recoil_offset = fwd_recoil * (-self.recoil_back)
-
-        # Walk bob (Z) — reload 중 + 이동키 눌렸을 때만 ramp in. 카메라에서 같은
-        # bob_z 를 빼서 화면은 정적, 자기 몸·팔·총만 까딱.
-        moving = any(self.keys[k] for k in ('w', 'a', 's', 'd'))
-        target_bob = 1.0 if (self._reload_oneshot and moving) else 0.0
-        self._walk_bob_t += ((target_bob - self._walk_bob_t)
-                             * min(1.0, dt * self._walk_bob_speed))
-        if self._walk_bob_t > 0.001:
-            self._walk_bob_phase += dt * self._walk_bob_freq
-        else:
-            self._walk_bob_phase = 0.0
-        bob_z = (self._walk_bob_amp_z * self._walk_bob_t
-                 * sin(self._walk_bob_phase))
-
-        self.ybot.setPos(self.player_pos + recoil_offset + Vec3(0, 0, bob_z))
+        self.ybot.setPos(self.player_pos + recoil_offset)
         self.ybot.setH(self.player_yaw + 180)
         # 애니메이션을 현재 시각으로 강제 동기화. 안 하면 joint 의 world 좌표가
         # 1프레임 lag 된 상태를 반환해서 카메라가 머리에서 떨림.
@@ -815,7 +784,6 @@ class ZombieGame(ShowBase):
                     head_w
                     + forward * (self.eye_forward_offset + self.recoil_back)
                     - right_v * self.eye_lateral_offset
-                    - Vec3(0, 0, bob_z)   # ybot 의 Z bob 상쇄 → 카메라 정적
                 )
             else:
                 self.camera.setPos(self.player_pos + Vec3(0, 0, self.head_height))
