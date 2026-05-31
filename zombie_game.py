@@ -3,18 +3,41 @@ zombie_game — Mirror's Edge style 1인칭 좀비 슈터 (Panda3D)
 Stage 1: 1인칭 카메라 + Y Bot 풀바디 + 기본 입력.
 """
 import random
-from math import cos, radians, sin
+from math import atan2, cos, degrees, radians, sin
 from pathlib import Path
 
 from direct.actor.Actor import Actor
-from direct.gui.DirectGui import DirectButton, DirectFrame
+from direct.gui.DirectGui import DirectButton, DirectFrame, DirectSlider
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
 from direct.task import Task
 from panda3d.core import (
-    AmbientLight, CardMaker, ClockObject, DirectionalLight, Filename,
-    LineSegs, NodePath, Quat, TextNode, Vec3, Vec4, WindowProperties,
+    AmbientLight, CardMaker, ClockObject, ColorBlendAttrib, DirectionalLight, Filename,
+    LineSegs, NodePath, Quat, TextNode, Vec3, Vec4, WindowProperties, loadPrcFileData,
 )
+
+from level import (PLAYER_RADIUS, ZOMBIE_RADIUS, WALL_HEIGHT, Wall,
+                   IMMUNE_COLOR, LESION_COLOR, build_level)
+
+# ── 성능 PRC: GPU 스키닝 ────────────────────────────────────────────────────
+# 좀비 14마리 × Mixamo 본 67개 × CPU 정점 변환 매 프레임 = 화각에 좀비 많을 때 FPS 폭락.
+# 두 플래그를 같이 켜면 본 매트릭스만 GPU 에 보내고 vertex skinning 은 GPU shader 가 처리:
+#   hardware-animated-vertices : vertex animation 을 GPU 로
+#   matrix-palette             : 본 매트릭스 팔레트 (per-vertex 최대 4본) 전송 활성화
+# ShowBase 인스턴스 만들기 전에 적용돼야 효과 — 모듈 import 시점 (지금) 에 로딩.
+loadPrcFileData('', 'hardware-animated-vertices #t')
+loadPrcFileData('', 'matrix-palette #t')
+
+# ── 한글 폰트 ─────────────────────────────────────────────────────────────
+# Panda3D 기본 폰트엔 한글 글리프가 없어 OnscreenText / TextNode / DirectGui 에
+# 들어간 한글이 □ 로 깨진다. text-default-font 를 PRC 로 등록하면 ShowBase 가
+# 만들어지며 자동으로 이 폰트를 기본으로 쓴다 (위젯별 명시 지정 불필요).
+# 배포용은 OFL 라이선스 나눔고딕 (assets/fonts/NanumGothic.ttf). 그게 없으면
+# 로컬 개발 fallback 으로 윈도우 맑은 고딕 — 배포본 만들 땐 나눔고딕 추가 필수.
+_FONT_BUNDLED = Path(__file__).parent / 'assets' / 'fonts' / 'NanumGothic.ttf'
+_FONT_FALLBACK = Path('C:/Windows/Fonts/malgun.ttf')
+_FONT_PATH = _FONT_BUNDLED if _FONT_BUNDLED.exists() else _FONT_FALLBACK
+loadPrcFileData('', f'text-default-font {_FONT_PATH.as_posix()}')
 
 
 SCRIPT_DIR = Path(__file__).parent
@@ -39,6 +62,545 @@ WEAPON_LOCAL_SCALE = 0.1195
 WEAPON_LOCAL_POS   = (0.000, 0.090, 0.040)
 WEAPON_LOCAL_HPR   = (22.5, -78.2, 108.9)
 
+ZOMBIE_BAM = Filename.from_os_specific(
+    str(SCRIPT_DIR / 'assets' / 'zombie' / 'scene.bam')
+)
+
+
+class Zombie:
+    """좀비 한 마리 — Actor + 상태머신(IDLE/CHASE/ATTACK) + 시야 기반 AI.
+
+    시야: 거리 < sight_range AND 좌우 시야각 ±sight_fov_half 안 → 본다.
+    상태:
+      IDLE   — 가만히 Idle anim. 플레이어 시야에 들어오면 CHASE.
+      CHASE  — Run anim 돌면서 플레이어 향해 이동. 근접 시 ATTACK, 시야 잃으면 IDLE.
+      ATTACK — 랜덤 attack anim 한 번. 끝나면 거리/시야 다시 판정해서 attack/chase/idle.
+    """
+    IDLE = 'idle'
+    CHASE = 'chase'
+    ATTACK = 'attack'
+    DYING = 'dying'
+    DEAD = 'dead'
+
+    # 히트박스 = vertical capsule (zombie.pos 의 X/Y, Z 범위 [Z_MIN, Z_MAX]).
+    # 안쪽 (TORSO_R 이하) + Z 높음 → head, 안쪽 + Z 낮음 → body. 바깥 (LIMB_R 까지)
+    # → other (팔/다리/발 등). 머리는 위쪽, 몸은 가운데, 나머지는 옆쪽 또는 발쪽.
+    HIT_TORSO_R     = 0.20
+    HIT_LIMB_R      = 0.55
+    HIT_Z_MIN       = 0.0
+    HIT_Z_MAX       = 1.85
+    HIT_HEAD_Z      = 1.45    # 이 이상이면 머리
+    DAMAGE = {'head': 20, 'body': 10, 'other': 5}
+
+    # Distance LOD — 플레이어로부터 이 거리 너머의 좀비는 actor.hide() + AI/anim skip.
+    # 어차피 시야 25m 너머는 안 쫓아오고 벽 차폐로 시각도 막혀있어서 cost 0 으로 만들어도
+    # 게임 플레이에 영향 없음. 맵 길이 ~65m → 다른 방의 좀비는 거의 다 LOD'd.
+    LOD_DISTANCE    = 28.0
+    LOD_DIST_SQ     = LOD_DISTANCE * LOD_DISTANCE
+
+    def __init__(self, game, spawn_pos, yaw=0.0):
+        self.game = game
+        self.actor = Actor(ZOMBIE_BAM)
+        self.actor.reparentTo(game.render)
+
+        # Mixamo container action 제외
+        self.anim_names = [a for a in self.actor.getAnimNames()
+                           if 'mixamo.com' not in a]
+
+        self.pos = Vec3(spawn_pos)
+        self.yaw = yaw
+        self.actor.setPos(self.pos)
+        self.actor.setH(self.yaw + 180)
+
+        # 튜닝 노브
+        self.move_speed       = 4.0    # m/s — 추격 속도 (플레이어와 동일)
+        self.sight_range      = 25.0   # m  — 최대 시야 거리
+        self.sight_fov_half   = 70.0   # deg — 시야각의 절반 (전체 140°)
+        self.attack_range     = 1.8    # m  — 이 안이면 공격
+
+        self.attack_anims = [a for a in ('Attack1', 'Attack2', 'Attack3', 'Attack4')
+                              if a in self.anim_names]
+
+        self.state = self.IDLE
+        self.current_anim = None
+        self.attack_t = 0.0
+
+        # Anim blend (crossfade) — 전환 시 180ms 동안 prev → new 가중치 보간
+        # → 공격 끝나고 Run 으로 바로 안 튀고 부드럽게 흘러감.
+        self.actor.enableBlend()
+        # Idle / Run 만 init 에서 loop (계속 active). Attack/Death 는 _play 때
+        # actor.play() 로 restart + 가중치 ramp up.
+        for a in ('Idle', 'Run'):
+            if a in self.anim_names:
+                self.actor.loop(a)
+                self.actor.setControlEffect(a, 0.0)
+        self._anim_prev = None
+        self._anim_blend_t = 0.0
+        self._play('Idle', loop=True)
+
+        # HP / health bar
+        self.hp_max = 100
+        self.hp = self.hp_max
+        self.hp_bar_t = 0.0           # 남은 표시 시간 (sec)
+        self.hp_bar_show_dur = 2.5    # 데미지 후 풀 alpha 로 보이는 시간
+        self.hp_bar_fade_dur = 1.5    # 그 뒤 fade out 시간
+        self._build_hp_bar()
+
+        # Transform — F 키로 dead 좀비를 Y Bot 으로 페이드 전환.
+        # X Bot alpha 1→0 / Y Bot alpha 0→1 dual fade.
+        # 둘 다 같은 self.pos / yaw + Death anim 의 마지막 프레임 pose → 위치/자세 일치.
+        self.transformed = False
+        self.transform_t = 0.0
+        self.transform_dur = 1.2
+        self.ybot_replacement = None
+
+        # LOD 상태 — True 면 actor 가 visible + 매 프레임 update. 토글 시에만 show/hide
+        # 호출 (매 프레임 hide 콜 피함). 시작 시 visible 가정.
+        self._lod_active = True
+
+    BLEND_DUR = 0.18    # crossfade 시간 (sec)
+
+    def _play(self, anim, loop=False):
+        if anim not in self.anim_names:
+            return
+        if self.current_anim == anim:
+            # 같은 anim: single-shot 이면 restart, loop 이면 그대로
+            if not loop:
+                self.actor.play(anim)
+            return
+        # 다른 anim: 시작 + crossfade
+        if not loop:
+            self.actor.play(anim)
+        else:
+            # Idle/Run 은 init 에서 이미 loop 중 → 다시 호출 안 해도 됨
+            pass
+        # 새 anim 은 weight 0 부터 시작, prev 는 1 부터 ramp down
+        self.actor.setControlEffect(anim, 0.0)
+        self._anim_prev = self.current_anim
+        self.current_anim = anim
+        self._anim_blend_t = self.BLEND_DUR
+
+    def _update_anim_blend(self, dt):
+        if self._anim_blend_t <= 0:
+            return
+        self._anim_blend_t -= dt
+        if self._anim_blend_t <= 0:
+            self.actor.setControlEffect(self.current_anim, 1.0)
+            if self._anim_prev is not None and self._anim_prev != self.current_anim:
+                self.actor.setControlEffect(self._anim_prev, 0.0)
+            self._anim_prev = None
+        else:
+            t = self._anim_blend_t / self.BLEND_DUR    # 1 → 0
+            self.actor.setControlEffect(self.current_anim, 1.0 - t)
+            if self._anim_prev is not None and self._anim_prev != self.current_anim:
+                self.actor.setControlEffect(self._anim_prev, t)
+
+    def _build_hp_bar(self):
+        """좀비 머리 위 health bar — 평소 hidden, 데미지 시 show + fade out."""
+        # 배경 (빨강) — 풀 너비 1m
+        cm_bg = CardMaker('hp_bg')
+        cm_bg.setFrame(-0.5, 0.5, -0.04, 0.04)
+        self.hp_bg = self.actor.attachNewNode(cm_bg.generate())
+        self.hp_bg.setColor(0.5, 0.08, 0.08, 0.85)
+        self.hp_bg.setZ(2.0)
+        self.hp_bg.setBillboardPointEye()
+        self.hp_bg.setLightOff()
+        self.hp_bg.setTransparency(True)
+        self.hp_bg.setBin('fixed', 80)
+        self.hp_bg.setDepthTest(False)
+        self.hp_bg.setDepthWrite(False)
+        self.hp_bg.hide()
+        # 채우기 (초록) — 좌측 정렬, hp_ratio 만큼 setSx 로 너비 조정
+        cm_f = CardMaker('hp_fill')
+        cm_f.setFrame(0, 1, -0.04, 0.04)
+        self.hp_fill = self.actor.attachNewNode(cm_f.generate())
+        self.hp_fill.setColor(0.2, 0.95, 0.25, 1.0)
+        self.hp_fill.setPos(-0.5, 0, 2.0)
+        self.hp_fill.setBillboardPointEye()
+        self.hp_fill.setLightOff()
+        self.hp_fill.setTransparency(True)
+        self.hp_fill.setBin('fixed', 81)
+        self.hp_fill.setDepthTest(False)
+        self.hp_fill.setDepthWrite(False)
+        self.hp_fill.hide()
+
+    def take_damage(self, amount):
+        if self.hp <= 0:
+            return
+        self.hp = max(0, self.hp - amount)
+        # 바 표시 + 풀 알파 + ratio 갱신
+        self.hp_bar_t = self.hp_bar_show_dur + self.hp_bar_fade_dur
+        self.hp_bg.show()
+        self.hp_fill.show()
+        self.hp_bg.setColorScale(1, 1, 1, 1)
+        self.hp_fill.setColorScale(1, 1, 1, 1)
+        ratio = max(0.001, self.hp / self.hp_max)
+        self.hp_fill.setSx(ratio)
+        if self.hp <= 0:
+            # Death anim 단발 + crossfade. 끝나면 마지막 프레임 (바닥) 에서 정지.
+            self.state = self.DYING
+            self.hp_bg.hide()
+            self.hp_fill.hide()
+            if 'Death' in self.anim_names:
+                self._play('Death', loop=False)
+                self.death_t = self.actor.getDuration('Death')
+            else:
+                self.actor.hide()
+                self.state = self.DEAD
+
+    def can_see_player(self, player_pos):
+        to_p = player_pos - self.pos
+        to_p.z = 0   # 평면 거리만
+        dist = to_p.length()
+        if dist > self.sight_range:
+            return False
+        if dist < 0.5:
+            return True   # 코앞이면 무조건 인지
+        yr = radians(self.yaw)
+        forward = Vec3(-sin(yr), cos(yr), 0)
+        to_p.normalize()
+        if forward.dot(to_p) <= cos(radians(self.sight_fov_half)):
+            return False
+        # 벽 차폐 — 좀비↔플레이어 직선상에 벽이 있으면 못 봄. 도어/케이지 갭은
+        # wall 박스가 없는 영역이라 자동 통과.
+        return not self.game.level_collider.segment_blocked(
+            self.pos.x, self.pos.y, player_pos.x, player_pos.y)
+
+    def _start_attack(self):
+        if not self.attack_anims:
+            return
+        attack = random.choice(self.attack_anims)
+        # _play 가 같은 anim 이면 restart, 다른 anim 이면 crossfade 처리.
+        self._play(attack, loop=False)
+        self.attack_t = self.actor.getDuration(attack)
+        self.state = self.ATTACK
+
+    def start_transform(self, game):
+        """DEAD 좀비 → Y Bot 으로 dual fade. 같은 self.pos / yaw + Death 마지막
+        프레임 pose 라 위치 / 자세 정확히 일치."""
+        if self.transformed or self.state != self.DEAD:
+            return
+        self.transform_t = self.transform_dur
+        self.actor.setTransparency(True)
+        # Y Bot 같은 위치 / 같은 yaw 에 생성, alpha 0 부터
+        self.ybot_replacement = Actor(BAM_PATH)
+        self.ybot_replacement.reparentTo(game.render)
+        self.ybot_replacement.setPos(self.pos)
+        self.ybot_replacement.setH(self.yaw + 180)
+        self.ybot_replacement.setTransparency(True)
+        self.ybot_replacement.setColorScale(1, 1, 1, 0)
+        # Death anim 의 마지막 프레임 pose — X Bot 과 동일한 자세 (둘 다 Hips
+        # location 보존된 anim 이라 바닥 누운 자세 일치).
+        anims = self.ybot_replacement.getAnimNames()
+        if 'Death' in anims:
+            last = self.ybot_replacement.getNumFrames('Death') - 1
+            self.ybot_replacement.pose('Death', last)
+
+    def update(self, dt, player_pos):
+        # Distance LOD — 멀면 actor 숨기고 모든 update 비용 0. 단, DYING (Death anim
+        # 진행 중) / Transform 페이드 중 좀비는 LOD 보류해서 끊김 없이 마무리.
+        dx = player_pos.x - self.pos.x
+        dy = player_pos.y - self.pos.y
+        busy = (self.state == self.DYING or self.transform_t > 0)
+        too_far = (dx * dx + dy * dy) > self.LOD_DIST_SQ and not busy
+        if too_far and self._lod_active:
+            self.actor.hide()
+            if self.ybot_replacement is not None:
+                self.ybot_replacement.hide()
+            # 다음에 다시 가까워졌을 때 깔끔하게 IDLE 부터 — CHASE 상태로 멈춰있다
+            # 갑자기 보이면서 Run anim 으로 튀는 거 방지.
+            if self.state == self.CHASE:
+                self.state = self.IDLE
+            self._lod_active = False
+        elif not too_far and not self._lod_active:
+            self.actor.show()
+            if self.ybot_replacement is not None:
+                self.ybot_replacement.show()
+            self._lod_active = True
+        if too_far:
+            return
+
+        # anim blend 가중치 보간 — 모든 state 에서 매 프레임 ramp.
+        self._update_anim_blend(dt)
+
+        # Transform dual fade — X Bot alpha 1→0, Y Bot alpha 0→1.
+        if self.transform_t > 0:
+            self.transform_t -= dt
+            if self.transform_t <= 0:
+                self.actor.hide()
+                if self.ybot_replacement is not None:
+                    self.ybot_replacement.setColorScale(1, 1, 1, 1)
+                    self.ybot_replacement.clearTransparency()
+                self.transformed = True
+            else:
+                t = self.transform_t / self.transform_dur   # 1 → 0
+                self.actor.setColorScale(1, 1, 1, t)        # X Bot 페이드 아웃
+                if self.ybot_replacement is not None:
+                    self.ybot_replacement.setColorScale(1, 1, 1, 1.0 - t)
+
+        if self.state == self.DEAD:
+            return   # 완전히 죽어서 마지막 프레임 정지 — 아무것도 안 함
+
+        if self.state == self.DYING:
+            # Death anim 재생 중 — 끝까지 기다린 후 DEAD 로
+            self.death_t -= dt
+            if self.death_t <= 0:
+                self.state = self.DEAD
+            # 위치는 그대로 (이동 안 함)
+            return
+
+        # HP bar fade — show_dur 동안 풀 알파, fade_dur 동안 1→0 lerp, 끝나면 hide
+        if self.hp_bar_t > 0:
+            self.hp_bar_t -= dt
+            if self.hp_bar_t <= 0:
+                self.hp_bg.hide()
+                self.hp_fill.hide()
+            elif self.hp_bar_t < self.hp_bar_fade_dur:
+                alpha = self.hp_bar_t / self.hp_bar_fade_dur
+                self.hp_bg.setColorScale(1, 1, 1, alpha)
+                self.hp_fill.setColorScale(1, 1, 1, alpha)
+
+        to_p = player_pos - self.pos
+        to_p.z = 0
+        dist = to_p.length()
+        sees = self.can_see_player(player_pos)
+
+        if self.state == self.IDLE:
+            self._play('Idle', loop=True)
+            if sees:
+                self.state = self.CHASE
+
+        elif self.state == self.CHASE:
+            if not sees:
+                self.state = self.IDLE
+            elif dist < self.attack_range:
+                self._start_attack()
+            else:
+                self._play('Run', loop=True)
+                if dist > 0.01:
+                    direction = Vec3(to_p.x / dist, to_p.y / dist, 0)
+                    self.pos.x += direction.x * self.move_speed * dt
+                    self.pos.y += direction.y * self.move_speed * dt
+                    # 벽 충돌 해소 — 좁은 통로/기둥에서 좀비가 벽 뚫고 직진하지 않게.
+                    nx, ny = self.game.level_collider.resolve(
+                        self.pos.x, self.pos.y, ZOMBIE_RADIUS)
+                    self.pos.x = nx
+                    self.pos.y = ny
+                    # 추격 중엔 항상 플레이어 향함
+                    self.yaw = degrees(atan2(-direction.x, direction.y))
+
+        elif self.state == self.ATTACK:
+            self.attack_t -= dt
+            if self.attack_t <= 0:
+                if sees and dist < self.attack_range:
+                    self._start_attack()    # 연속 공격
+                elif sees:
+                    self.state = self.CHASE
+                else:
+                    self.state = self.IDLE
+
+        # transform 적용
+        self.actor.setPos(self.pos)
+        self.actor.setH(self.yaw + 180)
+
+
+class Firewall:
+    """측면 방 입구 차단막. 쏴서 부수면 통로가 열리고 그 방 좀비(백신)가 스폰.
+    그 방을 전멸시키면 cleared -> 방 바닥이 병변색으로 번진다.
+    표면: 오염 잠금 해제/정화 / 진실: 격리벽 파괴/감염 확산."""
+    HP_MAX      = 120
+    SHOT_DAMAGE = 30
+    TINT_DUR    = 1.5
+    TINT_ALPHA  = 0.45
+
+    def __init__(self, game, orient, fixed, lo, hi, spawns, stain):
+        self.game = game
+        self.orient, self.fixed, self.lo, self.hi = orient, fixed, lo, hi
+        self.spawns = spawns
+        self.stain = stain
+        self.hp = self.HP_MAX
+        self.broken = False
+        self.cleared = False
+        self.zombies = []
+        self._flash_t = 0.0
+        self._tint_t = 0.0
+
+        self.wall = (Wall(fixed, lo, fixed, hi) if orient == 'v'
+                     else Wall(lo, fixed, hi, fixed))
+        game.level_collider.walls.append(self.wall)
+
+        cm = CardMaker('firewall')
+        cm.setFrame(-(hi - lo) / 2.0, (hi - lo) / 2.0, 0.0, WALL_HEIGHT)
+        self.node = game.render.attachNewNode(cm.generate())
+        self.node.setTwoSided(True)
+        if orient == 'v':
+            self.node.setPos(fixed, (lo + hi) / 2.0, 0.0)
+            self.node.setH(90)
+        else:
+            self.node.setPos((lo + hi) / 2.0, fixed, 0.0)
+            self.node.setH(0)
+        self.node.setColor(IMMUNE_COLOR[0], IMMUNE_COLOR[1], IMMUNE_COLOR[2], 0.55)
+        self.node.setTransparency(True)
+        self.node.setLightOff()
+
+    def ray_distance(self, cam_pos, ray_dir):
+        if self.broken:
+            return None
+        if self.orient == 'v':
+            if abs(ray_dir.x) < 1e-6:
+                return None
+            s = (self.fixed - cam_pos.x) / ray_dir.x
+            if s < 0:
+                return None
+            hy = cam_pos.y + ray_dir.y * s
+            hz = cam_pos.z + ray_dir.z * s
+            return s if (self.lo <= hy <= self.hi and 0.0 <= hz <= WALL_HEIGHT) else None
+        if abs(ray_dir.y) < 1e-6:
+            return None
+        s = (self.fixed - cam_pos.y) / ray_dir.y
+        if s < 0:
+            return None
+        hx = cam_pos.x + ray_dir.x * s
+        hz = cam_pos.z + ray_dir.z * s
+        return s if (self.lo <= hx <= self.hi and 0.0 <= hz <= WALL_HEIGHT) else None
+
+    def hit(self):
+        if self.broken:
+            return
+        self.hp = max(0, self.hp - self.SHOT_DAMAGE)
+        self._flash_t = 0.07
+        self.node.setColorScale(2.2, 2.2, 2.2, 1.0)
+        r = self.hp / self.HP_MAX
+        self.node.setColor(IMMUNE_COLOR[0], IMMUNE_COLOR[1], IMMUNE_COLOR[2],
+                           0.18 + 0.37 * r)
+        if self.hp <= 0:
+            self._break()
+
+    def _break(self):
+        self.broken = True
+        self.node.hide()
+        try:
+            self.game.level_collider.walls.remove(self.wall)
+        except ValueError:
+            pass
+        for x, y in self.spawns:
+            z = Zombie(self.game, Vec3(x, y, 0), 180)
+            self.game.zombies.append(z)
+            self.zombies.append(z)
+        print('[firewall] breached -> spawn %d' % len(self.spawns), flush=True)
+
+    def update(self, dt):
+        if self._flash_t > 0:
+            self._flash_t -= dt
+            if self._flash_t <= 0 and not self.broken:
+                self.node.setColorScale(1, 1, 1, 1)
+        if (self.broken and not self.cleared and self.zombies
+                and all(z.hp <= 0 for z in self.zombies)):
+            self.cleared = True
+            self._tint_t = self.TINT_DUR
+            print('[firewall] room cleared -> tint', flush=True)
+        if self._tint_t > 0:
+            self._tint_t -= dt
+            a = self.TINT_ALPHA * min(1.0, 1.0 - max(0.0, self._tint_t) / self.TINT_DUR)
+            self.stain.setColor(LESION_COLOR[0], LESION_COLOR[1], LESION_COLOR[2], a)
+
+
+class Gate:
+    """복도를 가로막는 전진 게이트. 해당 구역(zone) 양옆 방이 다 cleared 되기
+    전엔 잠겨서 부술 수 없다(쏘면 면역색이 튕겨냄). 다 cleared 되면 약해져
+    돌파 가능 -> 부수면 전진. final_spawns 가 있으면 부순 순간 그 방 좀비를
+    스폰(마지막 방 = 리빌)."""
+    HP_MAX      = 160
+    SHOT_DAMAGE = 30
+    TINT_DUR    = 1.5
+    TINT_ALPHA  = 0.45
+
+    def __init__(self, game, orient, fixed, lo, hi, rooms, stain, room_stain,
+                 final_spawns):
+        self.game = game
+        self.orient, self.fixed, self.lo, self.hi = orient, fixed, lo, hi
+        self.rooms = rooms
+        self.stain = stain
+        self.room_stain = room_stain
+        self.final_spawns = final_spawns
+        self.hp = self.HP_MAX
+        self.unlocked = False
+        self.broken = False
+        self._flash_t = 0.0
+        self._tint_t = 0.0
+        self._tint_target = None
+
+        self.wall = (Wall(fixed, lo, fixed, hi) if orient == 'v'
+                     else Wall(lo, fixed, hi, fixed))
+        game.level_collider.walls.append(self.wall)
+
+        cm = CardMaker('gate')
+        cm.setFrame(-(hi - lo) / 2.0, (hi - lo) / 2.0, 0.0, WALL_HEIGHT)
+        self.node = game.render.attachNewNode(cm.generate())
+        self.node.setTwoSided(True)
+        if orient == 'v':
+            self.node.setPos(fixed, (lo + hi) / 2.0, 0.0)
+            self.node.setH(90)
+        else:
+            self.node.setPos((lo + hi) / 2.0, fixed, 0.0)
+            self.node.setH(0)
+        self.node.setColor(IMMUNE_COLOR[0], IMMUNE_COLOR[1], IMMUNE_COLOR[2], 0.85)
+        self.node.setTransparency(True)
+        self.node.setLightOff()
+
+    ray_distance = Firewall.ray_distance      # 동일 로직 재사용
+
+    def hit(self):
+        if self.broken:
+            return
+        if not self.unlocked:
+            self._flash_t = 0.10
+            self.node.setColorScale(2.6, 2.6, 2.6, 1.0)
+            self.game._show_gate_msg('차단막 강화됨 — 양옆 방을 먼저 정화하라')
+            return
+        self.hp = max(0, self.hp - self.SHOT_DAMAGE)
+        self._flash_t = 0.07
+        self.node.setColorScale(2.2, 2.2, 2.2, 1.0)
+        r = self.hp / self.HP_MAX
+        self.node.setColor(IMMUNE_COLOR[0], IMMUNE_COLOR[1], IMMUNE_COLOR[2],
+                           0.15 + 0.30 * r)
+        if self.hp <= 0:
+            self._break()
+
+    def _break(self):
+        self.broken = True
+        self.node.hide()
+        try:
+            self.game.level_collider.walls.remove(self.wall)
+        except ValueError:
+            pass
+        if self.final_spawns:
+            for x, y in self.final_spawns:
+                self.game.zombies.append(Zombie(self.game, Vec3(x, y, 0), 180))
+            if self.room_stain is not None:
+                self._tint_target = self.room_stain
+                self._tint_t = self.TINT_DUR
+            self.game._show_gate_msg('ASSIMILATING ZONE', 2.4)   # 리빌 훅(placeholder)
+        print('[gate] breached', flush=True)
+
+    def update(self, dt):
+        if not self.unlocked and self.rooms and all(r.cleared for r in self.rooms):
+            self.unlocked = True
+            self.node.setColor(IMMUNE_COLOR[0], IMMUNE_COLOR[1], IMMUNE_COLOR[2], 0.40)
+            self._tint_target = self.stain
+            self._tint_t = self.TINT_DUR
+            self.game._show_gate_msg('차단막 약화됨 — 돌파 가능')
+            print('[gate] unlocked', flush=True)
+        if self._flash_t > 0:
+            self._flash_t -= dt
+            if self._flash_t <= 0 and not self.broken:
+                self.node.setColorScale(1, 1, 1, 1)
+        if self._tint_t > 0 and self._tint_target is not None:
+            self._tint_t -= dt
+            a = self.TINT_ALPHA * min(1.0, 1.0 - max(0.0, self._tint_t) / self.TINT_DUR)
+            self._tint_target.setColor(LESION_COLOR[0], LESION_COLOR[1],
+                                       LESION_COLOR[2], a)
+
 
 class ZombieGame(ShowBase):
     def __init__(self):
@@ -55,13 +617,34 @@ class ZombieGame(ShowBase):
         # 환경
         self.setBackgroundColor(0.45, 0.6, 0.85)
         self._make_lights()
+        # GPU 스키닝 보장 — 상단 PRC 두 플래그는 fixed-function 경로라 요즘 드라이버에선
+        # 무시되고 조용히 CPU 스키닝으로 폴백하는 경우가 흔함. auto-shader 가 진짜 HW
+        # 스키닝 셰이더를 생성해줘서 좀비 다수 시 vertex 변환이 GPU 로 옮겨감.
+        # 부작용: 라이팅 모델 살짝 바뀜 — 톤이 어색하면 dl color/ambient 보정.
+        self.render.setShaderAuto()
         self._make_ground()
-        self._make_landmarks()
+        # level.py 가 render 아래에 방·벽·기둥을 만들고 collider + 좀비 spawn 좌표 반환.
+        self.level_collider, self.level_data = build_level(self.render)
 
         # 카메라 — 캐릭터 머리 안쪽에서 보더라도 클리핑 안 되게 near 매우 작게.
         # FOV 크면 시야 넓어지고 자기 몸이 작게 보임 (FPS 표준 90~100).
         self.camLens.setNear(0.01)
-        self.camLens.setFov(100)
+        self.fov_hip = 100.0          # hip-fire 기본 FOV
+        self.fov_ads = 55.0           # ADS (우클릭 hold) zoom-in FOV
+        self.camLens.setFov(self.fov_hip)
+
+        # ADS (aim down sights) 상태
+        self.aiming = False           # 우클릭 hold 동안 True
+        self.aim_t = 0.0              # 0=hip / 1=ADS 보간 (지수 ramp)
+        self.aim_speed = 9.0          # 1/sec — 클수록 빠른 전환 (~110ms)
+        # ADS 시 ybot 전체를 player-frame 으로 이 만큼 이동, 카메라는 같은 양 보정.
+        # 결과: 손·팔·총 다 같이 이 지점으로 이동, 시점(world background) 정적.
+        # 단위 m. (X=우/좌, Y=앞/뒤, Z=위/아래). 현재: 좌 13cm + 앞 5cm + 아래 2cm.
+        self.ads_body_offset = Vec3(-0.13, 0.05, -0.02)
+        # ADS 시 마우스 감도 배율 — 작을수록 좌우 시점이 천천히·작게.
+        self.ads_mouse_factor = 0.35
+        # ADS 시 이동 속도 배율 — 작을수록 천천히 걸음.
+        self.ads_move_factor  = 0.40
 
         # 플레이어 상태 (panda3d 표준: Z-up, Y-forward)
         self.player_pos = Vec3(0, 0, 0)  # 발 기준
@@ -70,8 +653,8 @@ class ZombieGame(ShowBase):
         self.player_vz = 0.0
         self.on_ground = True
         self.head_height = 1.65
-        self.move_speed = 6.0
-        self.mouse_sens = 0.15
+        self.move_speed = 4.0   # 좀비 추격 속도와 동일 (Zombie.move_speed)
+        self.mouse_sens = 0.10    # 기본값 — ESC pause 메뉴 슬라이더로 0.02~0.30 조정
         self.jump_speed = 4.5
         self.gravity = 12.0
 
@@ -197,6 +780,15 @@ class ZombieGame(ShowBase):
             self.ybot.exposeJoint(None, 'upper', head_name) if head_name else None
         )
         self._hips_ref_local = None
+        # pitch 회전 피벗용 — RightShoulder world pos 를 pre/post 캡처해서 ybot 평행
+        # 이동으로 보정 → 어깨 기준 회전 효과.
+        rshoulder_name = next(
+            (j.getName() for j in self.ybot.getJoints()
+             if j.getName().endswith('RightShoulder')), None)
+        self.rshoulder_joint = (
+            self.ybot.exposeJoint(None, 'upper', rshoulder_name)
+            if rshoulder_name else None
+        )
 
         # 권총 메쉬: RightHand 본에 attach — 본 transform 따라 손에 붙어 다님.
         rhand_name = next(
@@ -301,15 +893,139 @@ class ZombieGame(ShowBase):
             parent=self.aspect2d,
         )
 
+        # 죽은 좀비 옆에 가까이 있으면 뜨는 interact 힌트 (F 키로 X Bot → Y Bot)
+        self.interact_text = OnscreenText(
+            text='', pos=(0, -0.7), scale=0.07,
+            fg=(1, 1, 0.6, 1), bg=(0, 0, 0, 0.6),
+            align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d,
+        )
+        self.interact_text.hide()
+        self._interact_target = None    # 현재 가까이 있는 dead 좀비
+        self.interact_range = 2.5       # m
+
+        # 게이트 잠김/해제 안내 (잠깐 떴다 사라짐)
+        self.gate_msg = OnscreenText(
+            text='', pos=(0, -0.5), scale=0.055,
+            fg=(0.6, 0.9, 1, 1), bg=(0, 0, 0, 0.6),
+            align=TextNode.ACenter, mayChange=True, parent=self.aspect2d,
+        )
+        self.gate_msg.hide()
+        self._gate_msg_token = 0
+
+        # 탄창 / 사격
+        self.ammo_max = 8
+        self.ammo = self.ammo_max
+        # 발사 쿨다운 — 이전엔 Shoot anim 끝까지 (~1초+) 막혀서 너무 느렸음.
+        # 0.18s = 약 5.5 발/초. 값 줄이면 더 빨라짐 (자동소총 0.1, 권총 0.2 정도).
+        self.shoot_cooldown_t = 0.0
+        self.shoot_cooldown_dur = 0.18
+
+        # Muzzle flash — weapon_anchor (= hand world frame, m 단위) 에 parent.
+        # ybot 숨겨도 (Valorant 스타일) 영향 없이 그대로 보임. billboard + additive.
+        if self.weapon is not None and self.right_hand_joint is not None:
+            cm_mf = CardMaker('muzzle_flash')
+            cm_mf.setFrame(-1, 1, -1, 1)
+            self.muzzle_flash = self.weapon_anchor.attachNewNode(cm_mf.generate())
+            # (8, 32, 8) cm hand-local 위치를 m 로 변환 → anchor local
+            self.muzzle_flash.setPos(0.08, 0.32, 0.08)
+            self.muzzle_flash_base_scale = 0.025  # ~5cm quad in world meters
+            self.muzzle_flash.setScale(self.muzzle_flash_base_scale)
+            self.muzzle_flash.setColor(1.0, 0.85, 0.35, 1.0)
+            self.muzzle_flash.setBillboardPointEye()
+            self.muzzle_flash.setLightOff()
+            self.muzzle_flash.setTransparency(True)
+            self.muzzle_flash.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd))
+            self.muzzle_flash.setBin('fixed', 100)
+            self.muzzle_flash.setDepthTest(False)
+            self.muzzle_flash.setDepthWrite(False)
+            self.muzzle_flash.hide()
+        else:
+            self.muzzle_flash = None
+            self.muzzle_flash_base_scale = 0.0
+        self.muzzle_flash_t = 0.0
+        self.muzzle_flash_dur = 0.06
+
+        # Tracer — 사격 시 muzzle 에서 forward 30m 짧은 얇은 선 (player_yaw 방향).
+        # 매 사격마다 위치/방향 다시 잡고 50ms 표시 후 hide.
+        ls_tr = LineSegs('tracer')
+        ls_tr.setThickness(1)                  # 진짜 얇게
+        ls_tr.setColor(1.0, 0.9, 0.55, 0.65)   # 따뜻한 노란빛, 살짝 투명
+        ls_tr.moveTo(0, 0, 0)
+        ls_tr.drawTo(0, 30, 0)                 # local +Y 로 30m
+        self.tracer = self.render.attachNewNode(ls_tr.create())
+        self.tracer.setTransparency(True)
+        self.tracer.setLightOff()
+        self.tracer.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd))
+        self.tracer.setBin('fixed', 99)
+        self.tracer.setDepthWrite(False)
+        self.tracer.hide()
+        self.tracer_t = 0.0
+        self.tracer_dur = 0.05
+
         # 일시정지 메뉴 (ESC 토글)
         self.paused = False
         self._build_pause_menu()
+        # 화면 중앙 십자 조준점
+        self._build_crosshair()
+
+        # Valorant 스타일 — 1인칭에서 자기 몸·다리 숨기고 팔·손은 그대로. ybot 메쉬가
+        # Alpha_Surface (body 8.7K verts) + Alpha_Surface_Arms (arm 8.6K verts) 로 분리되어
+        # 있음 (scripts/blender_split_arms.py 로 사전 처리). body 만 hide.
+        # Alpha_Joints / Alpha_Joints_Arms 도 동일 split — joints 는 보통 invisible 이지만
+        # 안전하게 body 쪽만 hide. arms 쪽은 그대로 visible.
+        self._body_meshes = []
+        for name in ('Alpha_Surface', 'Alpha_Joints'):
+            np = self.ybot.find(f'**/{name}')
+            if not np.isEmpty():
+                self._body_meshes.append(np)
+        self._set_body_visible(False)
+
+        # 좀비 spawn + 방화벽/게이트 + damage popup 텍스트 풀
+        self.zombies = []
+        self.firewalls = []
+        self.gates = []
+        self._damage_numbers = []     # [{np, t, dur}, ...] — _update 가 animate
+        self._spawn_zombies()
 
         # 메인 루프
         self.taskMgr.add(self._update, 'game_update')
 
         # 진단: Idle 한 프레임 돌고 나서 본 이름/좌표 한 번 출력
         self.taskMgr.doMethodLater(0.3, self._dump_joints, 'dump_joints')
+
+    def _spawn_zombies(self):
+        if not ZOMBIE_BAM.exists():
+            print(f'[zombie] BAM not found: {ZOMBIE_BAM}', flush=True)
+            return
+        # 시작 즉시 스폰 없음. 측면 방 방화벽을 부수면 그 방 좀비가 스폰되고,
+        # 구역 양옆 방을 다 전멸시키면 전진 게이트 잠금이 풀린다.
+        rooms_by_zone = {}
+        for room in self.level_data['rooms']:
+            o, f, lo, hi = room['firewall']
+            fw = Firewall(self, o, f, lo, hi, room['spawns'], room['stain'])
+            self.firewalls.append(fw)
+            rooms_by_zone.setdefault(room['zone'], []).append(fw)
+        for g in self.level_data['gates']:
+            o, f, lo, hi = g['barrier']
+            self.gates.append(Gate(self, o, f, lo, hi,
+                                   rooms_by_zone.get(g['zone'], []),
+                                   g['stain'], g['room_stain'], g['final_spawns']))
+        print(f'[barriers] firewalls={len(self.firewalls)} gates={len(self.gates)}',
+              flush=True)
+
+    def _show_gate_msg(self, text, dur=1.6):
+        self.gate_msg.setText(text)
+        self.gate_msg.show()
+        self._gate_msg_token += 1
+        token = self._gate_msg_token
+
+        def _hide(task, t=token):
+            if t == self._gate_msg_token:
+                self.gate_msg.hide()
+            return Task.done
+
+        self.taskMgr.doMethodLater(dur, _hide, 'gate_msg_hide')
 
     # --- world setup --------------------------------------------------------
 
@@ -325,23 +1041,12 @@ class ZombieGame(ShowBase):
         self.render.setLight(dlnp)
 
     def _make_ground(self):
+        # level.py 의 5방 라인업 (y=-2 ~ y=70) 을 여유 있게 덮음.
         cm = CardMaker('ground')
-        cm.setFrame(-32, 32, -32, 32)
+        cm.setFrame(-32, 32, -8, 76)
         gnd = self.render.attachNewNode(cm.generate())
         gnd.setHpr(0, -90, 0)  # XY 평면으로 눕히기
         gnd.setColor(0.55, 0.55, 0.58, 1)
-
-    def _make_landmarks(self):
-        # 빈 월드면 이동 감각이 없으니 색깔 막대 몇 개를 흩뿌려서 시각적 단서.
-        rng = random.Random(42)
-        for i in range(10):
-            cm = CardMaker(f'mark_{i}')
-            cm.setFrame(-0.4, 0.4, 0, 2.0)
-            card = self.render.attachNewNode(cm.generate())
-            card.setTwoSided(True)
-            card.setPos(rng.uniform(-15, 15), rng.uniform(-15, 15), 0)
-            card.setH(rng.uniform(0, 360))
-            card.setColor(rng.uniform(0.3, 1), rng.uniform(0.3, 1), rng.uniform(0.3, 1), 1)
 
     # --- input --------------------------------------------------------------
 
@@ -351,7 +1056,10 @@ class ZombieGame(ShowBase):
             self.accept(f'{k}-up', self._set_key, [k, False])
         self.accept('escape', self._toggle_pause)
         self.accept('mouse1', self._play_shoot_oneshot)
+        self.accept('mouse3', self._set_aim, [True])
+        self.accept('mouse3-up', self._set_aim, [False])
         self.accept('r', self._play_reload_oneshot)
+        self.accept('f', self._on_interact)
         self.accept('f2', self._toggle_editor)
         # Ctrl 토글 — Panda3D 에선 'control' 단독 이벤트가 안 들어오므로 lcontrol/
         # rcontrol 만 바인딩 (left/right 둘 다 잡힘)
@@ -371,6 +1079,19 @@ class ZombieGame(ShowBase):
 
     def _set_key(self, k, v):
         self.keys[k] = v
+
+    def _set_aim(self, on):
+        # 우클릭 hold — ADS on/off. 재장전 transition 중에도 그대로 받음
+        # (사용자가 R + 우클릭 동시 누르는 흔치 않은 케이스 그냥 허용).
+        self.aiming = on
+
+    def _on_interact(self):
+        # F 키 — 가까이 있는 dead 좀비 가 있으면 Y Bot 으로 transform 시작.
+        if self.paused or self._interact_target is None:
+            return
+        self._interact_target.start_transform(self)
+        self._interact_target = None
+        self.interact_text.hide()
 
     # --- slide marker tuning harness (조정 끝나면 제거) -----------------------
 
@@ -491,6 +1212,11 @@ class ZombieGame(ShowBase):
         # 멈추지만 player_pos 는 그대로 전진/후진. 1인칭이라 다리는 거의 안 보임.
         if self._reload_oneshot and target in ('RunForward', 'RunBackward'):
             target = 'Idle'
+        # ADS + 이동 시 lower 까지 Idle 강제 → Hips rotation 사라져서 상체로 전파 안 됨
+        # → 팔 완전 정지. (다리는 어차피 hidden, body slide 만 발생)
+        if self.aim_t > 0.5 and target in ('RunForward', 'RunBackward',
+                                            'StrafeL', 'StrafeR'):
+            target = 'Idle'
         loco_w = {a: (1.0 if a == target else 0.0) for a in self.anim_names}
         # lower: 항상 locomotion. Shoot 단발 중에도 다리는 안 멈춤.
         self._target_w['lower'] = dict(loco_w)
@@ -502,13 +1228,130 @@ class ZombieGame(ShowBase):
         if not self._hands_oneshot and not self._reload_oneshot:
             self._target_w['hands'] = dict(self._target_w['upper'])
 
-    def _play_shoot_oneshot(self):
-        if 'Shoot' not in self.anim_names or self._hands_oneshot or self._reload_oneshot:
+    def _resolve_shot_hit(self):
+        """카메라 ray vs 각 좀비 vertical capsule. 안쪽(torso) 이면 Z 따라 head/body,
+        바깥(limb) 이면 other. 가장 가까운 hit 에 damage + damage number popup."""
+        cam_pos = self.camera.getPos(self.render)
+        yr = radians(self.player_yaw)
+        pp = radians(self.player_pitch)
+        ray_dir = Vec3(-sin(yr) * cos(pp), cos(yr) * cos(pp), sin(pp))
+        ray_dir.normalize()
+
+        rd_2d_dot = ray_dir.x * ray_dir.x + ray_dir.y * ray_dir.y
+        if rd_2d_dot < 1e-6:
+            return    # 수직 ray (위/아래 정확히) — capsule 측면 안 잡힘, skip
+
+        best_t = float('inf')
+        best_z = None
+        best_zone = None
+        best_hit_pos = None
+        for z in self.zombies:
+            if z.hp <= 0:
+                continue
+            # ray 와 vertical line (z.pos.x, z.pos.y, *) 사이 최단 거리의 t
+            dx = z.pos.x - cam_pos.x
+            dy = z.pos.y - cam_pos.y
+            t = (dx * ray_dir.x + dy * ray_dir.y) / rd_2d_dot
+            if t < 0 or t >= best_t:
+                continue
+            closest_x = cam_pos.x + ray_dir.x * t
+            closest_y = cam_pos.y + ray_dir.y * t
+            dxy = ((closest_x - z.pos.x) ** 2 + (closest_y - z.pos.y) ** 2) ** 0.5
+            if dxy > Zombie.HIT_LIMB_R:
+                continue
+            hit_z = cam_pos.z + ray_dir.z * t
+            if hit_z < Zombie.HIT_Z_MIN or hit_z > Zombie.HIT_Z_MAX:
+                continue
+            # zone 분류 — HEAD_Z 위(어깨 위)엔 머리 외에 다른 부위 없으니 XY 무관 head.
+            # 옛 로직은 옆에서 머리 외곽 (dxy>TORSO_R) 쏘면 'other' (5dmg) 로 빠지던 버그.
+            if hit_z >= Zombie.HIT_HEAD_Z:
+                zone = 'head'
+            elif dxy <= Zombie.HIT_TORSO_R:
+                zone = 'body'
+            else:
+                zone = 'other'
+            best_t = t
+            best_z = z
+            best_zone = zone
+            best_hit_pos = Vec3(closest_x, closest_y, hit_z)
+
+        # 방화벽 / 게이트 — 좀비보다 앞에 있으면 그걸 맞힘 (좀비 무효화).
+        best_barrier = None
+        for b in self.firewalls + self.gates:
+            s = b.ray_distance(cam_pos, ray_dir)
+            if s is None or s >= best_t:
+                continue
+            best_t = s
+            best_barrier = b
+            best_z = None
+
+        if best_barrier is not None:
+            best_barrier.hit()
             return
+        if best_z is None:
+            return
+        dmg = Zombie.DAMAGE[best_zone]
+        best_z.take_damage(dmg)
+        self._spawn_damage_number(best_hit_pos, dmg)
+        print(f'[hit] {best_zone} dmg={dmg} → hp={best_z.hp}/{best_z.hp_max}',
+              flush=True)
+
+    def _spawn_damage_number(self, world_pos, dmg):
+        """피격 위치 근처 (랜덤 offset) 에 3D billboard text 띄움. 위로 떠오르며 fade."""
+        tn = TextNode('dmg')
+        tn.setText(str(dmg))
+        tn.setAlign(TextNode.ACenter)
+        # 데미지 크기 따라 색
+        if dmg >= 20:
+            tn.setTextColor(1.0, 0.35, 0.20, 1)   # 진한 주황 — head
+        elif dmg >= 10:
+            tn.setTextColor(1.0, 0.85, 0.30, 1)   # 노랑 — body
+        else:
+            tn.setTextColor(0.95, 0.95, 0.95, 1)  # 흰색 — other
+        tn.setShadow(0.05, 0.05)
+        tn.setShadowColor(0, 0, 0, 1)
+        np_text = self.render.attachNewNode(tn)
+        np_text.setBillboardPointEye()
+        np_text.setScale(0.30)
+        np_text.setLightOff()
+        np_text.setTransparency(True)
+        np_text.setBin('fixed', 95)
+        np_text.setDepthTest(False)
+        np_text.setDepthWrite(False)
+        off = Vec3(random.uniform(-0.20, 0.20),
+                   random.uniform(-0.20, 0.20),
+                   random.uniform(0.05, 0.20))
+        np_text.setPos(world_pos + off)
+        self._damage_numbers.append({'np': np_text, 't': 1.0, 'dur': 1.0})
+
+    def _play_shoot_oneshot(self):
+        if self.paused:
+            return
+        if self.ammo <= 0:
+            return  # 빈 탄창 — 발사 안 함 (R 로 재장전)
+        if self.shoot_cooldown_t > 0:
+            return  # 발사 간격 쿨다운
+        if 'Shoot' not in self.anim_names or self._reload_oneshot:
+            return
+        self.ammo -= 1
+        self.shoot_cooldown_t = self.shoot_cooldown_dur
+        # 히트 판정 — 카메라 위치에서 yaw+pitch 방향으로 ray, 각 좀비의 3 zone
+        # (head/body/foot) sphere 와 교차 검사. 가장 가까운 zone 에 damage.
+        self._resolve_shot_hit()
         # hands 만 Shoot 자세로 — 다리/상체는 그대로.
         self.ybot.play('Shoot', partName='hands')
         self.recoil_back = self.recoil_shoot_back
         self.slide_recoil = self.slide_recoil_kick
+        # Muzzle flash — anchor 에 parent 라 위치는 자동. show + timer 만.
+        if self.muzzle_flash is not None:
+            self.muzzle_flash_t = self.muzzle_flash_dur
+            self.muzzle_flash.setScale(self.muzzle_flash_base_scale)
+            self.muzzle_flash.show()
+            # Tracer — muzzle 위치에서 카메라가 보는 방향 (yaw + pitch)
+            self.tracer.setPos(self.muzzle_flash.getPos(self.render))
+            self.tracer.setHpr(self.player_yaw, self.player_pitch, 0)
+            self.tracer.show()
+            self.tracer_t = self.tracer_dur
         self._hands_oneshot = True
         self._target_w['hands'] = {
             a: (1.0 if a == 'Shoot' else 0.0) for a in self.anim_names
@@ -557,6 +1400,7 @@ class ZombieGame(ShowBase):
             if t != self._reload_token:
                 return Task.done
             self._reload_oneshot = False
+            self.ammo = self.ammo_max   # 탄창 충전
             # upper/hands 를 다음 프레임에 locomotion 으로 강제 재평가시키는 sentinel
             self.current_anim = '__reload_done__'
             return Task.done
@@ -580,60 +1424,114 @@ class ZombieGame(ShowBase):
                 cur_w[a] = new
                 self.ybot.setControlEffect(a, new, partName=p)
 
+    def _set_body_visible(self, visible):
+        """body / leg / spine 메쉬만 show/hide. 팔/손은 항상 그대로."""
+        for np in self._body_meshes:
+            if visible:
+                np.show()
+            else:
+                np.hide()
+
     def _toggle_editor(self):
         self.editor_mode = not self.editor_mode
         # cursor 상태는 안 바꿈 (양쪽 다 confined+hidden = 무한 회전 가능).
         if self.editor_mode:
-            # editor 진입: 현재 카메라 위치/방향에서 시작 → 시각적 점프 없음.
             self.editor_pos = Vec3(self.camera.getPos(self.render))
             self.editor_yaw = self.player_yaw
             self.editor_pitch = self.player_pitch
+            self._set_body_visible(True)    # 3인칭으로 자기 몸 다시 봄
+        else:
+            self._set_body_visible(False)   # FPS — body 숨기고 팔만
         self.win.movePointer(0, self._win_cx, self._win_cy)
         self._first_frame = True
 
     # --- pause menu ---------------------------------------------------------
 
     def _build_pause_menu(self):
-        # 어두운 반투명 배경 + 가운데 PAUSED + Resume/Quit 두 버튼.
+        # 어두운 반투명 배경 + PAUSED + Mouse Sensitivity 슬라이더 + Resume/Quit.
         self.pause_frame = DirectFrame(
             frameColor=(0, 0, 0, 0.6),
-            frameSize=(-0.5, 0.5, -0.4, 0.4),
+            frameSize=(-0.55, 0.55, -0.45, 0.45),
             pos=(0, 0, 0),
             parent=self.aspect2d,
         )
         OnscreenText(
-            text='PAUSED', pos=(0, 0.22), scale=0.12,
+            text='일시정지', pos=(0, 0.30), scale=0.12,
             fg=(1, 1, 1, 1), align=TextNode.ACenter, mayChange=False,
             parent=self.pause_frame,
         )
+        OnscreenText(
+            text='마우스 감도', pos=(0, 0.16), scale=0.045,
+            fg=(0.9, 0.9, 0.9, 1), align=TextNode.ACenter, mayChange=False,
+            parent=self.pause_frame,
+        )
+        self.sens_slider = DirectSlider(
+            range=(0.02, 0.30),
+            value=self.mouse_sens,
+            pageSize=0.01,
+            command=self._on_sens_change,
+            parent=self.pause_frame,
+            pos=(0, 0, 0.09),
+            scale=0.35,
+        )
+        self.sens_value_text = OnscreenText(
+            text=f'{self.mouse_sens:.3f}', pos=(0, 0.02), scale=0.04,
+            fg=(1, 1, 0.7, 1), align=TextNode.ACenter, mayChange=True,
+            parent=self.pause_frame,
+        )
         DirectButton(
-            text='Resume',
-            scale=0.08, pos=(0, 0, 0.0),
+            text='계속하기',
+            scale=0.08, pos=(0, 0, -0.12),
             command=self._toggle_pause,
             parent=self.pause_frame,
             frameSize=(-3, 3, -0.8, 1.2),
         )
         DirectButton(
-            text='Quit',
-            scale=0.08, pos=(0, 0, -0.22),
+            text='종료',
+            scale=0.08, pos=(0, 0, -0.32),
             command=self.userExit,
             parent=self.pause_frame,
             frameSize=(-3, 3, -0.8, 1.2),
         )
         self.pause_frame.hide()
 
+    def _on_sens_change(self):
+        # DirectSlider command — 매 변경마다 호출. 현재 값 읽어서 mouse_sens 갱신.
+        v = self.sens_slider['value']
+        self.mouse_sens = v
+        self.sens_value_text.setText(f'{v:.3f}')
+
+    def _build_crosshair(self):
+        """화면 중앙 십자 조준점 — 중심 gap 있는 + 모양. aspect2d 의 vertical 은 Z."""
+        ls = LineSegs('crosshair')
+        ls.setThickness(2)
+        ls.setColor(1, 1, 1, 0.85)
+        s = 0.020  # 바깥 끝 (aspect2d 단위)
+        g = 0.005  # 중심 gap
+        ls.moveTo(-s, 0, 0); ls.drawTo(-g, 0, 0)
+        ls.moveTo(g, 0, 0);  ls.drawTo(s, 0, 0)
+        ls.moveTo(0, 0, -s); ls.drawTo(0, 0, -g)
+        ls.moveTo(0, 0, g);  ls.drawTo(0, 0, s)
+        self.crosshair = self.aspect2d.attachNewNode(ls.create())
+        self.crosshair.setLightOff()
+
     def _toggle_pause(self):
         self.paused = not self.paused
         props = WindowProperties()
+        clock = ClockObject.getGlobalClock()
         if self.paused:
+            # 시간 정지 — MSlave 에선 main loop 의 tick() 이 frame_time 을 안 흘려서
+            # Actor loop anim / doMethodLater / dt 기반 update 모두 자동 멈춤.
+            # (참고: setDt(0) 는 Panda3D 가 assert 로 거부함 — MSlave 면 setDt 불필요.)
+            clock.setMode(ClockObject.MSlave)
             self.pause_frame.show()
-            # cursor 보이게 + absolute 모드로 메뉴 클릭 가능.
             props.setCursorHidden(False)
             props.setMouseMode(WindowProperties.M_absolute)
             self.win.requestProperties(props)
         else:
+            # 재개 — MNormal 복귀. 첫 프레임 dt 폭발은 _update 의 cap (≤0.1) 이 잡음.
+            clock.setMode(ClockObject.MNormal)
             self.pause_frame.hide()
-            # 다시 게임으로 — confined + hidden + 첫 프레임 mouse delta 무시.
             props.setCursorHidden(True)
             props.setMouseMode(WindowProperties.M_confined)
             self.win.requestProperties(props)
@@ -674,6 +1572,9 @@ class ZombieGame(ShowBase):
         if self.paused:
             return Task.cont
         dt = ClockObject.getGlobalClock().getDt()
+        # pause 직후 첫 프레임 wall-clock 누적 dt 폭발 cap — 좀비 워프 방지.
+        if dt > 0.1:
+            dt = 0.1
 
         # 애니메이션 블렌딩 weight 수렴
         self._update_blend(dt)
@@ -681,6 +1582,26 @@ class ZombieGame(ShowBase):
         # 사격 반동 자연 감쇠 — weapon_anchor 위치에 적용 (카메라엔 영향 없음)
         decay = min(1.0, dt * self.recoil_decay)
         self.recoil_back += (0.0 - self.recoil_back) * decay
+
+        # 발사 쿨다운 감쇠
+        if self.shoot_cooldown_t > 0:
+            self.shoot_cooldown_t -= dt
+
+        # Muzzle flash timer — 위치는 anchor parent 가 자동 처리, 크기만 fade.
+        if self.muzzle_flash is not None and self.muzzle_flash_t > 0:
+            self.muzzle_flash_t -= dt
+            if self.muzzle_flash_t <= 0:
+                self.muzzle_flash.hide()
+            else:
+                t_norm = self.muzzle_flash_t / self.muzzle_flash_dur
+                self.muzzle_flash.setScale(
+                    self.muzzle_flash_base_scale * (0.4 + 0.6 * t_norm))
+
+        # Tracer timer — 단순히 시간 지나면 hide.
+        if self.tracer_t > 0:
+            self.tracer_t -= dt
+            if self.tracer_t <= 0:
+                self.tracer.hide()
         # 슬라이드 후퇴 감쇠 + 실제 노드 위치 적용. 모델의 +X 가 권총 뒤쪽이라
         # rest 에서 +slide_recoil 만큼 더해야 뒤로 빠지는 효과.
         if self.slide_node is not None:
@@ -701,9 +1622,13 @@ class ZombieGame(ShowBase):
                 self.editor_pitch -= dy * self.mouse_sens
                 self.editor_pitch = max(-89.0, min(89.0, self.editor_pitch))
             else:
-                # 1인칭은 좌우(yaw)만 — 상하 시점은 고정 (편의 / 멀미 방지).
-                # editor (F2 free-cam) 모드에선 위아래도 가능.
-                self.player_yaw -= dx * self.mouse_sens
+                # 1인칭 yaw + pitch — 위·아래 ±89° (총 178°) 자유 시야.
+                # ADS 시 감도 낮춤 → 손/총 좌우 swing 천천히·작게.
+                sens = self.mouse_sens * (
+                    1.0 + (self.ads_mouse_factor - 1.0) * self.aim_t)
+                self.player_yaw -= dx * sens
+                self.player_pitch -= dy * sens
+                self.player_pitch = max(-89.0, min(89.0, self.player_pitch))
 
         if self.editor_mode:
             # editor free-cam: 카메라가 보는 방향 + 우 + 위. Space=상, 잠금 없음.
@@ -733,7 +1658,13 @@ class ZombieGame(ShowBase):
                 if self.keys['a']: mv -= right_v
                 if mv.length() > 0:
                     mv.normalize()
-                    self.player_pos += mv * (self.move_speed * dt)
+                    spd_mult = 1.0 + (self.ads_move_factor - 1.0) * self.aim_t
+                    self.player_pos += mv * (self.move_speed * spd_mult * dt)
+                    # 벽 충돌 해소 (XY 평면) — 박스 안쪽으로 침투했으면 바깥으로 밀어냄.
+                    nx, ny = self.level_collider.resolve(
+                        self.player_pos.x, self.player_pos.y, PLAYER_RADIUS)
+                    self.player_pos.x = nx
+                    self.player_pos.y = ny
                 if self.keys['space'] and self.on_ground:
                     self.player_vz = self.jump_speed
                     self.on_ground = False
@@ -769,8 +1700,19 @@ class ZombieGame(ShowBase):
         bob_z = (self._walk_bob_amp_z * self._walk_bob_t
                  * sin(self._walk_bob_phase))
 
-        self.ybot.setPos(self.player_pos + recoil_offset + Vec3(0, 0, bob_z))
-        self.ybot.setH(self.player_yaw + 180)
+        # ADS body offset — player-frame (우/앞/위) 벡터를 world 로 회전해서 ybot 에
+        # 더함. 카메라는 아래 setPos 에서 같은 양 -로 보정 → 시점 정적.
+        yr_ads = radians(self.player_yaw)
+        ads_right_w = Vec3(cos(yr_ads), sin(yr_ads), 0)
+        ads_fwd_w   = Vec3(-sin(yr_ads), cos(yr_ads), 0)
+        ads_offset_world = (ads_right_w * self.ads_body_offset.x
+                            + ads_fwd_w * self.ads_body_offset.y
+                            + Vec3(0, 0, self.ads_body_offset.z)) * self.aim_t
+
+        self.ybot.setPos(self.player_pos + recoil_offset
+                         + Vec3(0, 0, bob_z) + ads_offset_world)
+        # 일단 pitch=0 으로 세팅 → 아래에서 shoulder 피벗 트릭으로 pitch 적용.
+        self.ybot.setHpr(self.player_yaw + 180, 0, 0)
         # 애니메이션을 현재 시각으로 강제 동기화. 안 하면 joint 의 world 좌표가
         # 1프레임 lag 된 상태를 반환해서 카메라가 머리에서 떨림.
         self.ybot.update(force=True)
@@ -785,54 +1727,115 @@ class ZombieGame(ShowBase):
             self.ybot.setX(self.ybot.getX() + c * dlx - s * dly)
             self.ybot.setY(self.ybot.getY() + s * dlx + c * dly)
 
-        # weapon anchor 갱신: hand 본 따라감. ybot 자체가 사격 반동으로 뒤로 가서
-        # hand 본 world 좌표도 자동으로 뒤로 — 추가 offset 불필요.
+        # 어깨 피벗 pitch — RightShoulder world 를 pre/post 캡처해서 ybot 평행이동으로
+        # 보정 → 어깨가 안 움직이고 그 주위로 몸이 회전 = 어깨 축 회전 효과.
+        # 1인칭이라 다리/몸통이 어색하게 움직여도 안 보이고, 팔·손·총은 어깨 주위로
+        # 자연스럽게 회전.
+        if (not self.editor_mode and self.rshoulder_joint is not None
+                and abs(self.player_pitch) > 0.001):
+            sh_up = self.rshoulder_joint.getPos(self.render)
+            self.ybot.setHpr(self.player_yaw + 180, -self.player_pitch, 0)
+            sh_pitched = self.rshoulder_joint.getPos(self.render)
+            self.ybot.setPos(self.ybot.getPos() + (sh_up - sh_pitched))
+
+        # ADS ramp + FOV 보간 — 우클릭 hold 동안 aim_t 가 1 로 수렴 (~110ms).
+        target_aim = 1.0 if self.aiming else 0.0
+        self.aim_t += ((target_aim - self.aim_t)
+                       * min(1.0, dt * self.aim_speed))
+        if not self.editor_mode:
+            current_fov = (self.fov_hip
+                           + (self.fov_ads - self.fov_hip) * self.aim_t)
+            self.camLens.setFov(current_fov)
+
+        # 카메라 배치 — shoulder pivot 기준 forward/up 평면에서 player_pitch 만큼 회전.
+        # 손/총이 어꺠 축으로 회전하니 카메라도 같은 축으로 회전해서 정렬됨.
+        # bob / ads 는 ybot 에만 적용했으니 camera 에 영향 X (자연히 정적).
+        if self.editor_mode:
+            self.camera.setPos(self.editor_pos)
+            self.camera.setHpr(self.editor_yaw, self.editor_pitch, 0)
+            cam_pos = self.editor_pos
+        else:
+            shoulder_h = 1.40   # shoulder world Z 근사 (Y Bot)
+            sh_pivot = self.player_pos + Vec3(0, 0, shoulder_h)
+            yr = radians(self.player_yaw)
+            forward = Vec3(-sin(yr), cos(yr), 0)
+            right_v = Vec3(cos(yr), sin(yr), 0)
+            # pitch=0 시 카메라 offset (어깨 기준): 앞 / 위 / 좌
+            cam_fwd_off = self.eye_forward_offset + self.recoil_back
+            cam_up_off  = self.head_height - shoulder_h    # ≈ 0.25m
+            cam_lat_off = -self.eye_lateral_offset         # 좌측
+            # (forward, up) 평면에서 player_pitch 만큼 회전 → 어깨 orbit
+            pp = radians(self.player_pitch)
+            new_fwd = cam_fwd_off * cos(pp) - cam_up_off * sin(pp)
+            new_up  = cam_fwd_off * sin(pp) + cam_up_off * cos(pp)
+            cam_pos = (sh_pivot
+                       + forward * new_fwd
+                       + right_v * cam_lat_off
+                       + Vec3(0, 0, new_up))
+            self.camera.setPos(cam_pos)
+            self.camera.setHpr(self.player_yaw, self.player_pitch, 0)
+
+        # weapon anchor 갱신: hand 본 따라감. 이제 ybot 자체가 head 본 피벗으로
+        # pitch 되어 손 본도 같이 회전 → player_pitch 를 따로 더할 필요 없음
+        # (더하면 이중 적용).
         if (self.weapon is not None
                 and self.right_hand_joint is not None
                 and not self.right_hand_joint.isEmpty()):
             self.weapon_anchor.setPos(self.right_hand_joint.getPos(self.render))
             self.weapon_anchor.setHpr(self.right_hand_joint.getHpr(self.render))
 
-        # 카메라 배치
-        if self.editor_mode:
-            # free-cam: editor_pos / editor_yaw / pitch 그대로 사용
-            self.camera.setPos(self.editor_pos)
-            self.camera.setHpr(self.editor_yaw, self.editor_pitch, 0)
+        # 좀비 AI tick
+        for z in self.zombies:
+            z.update(dt, self.player_pos)
+
+        # 방화벽 / 게이트 tick (피격 플래시 복구, 색 번짐, 게이트 잠금 해제)
+        for fw in self.firewalls:
+            fw.update(dt)
+        for g in self.gates:
+            g.update(dt)
+
+        # Interact proximity — 가장 가까운 DEAD + 아직 transform 안 한 좀비 찾기
+        self._interact_target = None
+        best_d = self.interact_range
+        for z in self.zombies:
+            if z.state != Zombie.DEAD or z.transformed or z.transform_t > 0:
+                continue
+            d = (z.pos - self.player_pos).length()
+            if d < best_d:
+                best_d = d
+                self._interact_target = z
+        if self._interact_target is not None:
+            self.interact_text.setText('[F] Y Bot 으로 변환')
+            self.interact_text.show()
         else:
-            # 카메라를 Head 본 월드 좌표에 부착. 머리 애니메이션 그대로 따라감.
-            # 시선 방향(yaw/pitch) 은 마우스 입력 그대로 — head 본의 회전은 무시.
-            # 사격 반동(recoil_pitch/back)은 매 프레임 감쇠되며 카메라에 가산.
-            if self.head_joint is not None:
-                head_w = self.head_joint.getPos(self.render)
-                yr = radians(self.player_yaw)
-                forward = Vec3(-sin(yr), cos(yr), 0)
-                right_v = Vec3(cos(yr), sin(yr), 0)
-                # 카메라 시점 고정: ybot 이 recoil_back 만큼 뒤로 가서 head_w 도
-                # 같이 뒤로 가있는 상태. +forward * recoil_back 으로 보정 → 카메라
-                # 절대 위치는 사격 전과 동일.
-                # left lateral offset 추가 → 권총·손이 화면 우측에 보임 (FPS 표준).
-                self.camera.setPos(
-                    head_w
-                    + forward * (self.eye_forward_offset + self.recoil_back)
-                    - right_v * self.eye_lateral_offset
-                    - Vec3(0, 0, bob_z)   # ybot 의 Z bob 상쇄 → 카메라 정적
-                )
+            self.interact_text.hide()
+
+        # Damage number popup — 위로 떠오르며 fade out
+        for d in self._damage_numbers[:]:
+            d['t'] -= dt
+            if d['t'] <= 0:
+                d['np'].removeNode()
+                self._damage_numbers.remove(d)
             else:
-                self.camera.setPos(self.player_pos + Vec3(0, 0, self.head_height))
-            self.camera.setHpr(self.player_yaw, self.player_pitch, 0)
+                d['np'].setZ(d['np'].getZ() + 0.6 * dt)       # 60cm/sec 위로
+                alpha = d['t'] / d['dur']
+                d['np'].setColorScale(1, 1, 1, alpha)
 
         # HUD
         fps = ClockObject.getGlobalClock().getAverageFrameRate()
         self.hud.setText(
-            f'anim:  {self.current_anim}'
-            f'{"  +Shoot(hands)" if self._hands_oneshot else ""}'
-            f'{"  +Reload(upper)" if self._reload_oneshot else ""}\n'
+            f'동작:  {self.current_anim}'
+            f'{"  +사격(손)" if self._hands_oneshot else ""}'
+            f'{"  +재장전(상체)" if self._reload_oneshot else ""}\n'
+            f'탄약:  {self.ammo}/{self.ammo_max}'
+            f'{"   빈 탄창 (R)" if self.ammo == 0 else ""}\n'
             f'fps:   {fps:.0f}\n'
-            f'pos:   ({self.player_pos.x:.1f}, {self.player_pos.y:.1f}, {self.player_pos.z:.1f})\n'
-            f'mode:  {"editor[F2]" if self.editor_mode else "fps"}'
-            f'{"  KNEEL" if self.kneel_state == "kneel" else ""}'
-            f'{"  KNEEL->" if self.kneel_state == "going_down" else ""}'
-            f'{"  STAND->" if self.kneel_state == "going_up" else ""}'
+            f'위치:  ({self.player_pos.x:.1f}, {self.player_pos.y:.1f}, {self.player_pos.z:.1f})\n'
+            f'모드:  {"에디터[F2]" if self.editor_mode else "fps"}'
+            f'{"  무릎" if self.kneel_state == "kneel" else ""}'
+            f'{"  무릎 자세로" if self.kneel_state == "going_down" else ""}'
+            f'{"  일어서는 중" if self.kneel_state == "going_up" else ""}'
+            f'{"  ADS" if self.aim_t > 0.5 else ""}'
         )
 
         return Task.cont
