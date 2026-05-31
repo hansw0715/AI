@@ -52,14 +52,25 @@ class Wall:
         self.y1 = max(ay, by) + half
 
     def make_card(self, parent):
+        # 벽 한 칸 — CardMaker 카드는 한쪽 법선만 가져, 라이트가 뒷면에서 오면
+        # 그 벽이 검게 칠해진다 (어떤 벽은 밝고 어떤 벽은 어두운 문제의 원인).
+        # setTwoSided 는 양면 렌더만 시키고 법선은 그대로라 라이팅 보정이 안 됨.
+        # 해결: 카드 두 장을 180° 회전해 등 맞대게 → 각 면의 법선이 바깥을 향함.
+        # backface culling 이 카메라 반대쪽 카드를 알아서 숨기고, 라이트는 면이
+        # 향한 방향만 비춤 — 양쪽에서 봐도 자연스러운 음영.
         length = hypot(self.bx - self.ax, self.by - self.ay)
-        cm = CardMaker('wall')
-        cm.setFrame(-length / 2.0, length / 2.0, 0.0, WALL_HEIGHT)
-        np = parent.attachNewNode(cm.generate())
-        np.setTwoSided(True)
+        np = parent.attachNewNode('wall')
         np.setPos((self.ax + self.bx) / 2.0, (self.ay + self.by) / 2.0, 0.0)
         np.setH(degrees(atan2(self.by - self.ay, self.bx - self.ax)))
         np.setColor(*WALL_COLOR)
+
+        cm = CardMaker('wall_front')
+        cm.setFrame(-length / 2.0, length / 2.0, 0.0, WALL_HEIGHT)
+        np.attachNewNode(cm.generate())
+        cm_b = CardMaker('wall_back')
+        cm_b.setFrame(-length / 2.0, length / 2.0, 0.0, WALL_HEIGHT)
+        back = np.attachNewNode(cm_b.generate())
+        back.setH(180)
         return np
 
 
