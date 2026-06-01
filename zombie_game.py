@@ -84,6 +84,8 @@ GLITCH_LABELS = {
 
 
 SCRIPT_DIR = Path(__file__).parent
+# Quaternius sci-fi 키트 시각 레이어 사용 여부. False = 기본 맵(level.py 단색 벽).
+USE_KIT_MAP = False
 BAM_PATH = Filename.from_os_specific(
     str(SCRIPT_DIR / 'assets' / 'ybot' / 'scene.bam')
 )
@@ -191,7 +193,8 @@ class Zombie:
         ('RightUpLeg', 'RightLeg', 0.11, 'other'),
         ('RightLeg', 'RightFoot', 0.08, 'other'),
     )
-    DAMAGE = {'head': 20, 'body': 10, 'other': 5}
+    # head 50 → hp_max 100 이므로 헤드샷 2방에 사망. body/other 는 그대로.
+    DAMAGE = {'head': 50, 'body': 10, 'other': 5}
 
     # Distance LOD — 플레이어로부터 이 거리 너머의 좀비는 actor.hide() + AI/anim skip.
     # 어차피 시야 25m 너머는 안 쫓아오고 벽 차폐로 시각도 막혀있어서 cost 0 으로 만들어도
@@ -932,7 +935,23 @@ class ZombieGame(ShowBase):
         self.render.setShaderAuto()
         self._make_ground()
         # level.py 가 render 아래에 방·벽·기둥을 만들고 collider + 좀비 spawn 좌표 반환.
-        self.level_collider, self.level_data = build_level(self.render)
+        # 키트 .bam 이 있으면 단색 벽 카드를 끄고(z-fighting 방지) kit_map 메쉬로 대체.
+        import os
+        kit_available = USE_KIT_MAP and os.path.isfile("assets/kit/Wall_1.bam")
+        self.level_collider, self.level_data = build_level(
+            self.render, draw_wall_cards=not kit_available)
+        self.kit_root = None
+        if kit_available:
+            # kit_map.py 가 같은 collider.walls 위에 Quaternius sci-fi 키트 메쉬를
+            # 입힌다 (보이는 벽 = 부딪히는 벽).
+            try:
+                from kit_map import build_kit_visuals
+                self.kit_root = build_kit_visuals(self.render, self.level_collider)
+                print("[zombie_game] kit_map 시각 레이어 적용됨")
+            except Exception as e:
+                print(f"[zombie_game] kit_map 실패 ({e}) — 단색 벽으로 폴백")
+                for w in self.level_collider.walls:
+                    w.make_card(self.render)
 
         # 카메라 — 캐릭터 머리 안쪽에서 보더라도 클리핑 안 되게 near 매우 작게.
         # FOV 크면 시야 넓어지고 자기 몸이 작게 보임 (FPS 표준 90~100).
@@ -1219,6 +1238,41 @@ class ZombieGame(ShowBase):
         self.sfx_shot_pool = self._load_sfx_pool('shot.wav', 4)
         self._sfx_shot_i = 0
         self.sfx_reload = self._load_sfx('Reload.wav')
+
+        # 발소리 — f1/f2/f3 중 랜덤 재생하되 직전과 같은 건 안 나오게(중복 방지).
+        self.sfx_foot = [s for s in (self._load_sfx('f1.mp3'),
+                                     self._load_sfx('f2.mp3'),
+                                     self._load_sfx('f3.mp3')) if s is not None]
+        self._last_foot_i = -1
+        self._footstep_t = 0.0          # 다음 발소리까지 남은 시간(초)
+        self.footstep_interval = 0.30   # run 기준 보폭 간격(낮을수록 빠름). ADS 면 늘림
+
+        # 킬 사운드 (Valorant) — 연속 헤드샷 킬 콤보로 단계 상승.
+        #   1킬 → 1st. 직전 킬 5초 이내 + 헤드샷이면 2nd→3rd→4th→5th-6th 로 상승,
+        #   그 뒤로는 계속 5th-6th. 콤보 끊기면(5초 초과 or 헤드샷 아님) 다시 1st.
+        self.sfx_kill = {
+            1: self._load_sfx('valorant-1st-kill-sound.mp3'),
+            2: self._load_sfx('valorant-2nd-kill-sound.mp3'),
+            3: self._load_sfx('valorant-3rd-kill-sound.mp3'),
+            4: self._load_sfx('valorant-4th-kill-sound.mp3'),
+            5: self._load_sfx('valorant-5th-6th-kill-sound.mp3'),
+        }
+        self._last_kill_snd = None
+        self._kill_tier = 0             # 현재 콤보 단계 (1..5)
+        self._combo_window = 0.0        # 콤보 유지 남은 시간(초)
+        self.kill_combo_dur = 5.0       # 연속킬 인정 시간
+        self.kills = 0                  # 총 처치 수 (HUD)
+
+        # 피격 파티클 — Kenney particle pack 의 fire 스프라이트. 맞은 부위에 랜덤 1개.
+        _fire_dir = SCRIPT_DIR / 'kenney_particle-pack' / 'PNG (Transparent)'
+        self._fire_tex = []
+        for fn in ('fire_01.png', 'fire_02.png'):
+            t = self.loader.loadTexture(
+                Filename.from_os_specific(str(_fire_dir / fn)))
+            if t is not None:
+                self._fire_tex.append(t)
+        self._hit_particles = []        # [{np, t, dur, base}, ...] — _update 가 animate
+        print(f'[fx] fire 파티클 {len(self._fire_tex)}종 로드', flush=True)
         # 재장전 사운드 길이에 맞춰 Reload 애니메이션 속도를 동기화 (오디오 원음 유지).
         # 실제 재생 시간(_reload_play_dur)을 타이머에 사용. 과한 워핑은 클램프로 방지.
         self._reload_play_dur = (self.ybot.getDuration('Reload')
@@ -1308,24 +1362,57 @@ class ZombieGame(ShowBase):
         self.taskMgr.doMethodLater(0.3, self._dump_joints, 'dump_joints')
 
     def _spawn_zombies(self):
+        # 웨이브 모드 — 방화벽/게이트 진행 대신, 맵의 스폰 지점들에 매 웨이브
+        # 좀비를 점점 더 많이 풀어놓는다. 다 처치하면 인터미션 후 다음 웨이브.
+        pts = []
+        for room in self.level_data['rooms']:
+            pts.extend(room['spawns'])
+        for g in self.level_data['gates']:
+            if g.get('final_spawns'):
+                pts.extend(g['final_spawns'])
+        self._spawn_points = pts
+
+        # 웨이브 상태
+        self.wave = 0
+        self.wave_active = False
+        self.wave_base = 4              # 웨이브1 좀비 수
+        self.wave_growth = 2            # 웨이브마다 +N
+        self.intermission_dur = 4.0     # 웨이브 사이 대기(초)
+        self._intermission_t = 3.0      # 첫 웨이브까지 대기
+
         if not ZOMBIE_BAM.exists():
             print(f'[zombie] BAM not found: {ZOMBIE_BAM}', flush=True)
+            self._spawn_points = []
+        print(f'[wave] {len(self._spawn_points)} 스폰 지점 준비', flush=True)
+
+    def _spawn_wave(self, n):
+        """웨이브 n 의 좀비를 스폰 지점에 분산 배치."""
+        if not self._spawn_points:
             return
-        # 시작 즉시 스폰 없음. 측면 방 방화벽을 부수면 그 방 좀비가 스폰되고,
-        # 구역 양옆 방을 다 전멸시키면 전진 게이트 잠금이 풀린다.
-        rooms_by_zone = {}
-        for room in self.level_data['rooms']:
-            o, f, lo, hi = room['firewall']
-            fw = Firewall(self, o, f, lo, hi, room['spawns'], room['stain'])
-            self.firewalls.append(fw)
-            rooms_by_zone.setdefault(room['zone'], []).append(fw)
-        for g in self.level_data['gates']:
-            o, f, lo, hi = g['barrier']
-            self.gates.append(Gate(self, o, f, lo, hi,
-                                   rooms_by_zone.get(g['zone'], []),
-                                   g['stain'], g['room_stain'], g['final_spawns']))
-        print(f'[barriers] firewalls={len(self.firewalls)} gates={len(self.gates)}',
-              flush=True)
+        self._clear_corpses()
+        pts = list(self._spawn_points)
+        random.shuffle(pts)
+        count = self.wave_base + self.wave_growth * (n - 1)
+        for i in range(count):
+            x, y = pts[i % len(pts)]
+            self.zombies.append(Zombie(self, Vec3(x, y, 0), 180))
+        self.wave_active = True
+        self._show_gate_msg(f'WAVE {n}', dur=2.0)
+        print(f'[wave] {n}: 좀비 {count} 스폰', flush=True)
+
+    def _clear_corpses(self):
+        """완전히 죽은(DEAD) 좀비 노드를 정리해 누적 부하를 막는다.
+        변환(아군)·사망 연출/페이드 중인 좀비는 유지."""
+        keep = []
+        for z in self.zombies:
+            if (z.state == Zombie.DEAD and not z.transformed
+                    and z.transform_t <= 0):
+                z.actor.removeNode()
+                if z.ybot_replacement is not None:
+                    z.ybot_replacement.removeNode()
+            else:
+                keep.append(z)
+        self.zombies = keep
 
     def _show_gate_msg(self, text, dur=1.6, reveal=False):
         # reveal=True → 진실 누출 톤(빨강) + 짧은 글리치 동반. 게이트 돌파처럼
@@ -1348,36 +1435,27 @@ class ZombieGame(ShowBase):
     # --- world setup --------------------------------------------------------
 
     def _make_lights(self):
-        # 어두운 연구실 분위기 — 글로벌 조명은 거의 깔지 않고, 플레이어 플래시라이트가
-        # 앞쪽만 비추게. ambient 가 너무 낮으면 좀비 실루엣도 안 보이니 약하게 남김.
+        # 밝은 실내 — ambient 를 충분히 올려 맵 전체가 환하게. (플래시라이트 제거)
         amb = AmbientLight('ambient')
-        amb.setColor(Vec4(0.08, 0.08, 0.10, 1))     # 거의 검은 푸른 색
+        amb.setColor(Vec4(0.62, 0.63, 0.67, 1))      # 밝은 회백색 베이스
         self.render.setLight(self.render.attachNewNode(amb))
 
-        # 약한 디렉셔널 — 그림자 형태와 표면 음영만 살짝.
+        # 메인 디렉셔널 — 표면 음영/입체감.
         dl = DirectionalLight('dir')
-        dl.setColor(Vec4(0.10, 0.10, 0.12, 1))
+        dl.setColor(Vec4(0.48, 0.48, 0.50, 1))
         dlnp = self.render.attachNewNode(dl)
         dlnp.setHpr(45, -55, 0)
         self.render.setLight(dlnp)
 
-        # 플래시라이트 — 카메라가 아니라 "몸(가슴)" 위치에 부착.
-        # 카메라 위치에서 쏘면 1인칭 손/총이 cone 시작점보다 더 가까워서 빛 못 받음.
-        # 광원을 카메라 뒤쪽(-Y)·아래(-Z)로 옮겨 가슴 위치에 놓으면, 손/총이 cone
-        # 안 + near 너머에 들어가 자연스럽게 환해진다. 시선은 그대로 카메라 forward.
-        sl = Spotlight('flashlight')
-        sl.setColor(Vec4(1.60, 1.45, 1.15, 1))       # 따뜻한 백색 (전구 톤)
-        lens = PerspectiveLens()
-        lens.setFov(85)                              # cone 한참 넓게 — 손/총 + 시야 가장자리까지
-        lens.setNearFar(0.05, 35)                    # near 5cm — 가슴 직전 손/총까지
-        sl.setLens(lens)
-        sl.setExponent(18)                           # 부드러운 falloff — 가운데↔가장자리 차 줄임
-        sl.setAttenuation(Vec3(1.0, 0.0, 0.010))     # 거리 제곱 감쇠
-        slnp = self.camera.attachNewNode(sl)
-        slnp.setPos(0, -0.55, -0.30)                 # 카메라 뒤 55cm + 아래 30cm = 가슴 부근
-        slnp.setHpr(0, 0, 0)                         # 카메라 forward 와 동일 방향
-        self.render.setLight(slnp)
-        self.flashlight = slnp
+        # 보조 디렉셔널(반대쪽) — 그림자 지는 면도 너무 어둡지 않게 채움.
+        dl2 = DirectionalLight('dir2')
+        dl2.setColor(Vec4(0.26, 0.26, 0.30, 1))
+        dl2np = self.render.attachNewNode(dl2)
+        dl2np.setHpr(-130, -35, 0)
+        self.render.setLight(dl2np)
+
+        # 플래시라이트 제거 — 밝은 맵이라 불필요. (참조 안전용 None)
+        self.flashlight = None
 
     def _make_ground(self):
         # level.py 의 5방 라인업 (y=-2 ~ y=70) 을 여유 있게 덮음.
@@ -1618,7 +1696,11 @@ class ZombieGame(ShowBase):
         if best_z is None:
             return
         dmg = Zombie.DAMAGE[best_zone]
+        was_alive = best_z.hp > 0
         best_z.take_damage(dmg)
+        if was_alive and best_z.hp <= 0:
+            self._on_zombie_killed(best_zone == 'head')
+        self._spawn_hit_particle(best_hit_pos)
         self._spawn_damage_number(best_hit_pos, dmg)
         # 히트마커 펄스 — 0.18s 표시. 명중 표시는 항상 빨강.
         self.hitmarker.show()
@@ -1691,6 +1773,65 @@ class ZombieGame(ShowBase):
         if pool:
             print('[sfx] loaded %s x%d (겹침 풀)' % (filename, len(pool)), flush=True)
         return pool
+
+    def _play_footstep(self):
+        """발소리 한 발 — f1/f2/f3 중 직전과 다른 것을 랜덤으로 골라 재생."""
+        if self.paused or not self.sfx_foot:
+            return
+        n = len(self.sfx_foot)
+        if n == 1:
+            i = 0
+        else:
+            i = random.randrange(n)
+            while i == self._last_foot_i:   # 직전과 같으면 다시 뽑아 중복 방지
+                i = random.randrange(n)
+        self._last_foot_i = i
+        self.sfx_foot[i].play()
+
+    def _on_zombie_killed(self, headshot):
+        """좀비 처치 시 호출 — 킬 카운트 + 콤보 단계 갱신 + 킬 사운드."""
+        self.kills += 1
+        # 직전 킬 5초 이내 + 이번이 헤드샷이면 단계 상승(최대 5), 아니면 1로 리셋.
+        if headshot and self._combo_window > 0.0:
+            self._kill_tier = min(self._kill_tier + 1, 5)
+        else:
+            self._kill_tier = 1
+        self._combo_window = self.kill_combo_dur
+        self._play_kill_sound(self._kill_tier)
+
+    def _play_kill_sound(self, tier):
+        """현재 콤보 단계의 킬 사운드 재생. 이전 킬 사운드는 멈춰 겹침 방지."""
+        snd = self.sfx_kill.get(tier)
+        if snd is None:
+            return
+        if self._last_kill_snd is not None:
+            self._last_kill_snd.stop()
+        snd.play()
+        self._last_kill_snd = snd
+
+    def _spawn_hit_particle(self, world_pos):
+        """맞은 부위(world_pos)에 fire 스프라이트 1개(랜덤)를 잠깐 띄운다."""
+        if not self._fire_tex or world_pos is None:
+            return
+        cm = CardMaker('hit_fire')
+        cm.setFrame(-0.5, 0.5, -0.5, 0.5)
+        np = self.render.attachNewNode(cm.generate())
+        np.setTexture(random.choice(self._fire_tex))
+        np.setPos(world_pos)
+        np.setBillboardPointEye()          # 항상 카메라 정면
+        np.setLightOff()
+        np.setTransparency(True)
+        np.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd))  # additive 글로우
+        np.setBin('fixed', 90)
+        np.setDepthTest(True)
+        np.setDepthWrite(False)
+        base = 0.40                        # ~40cm
+        np.setScale(base)
+        # Kenney fire 텍스처는 흰 연기형 → 따뜻한 색으로 틴트해 불꽃처럼. 약간 랜덤.
+        col = random.choice([(1.0, 0.50, 0.12), (1.0, 0.70, 0.20), (1.0, 0.36, 0.07)])
+        np.setColorScale(col[0], col[1], col[2], 1)
+        self._hit_particles.append({'np': np, 't': 0.28, 'dur': 0.28,
+                                    'base': base, 'col': col})
 
     def _play_shoot_oneshot(self):
         if self.paused:
@@ -2182,12 +2323,15 @@ class ZombieGame(ShowBase):
         self.hud_integ_ext['frameSize']   = (bx1, ext_right, -zhi, zhi)
         self.hud_integ_num.setText(f'{int(round(self.core_integrity))}%')
 
-        # 확산률 = 변환(=감염)된 좀비 / 전체 — "구역 확보율" 로 위장
-        total = max(1, len(self.zombies))
-        infected = sum(1 for z in self.zombies if z.transformed)
-        spread = infected / total
-        self.hud_kills_num.setText(f'{self.purified:02d}')
-        self.hud_zone.setText(f'구역 확보 {int(round(spread * 100))}%')
+        # 웨이브 모드 HUD — 총 처치 수 + 현재 웨이브/남은 적
+        alive = sum(1 for z in self.zombies if z.hp > 0)
+        self.hud_kills_num.setText(f'{self.kills:02d}')
+        if self.wave_active:
+            self.hud_zone.setText(f'WAVE {self.wave}  남은 적 {alive}')
+        elif self.wave >= 1:
+            self.hud_zone.setText(f'WAVE {self.wave + 1} 준비…')
+        else:
+            self.hud_zone.setText('WAVE 시작 대기…')
 
         # 히트마커 타이머 — pulse 종료 시 hide.
         if self._hitmarker_t > 0:
@@ -2204,6 +2348,8 @@ class ZombieGame(ShowBase):
             if self._glitch_t <= 0:
                 self._set_glitch(False)
         else:
+            # 웨이브가 올라갈수록 글리치가 잦아지게 (확산률 대용).
+            spread = min(1.0, max(0, self.wave - 1) / 12.0)
             self._glitch_cooldown -= dt
             if self._glitch_cooldown <= 0:
                 self._trigger_glitch(0.12 + 0.10 * spread)
@@ -2419,6 +2565,21 @@ class ZombieGame(ShowBase):
                 self.player_vz = 0
                 self.on_ground = True
 
+            # 발소리 — 지상에서 서서 WASD 이동 중일 때 보폭 간격마다 한 발.
+            # (점프 중·무릎 자세·에디터 free-cam 에선 안 남)
+            stepping = (self.on_ground and self.kneel_state == 'stand'
+                        and any(self.keys[k] for k in ('w', 'a', 's', 'd')))
+            if stepping:
+                self._footstep_t -= dt
+                if self._footstep_t <= 0.0:
+                    self._play_footstep()
+                    # ADS 면 이동이 느려지므로(spd_mult<1) 보폭 간격도 그만큼 늘려
+                    # 발소리 템포를 실제 속도에 맞춘다.
+                    spd_mult = 1.0 + (self.ads_move_factor - 1.0) * self.aim_t
+                    self._footstep_t = self.footstep_interval / max(0.3, spd_mult)
+            else:
+                self._footstep_t = 0.0   # 멈추면 다음 이동 첫 발은 즉시 재생
+
         # 현재 상태에 맞는 locomotion anim 선택
         self._update_locomotion()
 
@@ -2530,11 +2691,28 @@ class ZombieGame(ShowBase):
         for z in self.zombies:
             z.update(dt, self.player_pos)
 
-        # 방화벽 / 게이트 tick (피격 플래시 복구, 색 번짐, 게이트 잠금 해제)
+        # 방화벽 / 게이트 tick (웨이브 모드에선 비어 있음 — 안전상 유지)
         for fw in self.firewalls:
             fw.update(dt)
         for g in self.gates:
             g.update(dt)
+
+        # ── 웨이브 매니저 ─────────────────────────────────────────────────
+        if self._spawn_points:
+            if self.wave_active:
+                if not any(z.hp > 0 for z in self.zombies):
+                    self.wave_active = False
+                    self._intermission_t = self.intermission_dur
+                    self._show_gate_msg(f'WAVE {self.wave} 클리어', dur=2.0)
+            else:
+                self._intermission_t -= dt
+                if self._intermission_t <= 0:
+                    self.wave += 1
+                    self._spawn_wave(self.wave)
+
+        # 킬 콤보 윈도우 카운트다운 — 0 이 되면 다음 킬은 1단계부터.
+        if self._combo_window > 0.0:
+            self._combo_window = max(0.0, self._combo_window - dt)
 
         # Interact proximity — 가장 가까운 DEAD + 아직 transform 안 한 좀비 찾기
         self._interact_target = None
@@ -2550,6 +2728,18 @@ class ZombieGame(ShowBase):
             self.interact_frame.show()
         else:
             self.interact_frame.hide()
+
+        # 피격 fire 파티클 — 살짝 커지며 fade out 후 제거
+        for p in self._hit_particles[:]:
+            p['t'] -= dt
+            if p['t'] <= 0:
+                p['np'].removeNode()
+                self._hit_particles.remove(p)
+            else:
+                f = p['t'] / p['dur']                      # 1 → 0
+                p['np'].setScale(p['base'] * (1.5 - 0.5 * f))   # 점점 커짐
+                c = p['col']
+                p['np'].setColorScale(c[0] * f, c[1] * f, c[2] * f, 1)  # 틴트+페이드
 
         # Damage number popup — 위로 떠오르며 fade out
         for d in self._damage_numbers[:]:

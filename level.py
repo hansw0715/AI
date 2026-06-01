@@ -222,8 +222,11 @@ class LevelCollider:
         return x, y
 
 
-def build_level(render):
+def build_level(render, draw_wall_cards=True):
     """레벨 생성. (collider, level_data) 반환.
+
+    draw_wall_cards: True 면 level.py 가 단색 벽 카드를 그린다. kit_map.py 로 키트
+      메쉬 벽을 입힐 때는 False 로 줘서 z-fighting 을 막는다 (stain/ground 는 유지).
 
     level_data = {
       'cage_stain': NodePath,             # 케이지 바닥 stain (F 탈출 시 fade in)
@@ -260,26 +263,27 @@ def build_level(render):
     walls += [Wall(-1.0, -1.0, 1.0, -1.0), Wall(-1.0, -1.0, -1.0, 1.0),
               Wall(1.0, -1.0, 1.0, 1.0)]
 
-    # ── 측면 방 4개 (벽만) ─────────────────────────────────────────────────
-    walls += _side_room(-15, CX0, 8, 20, open_side='E')   # 좌1
-    walls += _side_room(CX1, 15, 8, 20, open_side='W')    # 우1
-    walls += _side_room(-15, CX0, 27, 39, open_side='E')  # 좌2
-    walls += _side_room(CX1, 15, 27, 39, open_side='W')   # 우2
+    # ── 측면 방 4개 (벽만) — 더 넓게: 바깥벽 ±19, 1쌍 y[7,22] / 2쌍 y[26,41] ──
+    walls += _side_room(-19, CX0, 7, 22, open_side='E')   # 좌1
+    walls += _side_room(CX1, 19, 7, 22, open_side='W')    # 우1
+    walls += _side_room(-19, CX0, 26, 41, open_side='E')  # 좌2
+    walls += _side_room(CX1, 19, 26, 41, open_side='W')   # 우2
 
     # ── 마지막 방 ──────────────────────────────────────────────────────────
     walls += room_walls(-8, 8, FINAL_Y, 62, doors=[('S', 0, D)])
     walls += pillar(-3, 54)
     walls += pillar(3, 54)
 
-    for w in walls:
-        w.make_card(root)
+    if draw_wall_cards:
+        for w in walls:
+            w.make_card(root)
 
     # ── 색 번짐 stain (바닥) ───────────────────────────────────────────────
     L = LESION_COLOR
-    st_w1 = _floor_stain(root, -15, CX0, 8, 20, L)
-    st_e1 = _floor_stain(root, CX1, 15, 8, 20, L)
-    st_w2 = _floor_stain(root, -15, CX0, 27, 39, L)
-    st_e2 = _floor_stain(root, CX1, 15, 27, 39, L)
+    st_w1 = _floor_stain(root, -19, CX0, 7, 22, L)
+    st_e1 = _floor_stain(root, CX1, 19, 7, 22, L)
+    st_w2 = _floor_stain(root, -19, CX0, 26, 41, L)
+    st_e2 = _floor_stain(root, CX1, 19, 26, 41, L)
     st_zone0 = _floor_stain(root, CX0, CX1, 1, GATE1_Y, L)        # 구역0 복도 (케이지 제외)
     st_zone1 = _floor_stain(root, CX0, CX1, GATE1_Y, FINAL_Y, L)  # 구역1 복도
     st_final = _floor_stain(root, -8, 8, FINAL_Y, 62, L)         # 마지막 방
@@ -289,13 +293,13 @@ def build_level(render):
         'cage_stain': st_cage,
         'rooms': [
             {'name': 'W1', 'zone': 0, 'firewall': ('v', CX0, DOOR_Y1 - h, DOOR_Y1 + h),
-             'spawns': [(-12, 11), (-6, 14), (-11, 18)], 'stain': st_w1},
+             'spawns': [(-16, 10), (-7, 14), (-15, 20)], 'stain': st_w1},
             {'name': 'E1', 'zone': 0, 'firewall': ('v', CX1, DOOR_Y1 - h, DOOR_Y1 + h),
-             'spawns': [(12, 11), (6, 14), (11, 18)], 'stain': st_e1},
+             'spawns': [(16, 10), (7, 14), (15, 20)], 'stain': st_e1},
             {'name': 'W2', 'zone': 1, 'firewall': ('v', CX0, DOOR_Y2 - h, DOOR_Y2 + h),
-             'spawns': [(-12, 30), (-6, 33), (-11, 37)], 'stain': st_w2},
+             'spawns': [(-16, 29), (-7, 33), (-15, 39)], 'stain': st_w2},
             {'name': 'E2', 'zone': 1, 'firewall': ('v', CX1, DOOR_Y2 - h, DOOR_Y2 + h),
-             'spawns': [(12, 30), (6, 33), (11, 37)], 'stain': st_e2},
+             'spawns': [(16, 29), (7, 33), (15, 39)], 'stain': st_e2},
         ],
         'gates': [
             {'name': 'GATE1', 'zone': 0, 'barrier': ('h', GATE1_Y, CX0, CX1),

@@ -13,3 +13,12 @@ dist/
 *.bak
 *.blend1
 *.blend@
+
+# 대용량 소스/빌드 중간물 · 스크래치 (런타임 불필요)
+*.zip
+_kit_src/
+_verify_*.py
+# Kenney 파티클 팩 — 게임이 쓰는 fire_01/02.png 만 커밋(이미 추적됨), 나머지는 제외
+kenney_particle-pack/
+# 사용 안 하는 원본 오디오 (f1/f2/f3.mp3 로 대체됨)
+footstep.aiff
