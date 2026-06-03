@@ -12,10 +12,14 @@ from direct.gui.OnscreenImage import OnscreenImage
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
 from direct.task import Task
+from direct.interval.IntervalGlobal import (
+    Func, LerpColorScaleInterval, LerpScaleInterval, Parallel, Sequence, Wait,
+)
 from panda3d.core import (
     AmbientLight, CardMaker, ClockObject, ColorBlendAttrib, DirectionalLight, Filename,
-    LineSegs, NodePath, PerspectiveLens, Quat, Spotlight, TextNode, Vec3, Vec4,
-    WindowProperties, loadPrcFileData,
+    Geom, GeomNode, GeomTriangles, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
+    LineSegs, NodePath, PerspectiveLens, Quat, Spotlight, TextNode, Triangulator,
+    Vec3, Vec4, WindowProperties, loadPrcFileData,
 )
 
 from level import (PLAYER_RADIUS, ZOMBIE_RADIUS, WALL_HEIGHT, Wall,
@@ -61,6 +65,14 @@ HUD_ENEMY      = (1.00, 0.39, 0.48, 1.0)   # 적 타겟 정보 (표면에서도 
 # 셰이더에서 곱셈 후 프레임버퍼 쓰기 단계에서 [0,1] 클램프되는 걸 활용.
 HUD_TINT_CYAN  = (1.00, 1.00, 1.00, 1.0)
 HUD_TINT_RED   = (4.00, 0.20, 0.30, 1.0)
+# 반투명 하얀색 — 콤보 게이지 + 탄약 카운터용.
+HUD_WHITE_TRANS     = (1.00, 1.00, 1.00, 0.55)   # 텍스트/프레임 (반투명 흰)
+HUD_WHITE_TRANS_DIM = (1.00, 1.00, 1.00, 0.28)   # 보조/배경 (더 옅게)
+# 시안 PNG(≈0.25,0.88,1.0)를 곱셈으로 흰색화 + 알파 0.55 → 반투명 흰.
+HUD_TINT_WHITE_TRANS = (4.00, 1.14, 1.00, 0.55)
+# 발로란트 스타일 킬배너 — 전부 흰색(#f2f6f7) + 어두운 원반(#02090c).
+KB_WHITE = (0.949, 0.965, 0.969, 1.0)
+KB_DISC  = (0.008, 0.035, 0.047, 1.0)
 
 # HUD 전체 크기 배율. 한 값으로 모든 HUD 요소를 키우거나 줄인다.
 # 코너(배너/무결성/카트리지/미니맵/카운터)는 스케일 컨테이너로, 중앙(조준점/적
@@ -107,8 +119,43 @@ WEAPON_LOCAL_SCALE = 0.1195
 WEAPON_LOCAL_POS   = (0.000, 0.090, 0.040)
 WEAPON_LOCAL_HPR   = (22.5, -78.2, 108.9)
 
+# 권총 muzzle flash / tracer 시작점 (weapon_anchor local, m). +Y 가 총신 전방.
+WEAPON_MUZZLE_POS  = (0.08, 0.32, 0.08)
+
+# ── 소총 (AR-10) — 마우스 휠 다운으로 전환 ──────────────────────────────
+# .glb 직접 로드. scale/pos/hpr 는 임시값 — 권총처럼 F2 free-cam 으로 보면서
+# 아래 3 개 상수를 조정. 소총은 더 길어서 muzzle 도 더 앞(+Y).
+RIFLE_PATH = Filename.from_os_specific(
+    str(SCRIPT_DIR / 'assets' / 'weapons' / 'low-poly_armalite_ar-10.glb')
+)
+RIFLE_LOCAL_SCALE = 0.0900
+RIFLE_LOCAL_POS    = (0.010, 0.120, 0.030)
+RIFLE_LOCAL_HPR    = (22.5, -78.2, 108.9)
+RIFLE_MUZZLE_POS   = (0.08, 0.62, 0.08)
+# 소총 native 방향 보정 — 모델이 권총과 앞뒤가 반대라 총구가 플레이어를 향함.
+# 배치 HPR 과 분리해서, 모델 자체를 제 up(Z)축 기준 180° 돌려 앞뒤만 뒤집는다.
+# (배치 HPR 은 그대로 튜닝, 이 값은 방향 보정 전용.)
+RIFLE_LOCAL_PREROT = (180, 0, 0)
+
+# 무기별 스탯 — _equip_weapon 이 적용. ammo_max=탄창, cooldown=발사간격(s),
+# auto=연발(mouse1 hold 연사), head_onekill=헤드샷 즉사.
+WEAPON_STATS = {
+    'pistol': {'ammo_max': 8,  'cooldown': 0.18, 'auto': False, 'head_onekill': False},
+    'rifle':  {'ammo_max': 25, 'cooldown': 0.09, 'auto': True,  'head_onekill': True},
+}
+
+# 무기 스왑 모션 — 팔/총을 아래로 내려 시야 밖으로 → 교체 → 다시 올림.
+WEAPON_SWAP_DROP     = 0.6    # 내려가는 깊이 (m, ybot Z offset)
+WEAPON_SWAP_DOWN_DUR = 0.13   # 내리는 시간 (s)
+WEAPON_SWAP_UP_DUR   = 0.18   # 올리는 시간 (s)
+
 ZOMBIE_BAM = Filename.from_os_specific(
     str(SCRIPT_DIR / 'assets' / 'zombie' / 'scene.bam')
+)
+# 외부 Mixamo death 애니메이션 (Death From Front Headshot) — 좀비와 동일한
+# mixamorig 스켈레톤이라 actor.loadAnims 로 바인딩 가능.
+ZOMBIE_DEATH_BAM = Filename.from_os_specific(
+    str(SCRIPT_DIR / 'assets' / 'zombie' / 'death_headshot.bam')
 )
 
 UI_DIR = SCRIPT_DIR / 'assets' / 'ui'    # 정화 HUD PNG 자산 (시안 단색·4×·투명)
@@ -210,6 +257,11 @@ class Zombie:
         # Mixamo container action 제외
         self.anim_names = [a for a in self.actor.getAnimNames()
                            if 'mixamo.com' not in a]
+        # 외부 death 애니메이션 (Death From Front Headshot) 바인딩 — 동일 mixamorig 본.
+        if ZOMBIE_DEATH_BAM.exists():
+            self.actor.loadAnims({self.DEATH_ANIM: ZOMBIE_DEATH_BAM})
+            if self.DEATH_ANIM not in self.anim_names:
+                self.anim_names.append(self.DEATH_ANIM)
 
         # 본 기반 히트박스 — Head/Hips/팔/다리 본을 exposeJoint 해서 캡슐 구성.
         self._build_hitboxes()
@@ -243,6 +295,8 @@ class Zombie:
         self._wander_target = (self.pos.x, self.pos.y)
         self._wander_t = 0.0
         self._death_settle_t = 0.0     # 죽을 때 접지 보정 페이드 남은 시간 (sec)
+        self._corpse_t = 0.0           # DEAD 진입 후 누워있기+페이드 남은 시간 (sec)
+        self.remove_me = False         # 페이드 끝나 정리 대상이 됨
 
         # Anim blend (crossfade) — 전환 시 180ms 동안 prev → new 가중치 보간
         # → 공격 끝나고 Run 으로 바로 안 튀고 부드럽게 흘러감.
@@ -297,7 +351,11 @@ class Zombie:
     # 모션의 native 바닥 안착으로 부드럽게 넘김 → 추가 낙하 없음.
     GROUND_ZOMBIES = True       # 발 접지 보정 on/off
     GROUND_FOOT_Z = 0.09        # 바닥 접지 시 발 본 로컬 Z (player 발 ~0.10 기준)
-    DEATH_SETTLE_DUR = 0.45     # 죽을 때 접지 보정을 0 으로 페이드하는 시간 (sec)
+    DEATH_SETTLE_DUR = 0.30     # 죽을 때 접지 보정을 0 으로 페이드하는 시간 (sec)
+    DEATH_ANIM = 'DeathHeadshot'   # 사용할 죽음 애니메이션 (Death From Front Headshot)
+    DEATH_PLAY_RATE = 1.5       # 죽음 모션 재생 속도 (>1 = 더 빨리 쓰러짐)
+    CORPSE_LINGER = 0.8         # 죽은 뒤 바닥에 누워있는 시간 (sec)
+    CORPSE_FADE_DUR = 0.7       # 그 뒤 페이드아웃되어 사라지는 시간 (sec)
     DEBUG_DEATH = False         # 죽음 진단 로그
     _hips_debug_printed = False
     _death_dbg_done = False
@@ -494,13 +552,17 @@ class Zombie:
         ratio = max(0.001, self.hp / self.hp_max)
         self.hp_fill.setSx(ratio)
         if self.hp <= 0:
-            # Death anim 단발 + crossfade. 끝나면 마지막 프레임 (바닥) 에서 정지.
+            # Death anim 단발 + crossfade (직전 모션에서 부드럽게 이어짐).
+            # 빠른 재생속도로 더 빨리 쓰러지고, 끝나면 누워있다 페이드아웃.
             self.state = self.DYING
             self.hp_bg.hide()
             self.hp_fill.hide()
-            if 'Death' in self.anim_names:
-                self._play('Death', loop=False)
-                self.death_t = self.actor.getDuration('Death')
+            anim = self.DEATH_ANIM if self.DEATH_ANIM in self.anim_names else (
+                'Death' if 'Death' in self.anim_names else None)
+            if anim is not None:
+                self._play(anim, loop=False)
+                self.actor.setPlayRate(self.DEATH_PLAY_RATE, anim)
+                self.death_t = self.actor.getDuration(anim) / self.DEATH_PLAY_RATE
                 # 죽을 때 발 접지 보정을 settle 동안 유지하다 0 으로 페이드 (추가 낙하 방지).
                 self._death_settle_t = self.DEATH_SETTLE_DUR
             else:
@@ -562,7 +624,8 @@ class Zombie:
         # 진행 중) / Transform 페이드 중 좀비는 LOD 보류해서 끊김 없이 마무리.
         dx = player_pos.x - self.pos.x
         dy = player_pos.y - self.pos.y
-        busy = (self.state == self.DYING or self.transform_t > 0)
+        busy = (self.state == self.DYING or self.transform_t > 0
+                or (self.state == self.DEAD and self._corpse_t > 0.0))
         too_far = (dx * dx + dy * dy) > self.LOD_DIST_SQ and not busy
         if too_far and self._lod_active:
             self.actor.hide()
@@ -600,7 +663,16 @@ class Zombie:
                     self.ybot_replacement.setColorScale(1, 1, 1, 1.0 - t)
 
         if self.state == self.DEAD:
-            return   # 완전히 죽어서 마지막 프레임 정지 — 아무것도 안 함
+            # 잠깐 누워있다(CORPSE_LINGER) 페이드아웃(CORPSE_FADE_DUR) 후 제거 표시.
+            if self._corpse_t > 0.0:
+                self._corpse_t -= dt
+                if self._corpse_t < self.CORPSE_FADE_DUR:
+                    a = max(0.0, self._corpse_t / self.CORPSE_FADE_DUR)
+                    self.actor.setColorScale(1, 1, 1, a)
+                if self._corpse_t <= 0.0:
+                    self.actor.hide()
+                    self.remove_me = True
+            return
 
         if self.state == self.DYING:
             # Death anim 재생 중 — 끝까지 기다린 후 DEAD 로
@@ -618,6 +690,9 @@ class Zombie:
             if self.death_t <= 0:
                 self.state = self.DEAD
                 self.actor.setZ(self.pos.z)   # native 바닥 위치로 확정
+                # 시체 누워있기 + 페이드아웃 타이머 시작.
+                self._corpse_t = self.CORPSE_LINGER + self.CORPSE_FADE_DUR
+                self.actor.setTransparency(True)
             # 위치(X/Y)는 그대로 (이동 안 함)
             return
 
@@ -962,6 +1037,12 @@ class ZombieGame(ShowBase):
 
         # ADS (aim down sights) 상태
         self.aiming = False           # 우클릭 hold 동안 True
+        self._mouse1_down = False      # 좌클릭 hold 상태 (연발 무기 연사용)
+        # 무기 스왑 모션 상태 — 'idle'/'down'/'up', 팔 내림 offset(z) 애니메이션.
+        self._swap_state = 'idle'
+        self._swap_t = 0.0
+        self._swap_z = 0.0
+        self._swap_pending_idx = 0
         self.aim_t = 0.0              # 0=hip / 1=ADS 보간 (지수 ramp)
         self.aim_speed = 9.0          # 1/sec — 클수록 빠른 전환 (~110ms)
         # ADS 시 ybot 전체를 player-frame 으로 이 만큼 이동, 카메라는 같은 양 보정.
@@ -981,7 +1062,7 @@ class ZombieGame(ShowBase):
         self.on_ground = True
         self.head_height = 1.65
         self.move_speed = 4.0   # 좀비 추격 속도와 동일 (Zombie.move_speed)
-        self.mouse_sens = 0.10    # 기본값 — ESC pause 메뉴 슬라이더로 0.02~0.30 조정
+        self.mouse_sens = 0.03    # 기본값 — ESC pause 메뉴 슬라이더로 0.02~0.30 조정
         self.jump_speed = 4.5
         self.gravity = 12.0
 
@@ -1125,46 +1206,37 @@ class ZombieGame(ShowBase):
         self.right_hand_joint = (
             self.ybot.exposeJoint(None, 'hands', rhand_name) if rhand_name else None
         )
-        if self.right_hand_joint is not None and WEAPON_PATH.exists():
-            self.weapon = self.loader.loadModel(WEAPON_PATH)
-            # glTF RootNode self-transform 우회용 평탄화 (slide/trigger 보존).
-            self.weapon.flattenLight()
-            # weapon anchor — hand 본의 위치만 매 프레임 복사하고 회전은 무시한다.
-            # 이렇게 하면 weapon 의 H/P/R 축이 world 축과 정렬되어 직관적으로 회전
-            # 가능 (hand 본의 자체 회전이 weapon 의 회전축을 비틀어서 H 와 R 이
-            # 같은 효과를 내는 문제 해결). 단점: 손 자세 변해도 weapon 자세는
-            # 고정 — base orientation 잡는 단계엔 오히려 편함. 자세 다 잡힌 후
-            # hand 본 회전도 같이 따라가게 하려면 anchor 의 setHpr 도 매 프레임
-            # hand 회전으로 갱신하면 됨.
+        # 무기 레지스트리 — 권총/소총 모두 weapon_anchor 에 붙여두고 활성 1개만 show.
+        # anchor 갱신은 _update 안에서 ybot.update(force=True) 직후에 호출 —
+        # 별도 task 로 두면 frame order 가 어긋나서 1프레임 lag (잔상) 발생.
+        self.slide_recoil = 0.0
+        self.slide_recoil_kick = 0.4   # 모델 local units (음수 X 로 후퇴)
+        self.slide_recoil_decay = 14.0 # 1/sec — 클수록 빠른 복귀
+
+        self.weapon = None
+        self.slide_node = None
+        self.slide_rest_x = 0.0
+        self._weapons = {}        # name -> dict(node, slide_node, slide_rest_x, muzzle)
+        self._weapon_order = []   # 휠 순환 순서 (로드 성공한 것만)
+        self._weapon_idx = 0
+
+        if self.right_hand_joint is not None and not self.right_hand_joint.isEmpty():
             self.weapon_anchor = self.render.attachNewNode('weapon_anchor')
-            self.weapon.reparentTo(self.weapon_anchor)
-            self.weapon.setScale(WEAPON_LOCAL_SCALE)
-            self.weapon.setPos(*WEAPON_LOCAL_POS)
-            self.weapon.setHpr(*WEAPON_LOCAL_HPR)
-            self.weapon.setTwoSided(True)
-            # anchor 갱신은 _update 안에서 ybot.update(force=True) 직후에 호출 —
-            # 별도 task 로 두면 frame order 가 어긋나서 1프레임 lag (잔상) 발생.
-            print(f'[zombie_game] weapon attached to {rhand_name}', flush=True)
-
-            # Slide 노드 (사격 시 후퇴 효과용). flattenLight 가 named node 는
-            # 보존하므로 find 로 찾을 수 있음. 모델의 총신 축이 X 라서 -X 방향 후퇴.
-            self.slide_node = self.weapon.find('**/Slide')
-            if self.slide_node.isEmpty():
-                self.slide_node = None
-                print('[weapon] Slide node not found', flush=True)
+            # 순서 = 휠 순환 순서: [0]=권총, [1]=소총.
+            self._register_weapon('pistol', WEAPON_PATH,
+                                  WEAPON_LOCAL_SCALE, WEAPON_LOCAL_POS,
+                                  WEAPON_LOCAL_HPR, WEAPON_MUZZLE_POS)
+            self._register_weapon('rifle', RIFLE_PATH,
+                                  RIFLE_LOCAL_SCALE, RIFLE_LOCAL_POS,
+                                  RIFLE_LOCAL_HPR, RIFLE_MUZZLE_POS,
+                                  prerot=RIFLE_LOCAL_PREROT)
+            if self._weapon_order:
+                self._weapon_idx = 0
+                self._equip_weapon(self._weapon_order[0])
             else:
-                self.slide_rest_x = self.slide_node.getX()
-                print(f'[weapon] Slide found, rest X = {self.slide_rest_x:.3f}',
-                      flush=True)
-            # 슬라이드 후퇴 상태
-            self.slide_recoil = 0.0
-            self.slide_recoil_kick = 0.4   # 모델 local units (음수 X 로 후퇴)
-            self.slide_recoil_decay = 14.0 # 1/sec — 클수록 빠른 복귀
-
+                print('[zombie_game] WARN no weapon loaded', flush=True)
         else:
-            self.weapon = None
-            print(f'[zombie_game] WARN weapon not loaded '
-                  f'(rhand={rhand_name}, glb_exists={WEAPON_PATH.exists()})',
+            print(f'[zombie_game] WARN weapon not loaded (rhand={rhand_name})',
                   flush=True)
 
         # 슬라이드 위치 marker (RightHand 본 좌표계 — armature cm 단위) — 임시 하네스
@@ -1237,6 +1309,9 @@ class ZombieGame(ShowBase):
         # 효과음 — 발사(동시 겹침 풀) / 재장전
         self.sfx_shot_pool = self._load_sfx_pool('shot.wav', 4)
         self._sfx_shot_i = 0
+        # 소총(M16) 발사음 — 연발 빠른 연사라 겹침 풀 넉넉히(8개) 로 끊김 방지.
+        self.sfx_m16_pool = self._load_sfx_pool('m16sound.mp3', 8)
+        self._sfx_m16_i = 0
         self.sfx_reload = self._load_sfx('Reload.wav')
 
         # 발소리 — f1/f2/f3 중 랜덤 재생하되 직전과 같은 건 안 나오게(중복 방지).
@@ -1262,6 +1337,26 @@ class ZombieGame(ShowBase):
         self._combo_window = 0.0        # 콤보 유지 남은 시간(초)
         self.kill_combo_dur = 5.0       # 연속킬 인정 시간
         self.kills = 0                  # 총 처치 수 (HUD)
+
+        # ── 포인트(연산 자원) ───────────────────────────────────────────────
+        # 적 처치 시 "마지막에 맞힌 부위" 기준으로 적립. 숫자만 바꾸면 밸런싱 끝.
+        #   other(팔·다리 = 데미지 5 받는 곳) = 기준점
+        #   body(몸통샷 처치)  = 기준점 + 2
+        #   head(헤드샷 처치)  = 기준점 + 5
+        self.points = 0
+        self.KILL_POINTS_BASE = 10              # other(사지) 처치 기준 점수 ← 취향대로
+        self.KILL_POINTS = {
+            'other': self.KILL_POINTS_BASE,
+            'body':  self.KILL_POINTS_BASE + 2,
+            'head':  self.KILL_POINTS_BASE + 5,
+        }
+
+        # 피격 사운드 — 부위(head/body/other) 상관없이 Voicy_Headshot 으로 통일.
+        # 연사로 빠르게 겹칠 수 있어 풀로 로드해 라운드로빈 재생.
+        self.sfx_hit = self._load_sfx_pool('Voicy_Headshot .mp3', 4)
+        self._hit_i = 0
+        for _s in self.sfx_hit:
+            _s.setVolume(0.4)
 
         # 피격 파티클 — Kenney particle pack 의 fire 스프라이트. 맞은 부위에 랜덤 1개.
         _fire_dir = SCRIPT_DIR / 'kenney_particle-pack' / 'PNG (Transparent)'
@@ -1335,6 +1430,10 @@ class ZombieGame(ShowBase):
         self._build_pause_menu()
         # 화면 중앙 십자 조준점
         self._build_crosshair()
+        # 화면 하단 연속킬 콤보 게이지 (남은 시간 → 왼쪽으로 슬라이드 소진)
+        self._build_combo_bar()
+        # 발로란트 스타일 킬배너 (처치 시 하단 중앙에 '쾅' 등장)
+        self._build_kill_banner()
 
         # Valorant 스타일 — 1인칭에서 자기 몸·다리 숨기고 팔·손은 그대로. ybot 메쉬가
         # Alpha_Surface (body 8.7K verts) + Alpha_Surface_Arms (arm 8.6K verts) 로 분리되어
@@ -1415,6 +1514,8 @@ class ZombieGame(ShowBase):
         self.zombies = keep
 
     def _show_gate_msg(self, text, dur=1.6, reveal=False):
+        # 미니멀 HUD — 중앙 웨이브/게이트 메시지 제거 (표시 안 함).
+        return
         # reveal=True → 진실 누출 톤(빨강) + 짧은 글리치 동반. 게이트 돌파처럼
         # 확산이 한 단계 진행되는 순간에 쓴다 ('ASSIMILATING ZONE' 등).
         self.gate_msg.setText(text)
@@ -1482,11 +1583,13 @@ class ZombieGame(ShowBase):
             self.accept(k, self._set_key, [k, True])
             self.accept(f'{k}-up', self._set_key, [k, False])
         self.accept('escape', self._toggle_pause)
-        self.accept('mouse1', self._play_shoot_oneshot)
+        self.accept('mouse1', self._on_fire_down)
+        self.accept('mouse1-up', self._on_fire_up)
         self.accept('mouse3', self._set_aim, [True])
         self.accept('mouse3-up', self._set_aim, [False])
         self.accept('r', self._play_reload_oneshot)
-        self.accept('f', self._on_interact)
+        self.accept('wheel_down', self._cycle_weapon, [1])   # 휠 다운 → 소총
+        self.accept('wheel_up',   self._cycle_weapon, [-1])  # 휠 업 → 권총
         self.accept('f2', self._toggle_editor)
         self.accept('f3', self._toggle_debug)
         # Ctrl 토글 — Panda3D 에선 'control' 단독 이벤트가 안 들어오므로 lcontrol/
@@ -1512,6 +1615,103 @@ class ZombieGame(ShowBase):
         # 우클릭 hold — ADS on/off. 재장전 transition 중에도 그대로 받음
         # (사용자가 R + 우클릭 동시 누르는 흔치 않은 케이스 그냥 허용).
         self.aiming = on
+
+    def _register_weapon(self, name, path, scale, pos, hpr, muzzle, prerot=(0, 0, 0)):
+        """무기 .bam/.glb 로드 → weapon_anchor 에 붙이고 숨겨둠. 성공 시 등록.
+        prerot: 모델 native 방향 보정(모델 자기 frame 기준 회전). 배치 hpr 과 분리하려고
+        wrapper node 를 끼우고 모델에 prerot, wrapper 에 scale/pos/hpr 를 건다."""
+        if not path.exists():
+            print(f'[weapon] {name} file missing: {path}', flush=True)
+            return
+        try:
+            model = self.loader.loadModel(path)
+        except Exception as e:
+            print(f'[weapon] {name} load failed: {e}', flush=True)
+            return
+        model.flattenLight()                # glTF RootNode self-transform 우회 (named node 보존)
+        node = self.weapon_anchor.attachNewNode(f'{name}_weapon')
+        model.reparentTo(node)
+        model.setHpr(*prerot)               # 모델 native 방향 보정 (소총 앞뒤 뒤집힘 등)
+        node.setScale(scale)
+        node.setPos(*pos)
+        node.setHpr(*hpr)
+        node.setTwoSided(True)
+        node.hide()
+        slide = node.find('**/Slide')       # 총신 축 X → -X 후퇴. 없으면 None.
+        if slide.isEmpty():
+            slide_node, slide_rest_x = None, 0.0
+        else:
+            slide_node, slide_rest_x = slide, slide.getX()
+        self._weapons[name] = {
+            'node': node, 'slide_node': slide_node,
+            'slide_rest_x': slide_rest_x, 'muzzle': muzzle,
+        }
+        self._weapon_order.append(name)
+        print(f'[weapon] {name} registered (slide={"Y" if slide_node else "N"})',
+              flush=True)
+
+    def _equip_weapon(self, name):
+        """활성 무기 교체 — show/hide + slide_node + muzzle flash 위치 갱신."""
+        if name not in self._weapons:
+            return
+        for w in self._weapons.values():
+            w['node'].hide()
+        d = self._weapons[name]
+        d['node'].show()
+        self.weapon = d['node']
+        self.slide_node = d['slide_node']
+        self.slide_rest_x = d['slide_rest_x']
+        self.slide_recoil = 0.0
+        mf = getattr(self, 'muzzle_flash', None)   # muzzle flash 는 나중에 생성됨
+        if mf is not None:
+            mf.setPos(*d['muzzle'])
+        # 무기별 스탯 적용 — 탄창 풀충전 + 발사간격 + 연발/헤드원킬 플래그.
+        st = WEAPON_STATS.get(name, {})
+        self.ammo_max = st.get('ammo_max', 8)
+        self.ammo = self.ammo_max
+        self.shoot_cooldown_dur = st.get('cooldown', 0.18)
+        self.shoot_cooldown_t = 0.0
+        self._auto_fire = st.get('auto', False)
+        self._head_onekill = st.get('head_onekill', False)
+        print(f'[weapon] equipped {name} '
+              f'(ammo={self.ammo_max}, auto={self._auto_fire}, '
+              f'head1k={self._head_onekill})', flush=True)
+
+    def _cycle_weapon(self, delta):
+        """마우스 휠 무기 순환 — 즉시 교체하지 않고 스왑 모션 시작.
+        delta +1=다음(휠 다운), -1=이전(휠 업). 모션 중엔 입력 무시."""
+        if self.paused or len(self._weapon_order) < 2:
+            return
+        if self._swap_state != 'idle':
+            return  # 스왑 모션 진행 중 — 무시
+        target = (self._weapon_idx + delta) % len(self._weapon_order)
+        if target == self._weapon_idx:
+            return
+        self._swap_pending_idx = target
+        self._swap_state = 'down'      # 팔 내리기 시작 → 바닥에서 교체 → 올리기
+        self._swap_t = 0.0
+
+    def _update_weapon_swap(self, dt):
+        """스왑 모션 진행 — down(팔 내림) 끝에서 무기 교체 후 up(팔 올림).
+        self._swap_z 를 ybot setPos 에 더해 팔/총을 시야 밖으로 내렸다 올린다."""
+        if self._swap_state == 'idle':
+            return
+        self._swap_t += dt
+        if self._swap_state == 'down':
+            f = min(1.0, self._swap_t / WEAPON_SWAP_DOWN_DUR)
+            self._swap_z = -WEAPON_SWAP_DROP * (f * f)          # easeIn → 빠르게 내림
+            if f >= 1.0:
+                # 시야 밖(바닥)에서 실제 무기 교체 → 스왑처럼 안 보이게.
+                self._weapon_idx = self._swap_pending_idx
+                self._equip_weapon(self._weapon_order[self._weapon_idx])
+                self._swap_state = 'up'
+                self._swap_t = 0.0
+        else:  # 'up'
+            f = min(1.0, self._swap_t / WEAPON_SWAP_UP_DUR)
+            self._swap_z = -WEAPON_SWAP_DROP * (1.0 - f) ** 2   # easeOut → 올라와 안착
+            if f >= 1.0:
+                self._swap_z = 0.0
+                self._swap_state = 'idle'
 
     def _on_interact(self):
         # F 키 — 가까이 있는 dead 좀비 가 있으면 Y Bot 으로 transform 시작.
@@ -1696,16 +1896,18 @@ class ZombieGame(ShowBase):
         if best_z is None:
             return
         dmg = Zombie.DAMAGE[best_zone]
+        # 소총 등 head_onekill 무기는 헤드샷 즉사 — hp_max 만큼 데미지.
+        if best_zone == 'head' and getattr(self, '_head_onekill', False):
+            dmg = max(dmg, best_z.hp_max)
         was_alive = best_z.hp > 0
         best_z.take_damage(dmg)
+        # 피격 사운드 — 부위 상관없이 Voicy_Headshot 통일.
+        self._play_pool(self.sfx_hit, '_hit_i')
         if was_alive and best_z.hp <= 0:
-            self._on_zombie_killed(best_zone == 'head')
+            self._on_zombie_killed(best_zone)
         self._spawn_hit_particle(best_hit_pos)
         self._spawn_damage_number(best_hit_pos, dmg)
-        # 히트마커 펄스 — 0.18s 표시. 명중 표시는 항상 빨강.
-        self.hitmarker.show()
-        self._hitmarker_t = 0.18
-        self.hitmarker.setColorScale(*HUD_TINT_RED)
+        # 미니멀 HUD — 히트마커(명중 X) 제거.
         print(f'[hit] {best_zone} dmg={dmg} → hp={best_z.hp}/{best_z.hp_max}',
               flush=True)
 
@@ -1740,6 +1942,7 @@ class ZombieGame(ShowBase):
     def _resolve_sfx(self, filename):
         """여러 후보 경로에서 효과음 파일 경로를 찾음. 없으면 None + 경고."""
         candidates = [
+            SCRIPT_DIR / 'Sound' / filename,
             SCRIPT_DIR / 'assets' / 'sounds' / filename,
             SCRIPT_DIR / 'assets' / filename,
             SCRIPT_DIR / 'sounds' / filename,
@@ -1774,6 +1977,14 @@ class ZombieGame(ShowBase):
             print('[sfx] loaded %s x%d (겹침 풀)' % (filename, len(pool)), flush=True)
         return pool
 
+    def _play_pool(self, pool, idx_attr):
+        """겹침 풀에서 다음 사운드를 라운드로빈으로 재생 (연사 시 끊김 방지)."""
+        if self.paused or not pool:
+            return
+        i = getattr(self, idx_attr)
+        pool[i].play()
+        setattr(self, idx_attr, (i + 1) % len(pool))
+
     def _play_footstep(self):
         """발소리 한 발 — f1/f2/f3 중 직전과 다른 것을 랜덤으로 골라 재생."""
         if self.paused or not self.sfx_foot:
@@ -1788,9 +1999,13 @@ class ZombieGame(ShowBase):
         self._last_foot_i = i
         self.sfx_foot[i].play()
 
-    def _on_zombie_killed(self, headshot):
-        """좀비 처치 시 호출 — 킬 카운트 + 콤보 단계 갱신 + 킬 사운드."""
+    def _on_zombie_killed(self, zone):
+        """좀비 처치 시 호출 — 킬 카운트 + 부위별 포인트 적립 + 콤보 단계 갱신 + 킬 사운드.
+        zone: 마지막에 맞혀 죽인 부위('head'/'body'/'other'). 포인트·콤보 판정에 사용."""
+        headshot = (zone == 'head')
         self.kills += 1
+        # 부위별 포인트 적립 (혹시 모를 미정의 zone 은 기준점으로 폴백).
+        self.points += self.KILL_POINTS.get(zone, self.KILL_POINTS_BASE)
         # 직전 킬 5초 이내 + 이번이 헤드샷이면 단계 상승(최대 5), 아니면 1로 리셋.
         if headshot and self._combo_window > 0.0:
             self._kill_tier = min(self._kill_tier + 1, 5)
@@ -1798,6 +2013,7 @@ class ZombieGame(ShowBase):
             self._kill_tier = 1
         self._combo_window = self.kill_combo_dur
         self._play_kill_sound(self._kill_tier)
+        self._show_kill_banner()   # 발로란트 스타일 킬배너 (콤보 단계 반영)
 
     def _play_kill_sound(self, tier):
         """현재 콤보 단계의 킬 사운드 재생. 이전 킬 사운드는 멈춰 겹침 방지."""
@@ -1833,9 +2049,19 @@ class ZombieGame(ShowBase):
         self._hit_particles.append({'np': np, 't': 0.28, 'dur': 0.28,
                                     'base': base, 'col': col})
 
+    def _on_fire_down(self):
+        # 좌클릭 누름 — 즉발 1발. 연발 무기는 _update 가 hold 동안 반복 발사.
+        self._mouse1_down = True
+        self._play_shoot_oneshot()
+
+    def _on_fire_up(self):
+        self._mouse1_down = False
+
     def _play_shoot_oneshot(self):
         if self.paused:
             return
+        if self._swap_state != 'idle':
+            return  # 무기 교체(스왑) 모션 중 — 발사 안 함
         if self.ammo <= 0:
             return  # 빈 탄창 — 발사 안 함 (R 로 재장전)
         if self.shoot_cooldown_t > 0:
@@ -1844,9 +2070,13 @@ class ZombieGame(ShowBase):
             return
         self.ammo -= 1
         self.shoot_cooldown_t = self.shoot_cooldown_dur
-        if self.sfx_shot_pool:
-            self.sfx_shot_pool[self._sfx_shot_i].play()
-            self._sfx_shot_i = (self._sfx_shot_i + 1) % len(self.sfx_shot_pool)
+        # 발사음 — 활성 무기에 맞춰 선택. 소총=M16(겹침 풀), 그 외=기본 shot.
+        name = (self._weapon_order[self._weapon_idx]
+                if self._weapon_order else 'pistol')
+        if name == 'rifle' and self.sfx_m16_pool:
+            self._play_pool(self.sfx_m16_pool, '_sfx_m16_i')
+        else:
+            self._play_pool(self.sfx_shot_pool, '_sfx_shot_i')
         # 히트 판정 — 카메라 위치에서 yaw+pitch 방향으로 ray, 각 좀비의 3 zone
         # (head/body/foot) sphere 와 교차 검사. 가장 가까운 zone 에 damage.
         self._resolve_shot_hit()
@@ -2050,6 +2280,423 @@ class ZombieGame(ShowBase):
         self._hitmarker_t = 0.0
         self._ch_alert = False        # 적 조준 중이면 빨강
 
+    # 콤보 게이지 바 — 화면 하단 중앙. 좌측 고정, 남은 시간만큼 우측 가장자리가
+    # 차오르고, 시간이 흐르면 우측 가장자리가 왼쪽으로 줄며 소진된다.
+    COMBO_BAR_HW = 0.34      # 바 절반 너비 (x: -HW ~ +HW)
+    COMBO_BAR_HH = 0.012     # 바 절반 높이
+    COMBO_BAR_Z  = 0.135     # 화면 하단 가장자리 위로 띄운 높이
+
+    def _build_combo_bar(self):
+        hw, hh, z = self.COMBO_BAR_HW, self.COMBO_BAR_HH, self.COMBO_BAR_Z
+        pad = 0.006
+        # 바텀 센터 기준 컨테이너 — 평소 hidden, 콤보 진행 중에만 show.
+        self.combo_bar = self.a2dBottomCenter.attachNewNode('combo_bar')
+        self.combo_bar.setPos(0, 0, z)
+        # 트랙(배경) — 옅은 반투명 흰 + 살짝 큰 테두리.
+        self.combo_bar_track = DirectFrame(
+            frameColor=HUD_WHITE_TRANS_DIM,
+            frameSize=(-hw - pad, hw + pad, -hh - pad, hh + pad),
+            pos=(0, 0, 0), parent=self.combo_bar)
+        # 채움 — 좌측(-hw) 고정, 우측 가장자리를 매 프레임 갱신.
+        self.combo_bar_fill = DirectFrame(
+            frameColor=HUD_WHITE_TRANS,
+            frameSize=(-hw, hw, -hh, hh),
+            pos=(0, 0, 0), parent=self.combo_bar)
+        # 단계 텍스트 (x2 ~ x5) — 바 우측 끝 위에 작게.
+        self.combo_bar_tier = OnscreenText(
+            text='', pos=(hw + pad, hh + 0.012), scale=0.05,
+            fg=HUD_WHITE_TRANS, align=TextNode.ARight, mayChange=True,
+            parent=self.combo_bar)
+        self.combo_bar.hide()
+
+    def _update_combo_bar(self):
+        # 콤보 윈도우가 살아있을 때만 표시. ratio = 남은시간 / 전체.
+        if self._combo_window <= 0.0 or self.kill_combo_dur <= 0.0:
+            if not self.combo_bar.isHidden():
+                self.combo_bar.hide()
+            return
+        ratio = max(0.0, min(1.0, self._combo_window / self.kill_combo_dur))
+        hw, hh = self.COMBO_BAR_HW, self.COMBO_BAR_HH
+        # 좌측 고정, 우측 가장자리만 ratio 따라 이동 → 왼쪽으로 슬라이드 소진.
+        right = -hw + 2.0 * hw * ratio
+        self.combo_bar_fill['frameSize'] = (-hw, right, -hh, hh)
+        # 단계 표시 — 2단계 이상일 때만 (1단계는 콤보 아님).
+        if self._kill_tier >= 2:
+            self.combo_bar_tier.setText(f'x{self._kill_tier}')
+        else:
+            self.combo_bar_tier.setText('')
+        if self.combo_bar.isHidden():
+            self.combo_bar.show()
+
+    # --- 발로란트 스타일 킬배너 ----------------------------------------------
+
+    def _make_filled_circle(self, radius, color, segs=48):
+        """X-Z 평면 채워진 원(삼각형 팬) NodePath. aspect2d 용 — 위젯은 한 번만 생성."""
+        vdata = GeomVertexData('disc', GeomVertexFormat.getV3(), Geom.UHStatic)
+        vw = GeomVertexWriter(vdata, 'vertex')
+        vw.addData3(0, 0, 0)                       # 중심
+        for i in range(segs + 1):
+            a = (i / segs) * 6.283185307179586
+            vw.addData3(radius * cos(a), 0, radius * sin(a))
+        tris = GeomTriangles(Geom.UHStatic)
+        for i in range(1, segs + 1):
+            tris.addVertices(0, i, i + 1)
+        geom = Geom(vdata)
+        geom.addPrimitive(tris)
+        gn = GeomNode('disc')
+        gn.addGeom(geom)
+        np = NodePath(gn)
+        np.setColor(*color)
+        np.setLightOff()
+        np.setTwoSided(True)
+        return np
+
+    def _make_skull(self, S):
+        """HTML 의 해골 SVG(viewBox 0..100, 100px 표시) 를 다각형 지오메트리로 재현.
+        흰 외곽(직선 16각) + 어두운 눈·코 구멍 + 이빨 3줄. translate(0,4.5) 반영.
+        S = 디자인(px)→aspect2d 스케일. 원반 안에 알맞게 들어감."""
+        KB, DISC = KB_WHITE, KB_DISC
+
+        def M(sx, sy):
+            # 해골박스 중심(50,50)→레티클 중심, 아래로 4.5; svg y-down → z-up.
+            return ((sx - 50.0) * S, -(sy - 45.5) * S)
+
+        # 흰 두개골 외곽 (전부 직선 16각) — 턱 부분 오목 → Triangulator.
+        outline = [(50, 7), (32, 11), (20, 23), (16, 39), (22, 54), (31, 60),
+                   (34, 72), (45, 84), (50, 80), (55, 84), (66, 72), (69, 60),
+                   (78, 54), (84, 39), (80, 23), (68, 11)]
+        pts = [M(sx, sy) for (sx, sy) in outline]
+        tri = Triangulator()
+        for (x, z) in pts:
+            tri.addPolygonVertex(tri.addVertex(x, z))
+        tri.triangulate()
+        vdata = GeomVertexData('skull', GeomVertexFormat.getV3(), Geom.UHStatic)
+        vw = GeomVertexWriter(vdata, 'vertex')
+        for (x, z) in pts:
+            vw.addData3(x, 0, z)
+        prim = GeomTriangles(Geom.UHStatic)
+        for k in range(tri.getNumTriangles()):
+            prim.addVertices(tri.getTriangleV0(k), tri.getTriangleV1(k),
+                             tri.getTriangleV2(k))
+        gn = GeomNode('skull_white')
+        gn.addGeom(self._geom_from(vdata, prim))
+        white = NodePath(gn)
+        white.setColor(*KB)
+        white.setTwoSided(True)
+        white.setLightOff()
+
+        # 어두운 눈(2)·코(1) — 볼록 다각형, 팬 삼각분할.
+        feats = [
+            [(22, 40), (45, 47), (42, 55), (27, 53)],   # 왼 눈
+            [(78, 40), (55, 47), (58, 55), (73, 53)],   # 오른 눈
+            [(50, 59), (45, 69), (50, 67), (55, 69)],   # 코
+        ]
+        dvd = GeomVertexData('skullf', GeomVertexFormat.getV3(), Geom.UHStatic)
+        dvw = GeomVertexWriter(dvd, 'vertex')
+        dprim = GeomTriangles(Geom.UHStatic)
+        base = 0
+        for poly in feats:
+            for (sx, sy) in poly:
+                x, z = M(sx, sy)
+                dvw.addData3(x, 0, z)
+            for k in range(1, len(poly) - 1):
+                dprim.addVertices(base, base + k, base + k + 1)
+            base += len(poly)
+        dgn = GeomNode('skull_dark')
+        dgn.addGeom(self._geom_from(dvd, dprim))
+        dark = NodePath(dgn)
+        dark.setColor(*DISC)
+        dark.setTwoSided(True)
+        dark.setLightOff()
+        dark.setBin('fixed', 62)     # 흰 두개골(60) 위에 구멍 표시
+
+        # 이빨 3줄 — 어두운 짧은 선.
+        teeth = LineSegs()
+        teeth.setThickness(1.6)
+        teeth.setColor(*DISC)
+        for (a, b) in [((46, 72), (45, 79)), ((50, 73), (50, 80)),
+                       ((54, 72), (55, 79))]:
+            ax, az = M(*a)
+            bx, bz = M(*b)
+            teeth.moveTo(ax, 0, az)
+            teeth.drawTo(bx, 0, bz)
+        teeth_np = NodePath(teeth.create())
+        teeth_np.setLightOff()
+        teeth_np.setBin('fixed', 62)
+
+        grp = NodePath('skull')
+        white.reparentTo(grp)
+        dark.reparentTo(grp)
+        teeth_np.reparentTo(grp)
+        return grp
+
+    def _arc(self, radius, thick, color, a0, a1):
+        """단일 호 NodePath (a0~a1 deg, 로컬 반지름)."""
+        ls = LineSegs()
+        ls.setThickness(thick)
+        ls.setColor(*color)
+        steps = max(2, int(abs(a1 - a0) / 3.0))
+        for s in range(steps + 1):
+            ang = radians(a0 + (a1 - a0) * s / steps)
+            x, z = radius * cos(ang), radius * sin(ang)
+            if s == 0:
+                ls.moveTo(x, 0, z)
+            else:
+                ls.drawTo(x, 0, z)
+        np = NodePath(ls.create())
+        np.setLightOff()
+        return np
+
+    def _radial_tick(self, r0, r1, thick, color, ang_deg):
+        """ang_deg 방향 r0→r1 방사 틱 NodePath."""
+        ls = LineSegs()
+        ls.setThickness(thick)
+        ls.setColor(*color)
+        a = radians(ang_deg)
+        ls.moveTo(r0 * cos(a), 0, r0 * sin(a))
+        ls.drawTo(r1 * cos(a), 0, r1 * sin(a))
+        np = NodePath(ls.create())
+        np.setLightOff()
+        return np
+
+    def _kb_card(self, name, parent, S):
+        """UI_DIR/name (reticle 와 동일한 220유닛 캔버스) 을 reticle 전체에 꽉 차는
+        투명 카드로 중앙 배치. 파일 없으면 None (→ 호출부가 LineSegs 폴백)."""
+        p = UI_DIR / name
+        if not p.exists():
+            return None
+        tex = self.loader.loadTexture(Filename.from_os_specific(str(p)))
+        img = OnscreenImage(image=tex, pos=(0, 0, 0),
+                            scale=(110 * S, 1, 110 * S), parent=parent)
+        img.setTransparency(True)
+        return img
+
+    @staticmethod
+    def _geom_from(vdata, prim):
+        g = Geom(vdata)
+        g.addPrimitive(prim)
+        return g
+
+    def _dashed_ring(self, radius, thick, color, on_deg, off_deg, start_deg=0.0):
+        """끊긴(점선/호) 원형 링 NodePath — LineSegs 호 세그먼트로 구성.
+        on_deg 켜짐 / off_deg 꺼짐 을 360° 둘레에 반복. on_deg=360 이면 실선."""
+        ls = LineSegs()
+        ls.setThickness(thick)
+        ls.setColor(*color)
+        period = on_deg + off_deg
+        a = start_deg
+        end = start_deg + 360.0
+        while a < end - 1e-6:
+            a1 = min(a + on_deg, end)
+            steps = max(1, int((a1 - a) / 3.0))    # 호를 3° 간격으로 세분
+            for s in range(steps + 1):
+                ang = radians(a + (a1 - a) * s / steps)
+                x, z = radius * cos(ang), radius * sin(ang)
+                if s == 0:
+                    ls.moveTo(x, 0, z)
+                else:
+                    ls.drawTo(x, 0, z)
+            a += period
+        np = NodePath(ls.create())
+        np.setLightOff()
+        return np
+
+    def _build_kill_banner(self):
+        """처치 알림 위젯을 한 번만 생성하고 평소엔 hide. 색은 흰색 고정.
+        HTML(kill_banner_motion.html): 정적 타겟팅 프레임 + 회전 레티클 2겹 + 원반
+        + 해골 + 등장 플래시/쇼크링/파티클 버스트."""
+        S = 0.00125                       # 디자인(px) → aspect2d 스케일
+        self._kb_S = S
+        KB, DISC = KB_WHITE, KB_DISC
+        white = (KB[0], KB[1], KB[2], 1.0)
+
+        self.kb_root = self.aspect2d.attachNewNode('kill_banner')
+        self.kb_root.setPos(0, 0, -0.62)  # 화면 하단 중앙
+        self.kb_root.setTransparency(True)
+        self.kb_root.setLightOff()
+        self.kb_root.setBin('fixed', 60)
+        self.kb_root.setDepthTest(False)
+        self.kb_root.setDepthWrite(False)
+
+        # 등장 플래시 (radial, .85→0) — root 직속, 뒤에 깔림.
+        self.kb_flash = self._make_filled_circle(100 * S, KB, segs=40)
+        self.kb_flash.reparentTo(self.kb_root)
+        self.kb_flash.setTransparency(True)
+        self.kb_flash.setColorScale(1, 1, 1, 0)
+        self.kb_flash.setBin('fixed', 58)
+
+        # 쇼크 링 (scale .4→2, alpha .8→0) — root 직속, 독립 확산.
+        self.kb_shock = self._dashed_ring(70 * S, 2.0, white, 360.0, 0.0)
+        self.kb_shock.reparentTo(self.kb_root)
+        self.kb_shock.setTransparency(True)
+        self.kb_shock.setColorScale(1, 1, 1, 0)
+        self.kb_shock.setBin('fixed', 59)
+
+        # slam(scale/alpha) 대상 — 프레임/링/원반/해골 모두 자식.
+        self.kb_motion = self.kb_root.attachNewNode('kb_motion')
+
+        # 정적 타겟팅 프레임 (회전 안 함) — frame.png (220유닛 캔버스) 우선,
+        # 없으면 LineSegs 폴백(코너 브래킷 4 + 방위 틱 4 + 바깥 호 4).
+        self.kb_frame = self.kb_motion.attachNewNode('kb_frame')
+        if self._kb_card('frame.png', self.kb_frame, S) is None:
+            for c in (45, 135, 225, 315):
+                self._arc(101 * S, 2.0, white, c - 34, c + 34).reparentTo(self.kb_frame)
+            for a in (0, 90, 180, 270):
+                self._radial_tick(88 * S, 105 * S, 3.0, white, a).reparentTo(self.kb_frame)
+                self._arc(107 * S, 2.5, white, a - 8, a + 8).reparentTo(self.kb_frame)
+
+        # 회전 레티클 링 2겹 — ring_outer/inner.png (220유닛 캔버스, r93/r85 박힘)
+        # 우선. 위치·굵기·대시는 PNG 에 그대로 있으니 카드만 깔고 노드를 회전시킨다.
+        # 파일 없으면 LineSegs 폴백.
+        self.kb_ringA = self.kb_motion.attachNewNode('ringA')   # 바깥, 시계방향 9s
+        self.kb_ringB = self.kb_motion.attachNewNode('ringB')   # 안쪽, 반시계방향 6s
+        if self._kb_card('ring_outer.png', self.kb_ringA, S) is None:
+            self._dashed_ring(93 * S, 2.0, (KB[0], KB[1], KB[2], 0.5), 3.7, 6.2
+                              ).reparentTo(self.kb_ringA)
+            self._dashed_ring(93 * S, 6.0, white, 20.9, 73.9).reparentTo(self.kb_ringA)
+        if self._kb_card('ring_inner.png', self.kb_ringB, S) is None:
+            self._dashed_ring(85 * S, 2.0, (KB[0], KB[1], KB[2], 0.7), 1.35, 4.7
+                              ).reparentTo(self.kb_ringB)
+            self._dashed_ring(85 * S, 5.0, white, 13.5, 141.6).reparentTo(self.kb_ringB)
+
+        # 중앙 원반(어두움) + 흰 테두리.
+        self._make_filled_circle(76 * S, DISC, segs=56).reparentTo(self.kb_motion)
+        self._dashed_ring(76 * S, 2.5, white, 360.0, 0.0).reparentTo(self.kb_motion)
+
+        # 해골 — assets/ui/skull.png (512² 투명, 좌우 그라데이션) 우선 사용.
+        # 이미지 art 가 프레임의 ~68%×77% → full 이미지를 100-box(=50*S 반폭)에 맞추면
+        # art 가 원반 안에 알맞게 들어감. HTML translate(0,4.5) → 살짝 아래로.
+        skull_path = UI_DIR / 'skull.png'
+        if skull_path.exists():
+            tex = self.loader.loadTexture(Filename.from_os_specific(str(skull_path)))
+            self.kb_skull = OnscreenImage(
+                image=tex, pos=(0, 0, -4.5 * S), scale=(50 * S, 1, 50 * S),
+                parent=self.kb_motion)
+            self.kb_skull.setTransparency(True)
+            # 틴트 없이 원본 그라데이션 유지 (이미 흰/회색 톤).
+        else:
+            self.kb_skull = self._make_skull(S)
+            self.kb_skull.reparentTo(self.kb_motion)
+
+        # 파티클 버스트 풀 (root 직속, 위에 그림) — 작은 원들이 '팡' 터지는 느낌.
+        # 위젯(원 28개)을 한 번만 만들고 매 킬마다 재사용 → 드랍 방지.
+        self.kb_burst = self.kb_root.attachNewNode('kb_burst')
+        self.kb_burst.setBin('fixed', 63)
+        self._kb_dots = []
+        for _ in range(28):
+            d = self._make_filled_circle(1.6 * S, KB, segs=10)
+            d.reparentTo(self.kb_burst)
+            d.setTransparency(True)
+            d.setColorScale(1, 1, 1, 0)
+            self._kb_dots.append(d)
+        self._kb_dot_dir = [(0.0, 0.0)] * len(self._kb_dots)
+        self._kb_dot_dist = [0.0] * len(self._kb_dots)
+        self._kb_dot_life = [0.0] * len(self._kb_dots)
+        self._kb_dot_scale = [1.0] * len(self._kb_dots)
+        self._kb_burst_t = 0.0
+        self._kb_burst_life = 0.0
+
+        self.kb_root.hide()
+
+        # 링 회전 + 버스트 task.
+        self._kb_angle_a = 0.0
+        self._kb_angle_b = 0.0
+        self.taskMgr.add(self._kb_task, 'kb_task')
+
+        # 등장→유지→퇴장 Sequence (재사용; 새 킬마다 restart).
+        appear = Parallel(
+            Sequence(
+                LerpScaleInterval(self.kb_motion, 0.27, 0.97,
+                                  startScale=1.45, blendType='easeOut'),
+                LerpScaleInterval(self.kb_motion, 0.07, 1.0,
+                                  startScale=0.97, blendType='easeOut'),
+            ),
+            LerpColorScaleInterval(self.kb_motion, 0.18, (1, 1, 1, 1),
+                                   startColorScale=(1, 1, 1, 0), blendType='easeOut'),
+            LerpColorScaleInterval(self.kb_flash, 0.45, (1, 1, 1, 0),
+                                   startColorScale=(1, 1, 1, 0.85), blendType='easeOut'),
+            LerpScaleInterval(self.kb_shock, 0.55, 2.0,
+                              startScale=0.4, blendType='easeOut'),
+            LerpColorScaleInterval(self.kb_shock, 0.55, (1, 1, 1, 0),
+                                   startColorScale=(1, 1, 1, 0.8), blendType='easeOut'),
+        )
+        leave = Parallel(
+            LerpScaleInterval(self.kb_motion, 0.4, 1.1,
+                              startScale=1.0, blendType='easeIn'),
+            LerpColorScaleInterval(self.kb_motion, 0.4, (1, 1, 1, 0),
+                                   startColorScale=(1, 1, 1, 1), blendType='easeIn'),
+        )
+        self._kb_seq = Sequence(
+            Func(self._kb_prep),
+            appear,
+            Wait(1.6),
+            leave,
+            Func(self.kb_root.hide),
+        )
+
+    def _kb_prep(self):
+        """Sequence 시작 — 초기 상태(scale/alpha) 세팅 + show + 버스트 발사."""
+        self.kb_motion.setScale(1.45)
+        self.kb_motion.setColorScale(1, 1, 1, 0)
+        self.kb_flash.setColorScale(1, 1, 1, 0.85)
+        self.kb_shock.setScale(0.4)
+        self.kb_shock.setColorScale(1, 1, 1, 0.8)
+        self.kb_root.show()
+        self._kb_fire_burst()
+
+    def _kb_fire_burst(self):
+        """작은 원들을 중앙에서 사방으로 '팡' — 방향/거리/수명/크기 랜덤.
+        위치·크기·알파는 task 가 매 프레임 갱신. 모두 중앙(0)에서 동시에 출발."""
+        S = self._kb_S
+        self._kb_burst_life = 0.0
+        for i, d in enumerate(self._kb_dots):
+            ang = random.uniform(0.0, 6.283185307179586)
+            dist = (52.0 + random.uniform(0.0, 84.0)) * S   # 더 넓게 퍼짐
+            life = 0.30 + random.uniform(0.0, 0.22)
+            scl = random.uniform(0.7, 2.3)                  # 원 크기 다양
+            self._kb_dot_dir[i] = (cos(ang), -sin(ang))     # svg y-down → z-up
+            self._kb_dot_dist[i] = dist
+            self._kb_dot_life[i] = life
+            self._kb_dot_scale[i] = scl
+            d.setPos(0, 0, 0)
+            d.setScale(scl)
+            d.setColorScale(1, 1, 1, 1)
+            if life > self._kb_burst_life:
+                self._kb_burst_life = life
+        self._kb_burst_t = self._kb_burst_life
+
+    def _kb_task(self, task):
+        clock = ClockObject.getGlobalClock()
+        dt = clock.getDt()
+        # 링 회전 (보일 때만).
+        if not self.kb_root.isHidden():
+            self._kb_angle_a = (self._kb_angle_a + 40.0 * dt) % 360.0   # CW  ~9s
+            self._kb_angle_b = (self._kb_angle_b - 60.0 * dt) % 360.0   # CCW ~6s
+            self.kb_ringA.setR(self._kb_angle_a)
+            self.kb_ringB.setR(self._kb_angle_b)
+        # 파티클 버스트 진행 — 빠르게 튀어나가(강한 easeOut) 작아지며 사라짐 → '팡'.
+        if self._kb_burst_t > 0.0:
+            self._kb_burst_t = max(0.0, self._kb_burst_t - dt)
+            elapsed = self._kb_burst_life - self._kb_burst_t
+            for i, d in enumerate(self._kb_dots):
+                life = self._kb_dot_life[i] or 1.0
+                f = min(1.0, elapsed / life)
+                ease = 1.0 - (1.0 - f) ** 4                # quartic easeOut (초반 폭발)
+                ux, uz = self._kb_dot_dir[i]
+                dist = self._kb_dot_dist[i] * ease
+                d.setPos(ux * dist, 0, uz * dist)
+                d.setScale(self._kb_dot_scale[i] * (1.0 - 0.62 * f))   # 점점 작아짐
+                a = 1.0 if f < 0.55 else max(0.0, 1.0 - (f - 0.55) / 0.45)
+                d.setColorScale(1, 1, 1, a)
+            if self._kb_burst_t <= 0.0:
+                for d in self._kb_dots:
+                    d.setColorScale(1, 1, 1, 0)
+        return task.cont
+
+    def _show_kill_banner(self):
+        """처치 시 호출 — 진행 중이던 Sequence 멈추고 처음부터 재생(겹침 방지)."""
+        self._kb_seq.start()   # start() 가 t=0 으로 리셋하며 재생
+
     # --- HUD (임상 안티바이러스 톤 + 글리치) ---------------------------------
 
     def _hud_img(self, name, pos, scale, parent, hidden=False):
@@ -2156,15 +2803,24 @@ class ZombieGame(ShowBase):
         self.hud_integ_ext.hide()
         self.hud_integ_num.hide()
 
+        # 좌하단 — 연산 자원(포인트). 코어 무결성 바가 숨김이라 비어 있는 코너에 표시.
+        # 처치로 적립 → 추후 Wall Buy 무기 구매 / 구역 개방 비용으로 사용 예정.
+        self.hud_points_lbl = OnscreenText(
+            text='연산 자원', pos=(0.05, 0.215), scale=0.036,
+            fg=HUD_CYAN_DIM, align=TextNode.ALeft, mayChange=True, parent=BL)
+        self.hud_points_num = OnscreenText(
+            text='0', pos=(0.05, 0.120), scale=0.080,
+            fg=HUD_WHITE, align=TextNode.ALeft, mayChange=True, parent=BL)
+
         # 우하단 — 정화 카트리지 ("탄약"). 라벨(상) / 큰 숫자(중) / cart row(하).
         # 카트리지 단독 칸을 3× 키우고 간격은 거의 붙여 magazine 한 덩어리처럼.
         # 칸이 커진 만큼 cart row 자체와 숫자/라벨도 위로 올려 화면 하단 클리핑 회피.
         self.hud_ammo_lbl = OnscreenText(
             text=s['ammo_lbl'][0], pos=(-0.05, 0.390), scale=0.036,
-            fg=HUD_CYAN_DIM, align=TextNode.ARight, mayChange=True, parent=BR)
+            fg=HUD_WHITE_TRANS_DIM, align=TextNode.ARight, mayChange=True, parent=BR)
         self.hud_ammo_num = OnscreenText(
             text='8', pos=(-0.05, 0.215), scale=0.130,
-            fg=HUD_WHITE, align=TextNode.ARight, mayChange=True, parent=BR)
+            fg=HUD_WHITE_TRANS, align=TextNode.ARight, mayChange=True, parent=BR)
         n = self.ammo_max
         seg_w, gap = 0.090, 0.00006      # 단독 칸 3×, 간격 사실상 0 (이전 1/5)
         seg_h = seg_w * (400 / 336)      # cart 종횡비 보존
@@ -2183,6 +2839,9 @@ class ZombieGame(ShowBase):
             off = self._hud_img('cart-off.png', pos=(cx, 0, cart_z),
                                 scale=(seg_w * 0.5, 1, seg_h * 0.5),
                                 parent=BR, hidden=True)
+            # 시안 카트리지 PNG → 반투명 흰색으로 틴트.
+            on.setColorScale(*HUD_TINT_WHITE_TRANS)
+            off.setColorScale(*HUD_TINT_WHITE_TRANS)
             self.hud_ammo_on.append(on)
             self.hud_ammo_off.append(off)
 
@@ -2246,6 +2905,15 @@ class ZombieGame(ShowBase):
             (self.hud_map_lbl,   'zone_lbl',  HUD_CYAN_DIM),
         ]
 
+        # 미니멀 HUD — 탄약(BR)·조준점·일시정지만 남기고 나머지 코너 UI 전부 숨김.
+        #   L  = 좌상단 시스템 배너 + 디버그
+        #   R  = 우상단 킬 카운터 + 미니맵
+        #   BL = 좌하단 코어 무결성(체력) 바
+        # (BR = 탄약 카운터는 유지)
+        L.hide()
+        R.hide()
+        BL.hide()
+
     def _set_glitch(self, on):
         """on=True → 진실 라벨/빨강, False → 표면 라벨/시안. HUD 전반에 적용.
         모든 시안 PNG 는 _hud_images 일괄 setColorScale 로 빨강 틴트 처리 (PNG 교체 없음)."""
@@ -2289,9 +2957,10 @@ class ZombieGame(ShowBase):
     def _update_hud(self, dt):
         glitching = self._glitch_t > 0
 
-        # 카트리지 — i < ammo 면 cart-on 표시, 아니면 cart-off. 큰 숫자도 갱신.
+        # 카트리지 — pip 위젯 수(고정)만큼 순회. 큰 숫자가 실제 탄약(소총 25발 등).
+        # pip 보다 탄약이 많으면(소총) pip 은 마지막 N발 게이지처럼 동작 → 인덱스 안전.
         self.hud_ammo_num.setText(str(self.ammo))
-        for i in range(self.ammo_max):
+        for i in range(len(self.hud_ammo_on)):
             lit = i < self.ammo
             if lit:
                 self.hud_ammo_on[i].show()
@@ -2299,10 +2968,9 @@ class ZombieGame(ShowBase):
             else:
                 self.hud_ammo_on[i].hide()
                 self.hud_ammo_off[i].show()
-        if self.ammo == 0:
-            self.hud_ammo_num.setFg(HUD_RED)
-        elif not glitching:
-            self.hud_ammo_num.setFg(HUD_WHITE)
+        # 탄약 숫자 — 반투명 흰색 유지 (빈 탄창은 더 옅게).
+        self.hud_ammo_num.setFg(HUD_WHITE_TRANS_DIM if self.ammo == 0
+                                else HUD_WHITE_TRANS)
 
         # 코어 무결성 — 두 단계 채움.
         #   HP 68 ~ 100 : baked PNG fill 은 그대로 + cyan 확장이 rail 영역 채움 (풀바)
@@ -2326,6 +2994,7 @@ class ZombieGame(ShowBase):
         # 웨이브 모드 HUD — 총 처치 수 + 현재 웨이브/남은 적
         alive = sum(1 for z in self.zombies if z.hp > 0)
         self.hud_kills_num.setText(f'{self.kills:02d}')
+        self.hud_points_num.setText(f'{self.points:,}')
         if self.wave_active:
             self.hud_zone.setText(f'WAVE {self.wave}  남은 적 {alive}')
         elif self.wave >= 1:
@@ -2374,6 +3043,9 @@ class ZombieGame(ShowBase):
             )
 
     def _update_enemy_target(self):
+        # 미니멀 HUD — 적 타겟 정보 패널 제거 (항상 숨김).
+        self.enemy_target.hide()
+        return
         from math import radians, sin, cos
         fx = -sin(radians(self.player_yaw))
         fy = cos(radians(self.player_yaw))
@@ -2474,6 +3146,13 @@ class ZombieGame(ShowBase):
         # 발사 쿨다운 감쇠
         if self.shoot_cooldown_t > 0:
             self.shoot_cooldown_t -= dt
+
+        # 연발(full-auto) — 좌클릭 hold 동안 쿨다운마다 자동 발사. (반자동은 클릭당 1발)
+        if getattr(self, '_auto_fire', False) and getattr(self, '_mouse1_down', False):
+            self._play_shoot_oneshot()
+
+        # 무기 스왑 모션 진행 (팔 내림 offset _swap_z 갱신, 바닥에서 실제 교체).
+        self._update_weapon_swap(dt)
 
         # Muzzle flash timer — 위치는 anchor parent 가 자동 처리, 크기만 fade.
         if self.muzzle_flash is not None and self.muzzle_flash_t > 0:
@@ -2613,7 +3292,7 @@ class ZombieGame(ShowBase):
                             + Vec3(0, 0, self.ads_body_offset.z)) * self.aim_t
 
         self.ybot.setPos(self.player_pos + recoil_offset
-                         + Vec3(0, 0, bob_z) + ads_offset_world)
+                         + Vec3(0, 0, bob_z + self._swap_z) + ads_offset_world)
         # 일단 pitch=0 으로 세팅 → 아래에서 shoulder 피벗 트릭으로 pitch 적용.
         self.ybot.setHpr(self.player_yaw + 180, 0, 0)
         # 애니메이션을 현재 시각으로 강제 동기화. 안 하면 joint 의 world 좌표가
@@ -2687,9 +3366,14 @@ class ZombieGame(ShowBase):
             self.weapon_anchor.setPos(self.right_hand_joint.getPos(self.render))
             self.weapon_anchor.setHpr(self.right_hand_joint.getHpr(self.render))
 
-        # 좀비 AI tick
+        # 좀비 AI tick — 페이드아웃 끝난 시체는 노드 정리 후 목록에서 제거.
         for z in self.zombies:
             z.update(dt, self.player_pos)
+        if any(z.remove_me for z in self.zombies):
+            for z in self.zombies:
+                if z.remove_me:
+                    z.actor.removeNode()
+            self.zombies = [z for z in self.zombies if not z.remove_me]
 
         # 방화벽 / 게이트 tick (웨이브 모드에선 비어 있음 — 안전상 유지)
         for fw in self.firewalls:
@@ -2713,21 +3397,10 @@ class ZombieGame(ShowBase):
         # 킬 콤보 윈도우 카운트다운 — 0 이 되면 다음 킬은 1단계부터.
         if self._combo_window > 0.0:
             self._combo_window = max(0.0, self._combo_window - dt)
+        # 하단 콤보 게이지 갱신 (남은 시간 → 왼쪽으로 슬라이드 소진)
+        self._update_combo_bar()
 
-        # Interact proximity — 가장 가까운 DEAD + 아직 transform 안 한 좀비 찾기
-        self._interact_target = None
-        best_d = self.interact_range
-        for z in self.zombies:
-            if z.state != Zombie.DEAD or z.transformed or z.transform_t > 0:
-                continue
-            d = (z.pos - self.player_pos).length()
-            if d < best_d:
-                best_d = d
-                self._interact_target = z
-        if self._interact_target is not None:
-            self.interact_frame.show()
-        else:
-            self.interact_frame.hide()
+        # (F 정화/복원 상호작용 제거 — 좀비는 죽으면 페이드아웃되어 사라짐)
 
         # 피격 fire 파티클 — 살짝 커지며 fade out 후 제거
         for p in self._hit_particles[:]:
