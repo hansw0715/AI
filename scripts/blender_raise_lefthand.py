@@ -3,9 +3,13 @@
 LeftArm+LeftForeArm 회전만 바꿔 손 위치를 올림. 손목/손가락 회전은 유지.
 암맥 world transform 은 절대 건드리지 않음 (읽기 전용).
 
+RAISE 음수면 내림 (예: -0.05 = 5cm 아래로).
+FRAMES(선택) 콤마 구분 목록을 주면 그 프레임만 보정 (예: 0,72 = 그립 북엔드만).
+나머지 프레임은 기존 키로 자연 보간됨.
+
 사용:
   blender --background --python scripts/blender_raise_lefthand.py -- \
-      IN_BLEND OUT_BLEND RAISE_M ACTION
+      IN_BLEND OUT_BLEND RAISE_M ACTION [FRAMES]
 """
 import sys
 import bpy
@@ -15,6 +19,8 @@ argv = sys.argv[sys.argv.index('--') + 1:]
 in_blend, out_blend = argv[0], argv[1]
 RAISE = float(argv[2]) if len(argv) > 2 else 0.10
 ACTION = argv[3] if len(argv) > 3 else 'RifleIdle'
+ONLY_FRAMES = ([int(x) for x in argv[4].split(',') if x.strip() != '']
+               if len(argv) > 4 and argv[4].strip() != '' else None)
 PREFIX = 'mixamorig:'
 LARM, LFORE, LHAND = PREFIX + 'LeftArm', PREFIX + 'LeftForeArm', PREFIX + 'LeftHand'
 
@@ -36,6 +42,7 @@ for pb in arm.pose.bones:
     pb.rotation_mode = 'QUATERNION'
 
 f0, f1 = int(act.frame_range[0]), int(act.frame_range[1])
+frames = ONLY_FRAMES if ONLY_FRAMES is not None else list(range(f0, f1 + 1))
 
 # Pass 1: IK 로 LeftHand 를 +Z RAISE 한 LARM/LFORE visual matrix 수집
 tgt = bpy.data.objects.new('LHRaiseTgt', None)
@@ -47,7 +54,7 @@ ik.chain_count = 2
 ik.use_tail = True
 
 collected = {}
-for f in range(f0, f1 + 1):
+for f in frames:
     scene.frame_set(f)
     bpy.context.view_layer.update()
     hand_w = arm.matrix_world @ arm.pose.bones[LHAND].matrix.translation
@@ -75,5 +82,6 @@ for f, (mA, mF) in collected.items():
     bpy.context.view_layer.update()
 
 bpy.ops.wm.save_as_mainfile(filepath=out_blend)
-print('[raise] %s: LeftHand +%.3fm, frames %d-%d' % (ACTION, RAISE, f0, f1),
-      flush=True)
+print('[raise] %s: LeftHand %+.3fm, frames %s' % (
+    ACTION, RAISE, (ONLY_FRAMES if ONLY_FRAMES is not None else '%d-%d' % (f0, f1))),
+    flush=True)
