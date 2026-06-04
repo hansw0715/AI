@@ -128,14 +128,30 @@ WEAPON_MUZZLE_POS  = (0.08, 0.32, 0.08)
 RIFLE_PATH = Filename.from_os_specific(
     str(SCRIPT_DIR / 'assets' / 'weapons' / 'low-poly_armalite_ar-10.glb')
 )
-RIFLE_LOCAL_SCALE = 0.0900
-RIFLE_LOCAL_POS    = (0.010, 0.120, 0.030)
-RIFLE_LOCAL_HPR    = (22.5, -78.2, 108.9)
+RIFLE_LOCAL_SCALE = 0.0810
+RIFLE_LOCAL_POS    = (0.017, 0.281, 0.064)
+RIFLE_LOCAL_HPR    = (27.5, -105.2, 91.9)
 RIFLE_MUZZLE_POS   = (0.08, 0.62, 0.08)
 # 소총 native 방향 보정 — 모델이 권총과 앞뒤가 반대라 총구가 플레이어를 향함.
 # 배치 HPR 과 분리해서, 모델 자체를 제 up(Z)축 기준 180° 돌려 앞뒤만 뒤집는다.
 # (배치 HPR 은 그대로 튜닝, 이 값은 방향 보정 전용.)
 RIFLE_LOCAL_PREROT = (180, 0, 0)
+
+# 무기별 "보이는 몸 전체" 오프셋 (우, 앞, 위 / m) — player-frame 기준.
+# 1인칭이라 보이는 몸(ybot)만 이만큼 평행이동하고 카메라·히트박스(player_pos)는
+# 불변. 손이 본 애니메이션을 떠나지 않으니 총을 손에 든 채로 화면상 위치만 옮길 때
+# 사용. 총 자체의 손 기준 미세위치는 RIFLE_LOCAL_POS/HPR 로 따로 조정.
+# 게임 중 B 키로 튜닝 모드 토글 → 화살표/PgUp·Dn 으로 조절, P 로 값 출력.
+WEAPON_BODY_OFFSET = {
+    'pistol': (0.0, 0.0, 0.0),
+    'rifle':  (-0.075, 0.100, 0.110),
+}
+# 무기별 "보이는 몸" 회전 (H, P, R / deg) — 몸+총이 같은 축으로 함께 회전
+# (총은 손 본을 따라감). 카메라·히트박스 불변. [ ] ; ' , . 로 조절.
+WEAPON_BODY_HPR = {
+    'pistol': (0.0, 0.0, 0.0),
+    'rifle':  (10.0, 0.0, 0.0),
+}
 
 # 무기별 스탯 — _equip_weapon 이 적용. ammo_max=탄창, cooldown=발사간격(s),
 # auto=연발(mouse1 hold 연사), head_onekill=헤드샷 즉사.
@@ -1049,6 +1065,11 @@ class ZombieGame(ShowBase):
         # 결과: 손·팔·총 다 같이 이 지점으로 이동, 시점(world background) 정적.
         # 단위 m. (X=우/좌, Y=앞/뒤, Z=위/아래). 현재: 좌 13cm + 앞 5cm + 아래 2cm.
         self.ads_body_offset = Vec3(-0.13, 0.05, -0.02)
+        # 무기별 "보이는 몸" 오프셋 — 장착 무기에 따라 _equip_weapon 이 갱신.
+        # ADS 오프셋과 동일 원리(몸만 이동, 카메라·히트박스 불변) 지만 항상 적용.
+        self.weapon_body_offset = Vec3(0, 0, 0)
+        self.weapon_body_hpr = Vec3(0, 0, 0)   # 보이는 몸 회전(H,P,R deg)
+        self._tune_mode = 'weapon'   # 'weapon'=총 위치, 'body'=보이는 몸 위치/회전
         # ADS 시 마우스 감도 배율 — 작을수록 좌우 시점이 천천히·작게.
         self.ads_mouse_factor = 0.35
         # ADS 시 이동 속도 배율 — 작을수록 천천히 걸음.
@@ -1131,6 +1152,10 @@ class ZombieGame(ShowBase):
                 self.ybot.setControlEffect(a, w, partName=p)
         self.blend_speed = 14.0       # 크면 빠른 전환, 작으면 부드러움
         self.blend_out_time = 0.18    # 단발 anim 끝나기 이만큼 전부터 다음 상태로 페이드
+        # 재장전 종료 시 자세 복귀가 휙 튀지 않게 잠깐 느린 블렌드 사용.
+        self._slow_blend_t = 0.0          # >0 이면 느린 블렌드(초)
+        self.slow_blend_speed = 5.0       # 재장전 복귀용 느린 전환 속도
+        self.reload_return_slow_dur = 0.5 # 재장전 끝 느린 블렌드 지속(초)
 
         # 모든 locomotion anim 을 양쪽 파트에서 항상 loop — weight 가 0 이어도
         # 내부 time 은 흐르고, 보이는 건 _current_w 가 결정. 액션 전환 시 시작
@@ -1141,6 +1166,10 @@ class ZombieGame(ShowBase):
             # Walk* 도 loop 만 깔아둠 — 현재 코드에선 미사용이지만 추후 Shift+이동
             # 같은 걸 붙일 때 시작 프레임이 튀지 않게 미리 돌려 둠.
             'WalkForward', 'WalkBackward',
+            # 소총(Pro Rifle Pack) 로코모션 — 소총 장착 시 _target_anim 이 선택.
+            'RifleIdle', 'RifleRunForward', 'RifleRunBackward',
+            'RifleStrafeL', 'RifleStrafeR', 'RifleKneelIdle', 'RifleJump',
+            'RifleWalkForward', 'RifleWalkBackward',
         }
         for a in self.anim_names:
             if a in self._loop_anim_set:
@@ -1214,6 +1243,7 @@ class ZombieGame(ShowBase):
         self.slide_recoil_decay = 14.0 # 1/sec — 클수록 빠른 복귀
 
         self.weapon = None
+        self.weapon_name = None
         self.slide_node = None
         self.slide_rest_x = 0.0
         self._weapons = {}        # name -> dict(node, slide_node, slide_rest_x, muzzle)
@@ -1256,10 +1286,14 @@ class ZombieGame(ShowBase):
             self.slide_marker.setLightOff()
             self._marker_pos = [0.0, 0.0, 0.0]
             self.slide_marker.setPos(0, 0, 0)
-            print('[marker] axes: red=X green=Y blue=Z. I/K=±Y, J/L=±X, U/O=±Z, P=dump',
+            print('[marker] axes: red=X green=Y blue=Z. I/K=±Y, J/L=±X, U/O=±Z',
                   flush=True)
         else:
             self.slide_marker = None
+        print('[weapon-tune] B로 총↔몸 토글 | 위치 ←/→ ↑/↓ PgUp/PgDn | '
+              '회전 [ ]=H  ; \'=P  , .=R | P=현재값 출력 '
+              '(weapon=총 / body=몸+총)',
+              flush=True)
         # 카메라를 Head 본의 월드 좌표에 매 프레임 따라붙임. 머리가 애니메이션으로
         # 흔들려도 카메라가 동행하니까 자기 뒤통수가 보이는 일이 없음.
         # 시선 방향(yaw/pitch) 은 마우스 입력 그대로 — head 본의 회전은 무시.
@@ -1312,7 +1346,13 @@ class ZombieGame(ShowBase):
         # 소총(M16) 발사음 — 연발 빠른 연사라 겹침 풀 넉넉히(8개) 로 끊김 방지.
         self.sfx_m16_pool = self._load_sfx_pool('m16sound.mp3', 8)
         self._sfx_m16_i = 0
+        # 소총 발사음 볼륨 — 기본(1.0) 대비 +30%. (Panda3D 는 1.0 초과 증폭 허용)
+        for _s in self.sfx_m16_pool:
+            _s.setVolume(1.3)
         self.sfx_reload = self._load_sfx('Reload.wav')
+        # 빈 탄창 클릭 — 총알 없을 때 발사 시도하면 권총·소총 공통으로 재생.
+        self.sfx_empty = self._load_sfx('emptygun.wav')
+        self._empty_click_t = 0.0   # 빈총 소리 연타 방지 쿨다운(초)
 
         # 발소리 — f1/f2/f3 중 랜덤 재생하되 직전과 같은 건 안 나오게(중복 방지).
         self.sfx_foot = [s for s in (self._load_sfx('f1.mp3'),
@@ -1369,19 +1409,25 @@ class ZombieGame(ShowBase):
         self._hit_particles = []        # [{np, t, dur, base}, ...] — _update 가 animate
         print(f'[fx] fire 파티클 {len(self._fire_tex)}종 로드', flush=True)
         # 재장전 사운드 길이에 맞춰 Reload 애니메이션 속도를 동기화 (오디오 원음 유지).
-        # 실제 재생 시간(_reload_play_dur)을 타이머에 사용. 과한 워핑은 클램프로 방지.
-        self._reload_play_dur = (self.ybot.getDuration('Reload')
-                                 if 'Reload' in self.anim_names else 0.0)
-        if self.sfx_reload is not None and 'Reload' in self.anim_names:
-            snd_len = self.sfx_reload.length()
-            anim_len = self.ybot.getDuration('Reload')
+        # 권총=Reload, 소총=RifleReload 둘 다 처리. 실제 재생 시간을 _reload_dur 에
+        # 저장해 타이머에 사용. 과한 워핑은 클램프(0.6~1.6)로 방지.
+        self._reload_dur = {}
+        snd_len = (self.sfx_reload.length()
+                   if self.sfx_reload is not None else 0.0)
+        for _ranim in ('Reload', 'RifleReload'):
+            if _ranim not in self.anim_names:
+                continue
+            anim_len = self.ybot.getDuration(_ranim)
+            play_dur = anim_len
             if snd_len > 0.05 and anim_len > 0.05:
                 rate = max(0.6, min(1.6, anim_len / snd_len))
                 for _pp in ('upper', 'hands'):
-                    self.ybot.setPlayRate(rate, 'Reload', partName=_pp)
-                self._reload_play_dur = anim_len / rate
-                print('[sfx] reload synced: snd=%.2fs anim=%.2fs rate=%.2f -> %.2fs'
-                      % (snd_len, anim_len, rate, self._reload_play_dur), flush=True)
+                    self.ybot.setPlayRate(rate, _ranim, partName=_pp)
+                play_dur = anim_len / rate
+                print('[sfx] %s synced: snd=%.2fs anim=%.2fs rate=%.2f -> %.2fs'
+                      % (_ranim, snd_len, anim_len, rate, play_dur), flush=True)
+            self._reload_dur[_ranim] = play_dur
+        self._reload_play_dur = self._reload_dur.get('Reload', 0.0)
 
         # Muzzle flash — weapon_anchor (= hand world frame, m 단위) 에 parent.
         # ybot 숨겨도 (Valorant 스타일) 영향 없이 그대로 보임. billboard + additive.
@@ -1606,7 +1652,32 @@ class ZombieGame(ShowBase):
         for key, args in marker_binds.items():
             self.accept(key, self._nudge_marker, list(args))
             self.accept(f'{key}-repeat', self._nudge_marker, list(args))
-        self.accept('p', self._dump_marker)
+
+        # 무기 위치/회전 튜닝 하네스 — 장착 무기(self.weapon) local POS/HPR 조절.
+        #   이동(POS):  ←/→ = X(좌/우),  ↑/↓ = Y(앞/뒤, 총신),  PageUp/Down = Z(위/아래)
+        #   회전(HPR):  [ ] = H(좌우 yaw),  ; ' = P(상하 pitch),  , . = R(roll)
+        #   P = 현재 값 PowerShell 출력 + 화면 표시
+        weapon_pos_binds = {
+            'arrow_right': (0,  1), 'arrow_left': (0, -1),   # ±X
+            'arrow_up':    (1,  1), 'arrow_down': (1, -1),   # ±Y (총신 전후)
+            'page_up':     (2,  1), 'page_down':  (2, -1),   # ±Z
+        }
+        for key, args in weapon_pos_binds.items():
+            self.accept(key, self._nudge_weapon_pos, list(args))
+            self.accept(f'{key}-repeat', self._nudge_weapon_pos, list(args))
+        # Panda3D 는 구두점 키를 'bracketleft' 같은 단어가 아니라 글자 그대로
+        # ('[' / ']' / ';' / "'" / ',' / '.') 이벤트로 보낸다.
+        weapon_hpr_binds = {
+            ']': (0,  1), '[': (0, -1),   # ±H (yaw)
+            "'": (1,  1), ';': (1, -1),   # ±P (pitch)
+            '.': (2,  1), ',': (2, -1),   # ±R (roll)
+        }
+        for key, args in weapon_hpr_binds.items():
+            self.accept(key, self._nudge_weapon_hpr, list(args))
+            self.accept(f'{key}-repeat', self._nudge_weapon_hpr, list(args))
+
+        self.accept('b', self._toggle_tune_mode)  # B → 튜닝 대상 토글(총↔몸)
+        self.accept('p', self._dump_weapon)   # P → 무기 위치/회전 콘솔 출력
 
     def _set_key(self, k, v):
         self.keys[k] = v
@@ -1659,6 +1730,9 @@ class ZombieGame(ShowBase):
         d = self._weapons[name]
         d['node'].show()
         self.weapon = d['node']
+        self.weapon_name = name        # 현재 무기 — 로코모션 anim 세트 선택에 사용
+        self.weapon_body_offset = Vec3(*WEAPON_BODY_OFFSET.get(name, (0, 0, 0)))
+        self.weapon_body_hpr = Vec3(*WEAPON_BODY_HPR.get(name, (0, 0, 0)))
         self.slide_node = d['slide_node']
         self.slide_rest_x = d['slide_rest_x']
         self.slide_recoil = 0.0
@@ -1759,7 +1833,115 @@ class ZombieGame(ShowBase):
         self.taskMgr.doMethodLater(3.0, _remove, 'marker_dump_remove')
 
     # --- weapon tuning harness (조정 끝나면 통째로 제거) -------------------
+    # 현재 장착 무기(self.weapon 노드)의 local POS/HPR 을 실시간으로 미세조정.
+    # 화살표/PageUp·Down = XYZ 이동, [ ] ; ' , . = 회전(H/P/R), P = 콘솔 dump.
+    # 무기 node 의 pos/hpr 은 매 프레임 갱신 안 됨(register 때 1회) → 여기서 바꾼
+    # 값이 그대로 유지됨. 반동(weapon_anchor)·슬라이드(slide_node)·스왑(ybot Z)
+    # 은 별도 노드라 충돌 없음.
+    WEAPON_TUNE_POS_STEP = 0.005   # m (5mm)
+    WEAPON_TUNE_HPR_STEP = 1.0     # deg
 
+    def _toggle_tune_mode(self):
+        """B 키 — 튜닝 대상 토글: 'weapon'(총 손기준 위치/회전) ↔ 'body'(보이는 몸)."""
+        self._tune_mode = 'body' if self._tune_mode == 'weapon' else 'weapon'
+        label = ('보이는 몸 이동/회전 (손+총 함께)' if self._tune_mode == 'body'
+                 else '총 위치/회전 (손 기준)')
+        print(f'[tune] 모드 = {self._tune_mode}  ({label})', flush=True)
+
+    def _nudge_weapon_pos(self, idx, sign):
+        """화살표/PgUp·Dn — 모드에 따라 총 위치(weapon) 또는 보이는 몸(body) 이동.
+        idx 0=X(우/좌) 1=Y(앞/뒤) 2=Z(위/아래).
+
+        body 모드: 보이는 몸을 player-frame 으로 이동시키되, 총은 손목에 고정돼
+        같이 끌려가므로 그만큼 총 local 오프셋을 반대로 빼서 보정 → 총은 화면에서
+        제자리, 손목(몸)만 총 쪽으로 이동. (보정량은 현재 손 회전 기준 정확히 상쇄)"""
+        step = sign * self.WEAPON_TUNE_POS_STEP
+        if self._tune_mode == 'body':
+            # player-frame 축 → world 벡터
+            yr = radians(self.player_yaw)
+            axis_w = (Vec3(cos(yr), sin(yr), 0),    # 0=우/좌
+                      Vec3(-sin(yr), cos(yr), 0),   # 1=앞/뒤
+                      Vec3(0, 0, 1))[idx]           # 2=위/아래
+            delta_world = axis_w * step
+            v = self.weapon_body_offset
+            cur = [v.x, v.y, v.z]
+            cur[idx] += step
+            self.weapon_body_offset = Vec3(*cur)
+            # 총 고정 보정 — 몸이 delta_world 만큼 이동 → 총 local 을 같은 양만큼 빼기
+            if self.weapon is not None:
+                d_local = self.weapon_anchor.getRelativeVector(
+                    self.render, delta_world)
+                p = self.weapon.getPos()
+                self.weapon.setPos(p.x - d_local.x,
+                                   p.y - d_local.y,
+                                   p.z - d_local.z)
+            return
+        if self.weapon is None:
+            return
+        p = list(self.weapon.getPos())
+        p[idx] += step
+        self.weapon.setPos(*p)
+
+    def _nudge_weapon_hpr(self, idx, sign):
+        """[ ] ; ' , . — 회전. (B로 대상 토글)
+        weapon 모드: 총 자체 회전(node local hpr = RIFLE_LOCAL_HPR).
+        body   모드: 보이는 몸 회전(weapon_body_hpr) → 몸+총 함께 회전.
+        idx 0=H,1=P,2=R."""
+        step = sign * self.WEAPON_TUNE_HPR_STEP
+        if self._tune_mode == 'weapon':
+            if self.weapon is None:
+                return
+            h = list(self.weapon.getHpr())
+            h[idx] += step
+            self.weapon.setHpr(*h)
+            return
+        v = self.weapon_body_hpr
+        cur = [v.x, v.y, v.z]
+        cur[idx] += step
+        self.weapon_body_hpr = Vec3(*cur)
+
+    def _dump_weapon(self):
+        """장착 무기의 현재 POS/HPR 을 PowerShell(콘솔)에 출력 + 화면 3초 overlay.
+        출력 형식은 zombie_game.py 상단 상수에 그대로 붙여넣을 수 있게 맞춤."""
+        if self.weapon is None:
+            print('[weapon-tune] no weapon equipped', flush=True)
+            return
+        name = self.weapon_name or '?'
+        p = self.weapon.getPos()
+        h = self.weapon.getHpr()
+        b = self.weapon_body_offset
+        bh = self.weapon_body_hpr
+        prefix = 'RIFLE' if name == 'rifle' else 'WEAPON'
+        pos_line = (f'{prefix}_LOCAL_POS   = '
+                    f'({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})')
+        hpr_line = (f'{prefix}_LOCAL_HPR   = '
+                    f'({h[0]:.1f}, {h[1]:.1f}, {h[2]:.1f})')
+        body_line = (f"WEAPON_BODY_OFFSET['{name}'] = "
+                     f'({b.x:.3f}, {b.y:.3f}, {b.z:.3f})')
+        body_hpr_line = (f"WEAPON_BODY_HPR['{name}'] = "
+                         f'({bh.x:.1f}, {bh.y:.1f}, {bh.z:.1f})')
+        print(f'[weapon-tune] {name}  (mode={self._tune_mode})', flush=True)
+        print('  ' + pos_line, flush=True)
+        print('  ' + hpr_line, flush=True)
+        print('  ' + body_line, flush=True)
+        print('  ' + body_hpr_line, flush=True)
+        txt = (f'{name.upper()} [{self._tune_mode}]\n'
+               f'{body_line}\n{body_hpr_line}')
+        if getattr(self, '_weapon_tune_text', None) is not None:
+            self._weapon_tune_text.destroy()
+        self._weapon_tune_text = OnscreenText(
+            text=txt, pos=(0, 0.2), scale=0.06,
+            fg=(0.4, 1, 0.4, 1), bg=(0, 0, 0, 0.85),
+            align=TextNode.ACenter, mayChange=False,
+            parent=self.aspect2d,
+        )
+        token = self._weapon_tune_text
+        def _remove(task, t=token):
+            if getattr(self, '_weapon_tune_text', None) is t:
+                self._weapon_tune_text.destroy()
+                self._weapon_tune_text = None
+            return Task.done
+        self.taskMgr.doMethodLater(3.0, _remove, 'weapon_tune_dump_remove')
 
     def _toggle_kneel(self):
         if self._reload_oneshot:
@@ -1807,27 +1989,37 @@ class ZombieGame(ShowBase):
 
         self.taskMgr.doMethodLater(back_after, _back, 'kneel_transition_return')
 
+    def _loco_anim(self, base):
+        """소총 장착 시 base 로코모션 anim 을 Pro Rifle Pack 변형(Rifle*)으로 치환.
+        해당 rifle 변형이 bam 에 없으면(예: 무릎 transition) base 그대로 폴백."""
+        if self.weapon_name == 'rifle':
+            rifle = 'Rifle' + base
+            if rifle in self.anim_names:
+                return rifle
+        return base
+
     def _target_anim(self):
-        """현재 상태(공중/무릎/이동방향)에 맞는 loop anim 이름."""
+        """현재 상태(공중/무릎/이동방향)에 맞는 loop anim 이름.
+        소총 장착 중이면 _loco_anim 이 Rifle* 변형으로 자동 치환."""
         if self.kneel_state == 'going_down' and 'StandToKneel' in self.anim_names:
-            return 'StandToKneel'
+            return self._loco_anim('StandToKneel')
         if self.kneel_state == 'going_up' and 'KneelToStand' in self.anim_names:
-            return 'KneelToStand'
+            return self._loco_anim('KneelToStand')
         if self.kneel_state == 'kneel' and 'KneelIdle' in self.anim_names:
-            return 'KneelIdle'
+            return self._loco_anim('KneelIdle')
         if not self.on_ground and 'Jump' in self.anim_names:
-            return 'Jump'
+            return self._loco_anim('Jump')
         fwd = self.keys['w'] - self.keys['s']
         rgt = self.keys['d'] - self.keys['a']
         if fwd > 0 and 'RunForward' in self.anim_names:
-            return 'RunForward'
+            return self._loco_anim('RunForward')
         if fwd < 0 and 'RunBackward' in self.anim_names:
-            return 'RunBackward'
+            return self._loco_anim('RunBackward')
         if rgt > 0 and 'StrafeR' in self.anim_names:
-            return 'StrafeR'
+            return self._loco_anim('StrafeR')
         if rgt < 0 and 'StrafeL' in self.anim_names:
-            return 'StrafeL'
-        return 'Idle'
+            return self._loco_anim('StrafeL')
+        return self._loco_anim('Idle')
 
     def _update_locomotion(self):
         # Kneel transition 중에는 _play_kneel_transition 이 target_w 를 잡고 있음.
@@ -1840,13 +2032,16 @@ class ZombieGame(ShowBase):
         # 아래로 빠짐. A/D 의 StrafeL/R 은 Hips pitch 가 없어 reload 가 정상으로
         # 보이는 거. 같은 효과를 W/S 에도 주려고 lower 를 Idle 로 대체 — 다리는
         # 멈추지만 player_pos 는 그대로 전진/후진. 1인칭이라 다리는 거의 안 보임.
-        if self._reload_oneshot and target in ('RunForward', 'RunBackward'):
-            target = 'Idle'
+        if self._reload_oneshot and target in ('RunForward', 'RunBackward',
+                                               'RifleRunForward', 'RifleRunBackward'):
+            target = self._loco_anim('Idle')
         # ADS + 이동 시 lower 까지 Idle 강제 → Hips rotation 사라져서 상체로 전파 안 됨
         # → 팔 완전 정지. (다리는 어차피 hidden, body slide 만 발생)
         if self.aim_t > 0.5 and target in ('RunForward', 'RunBackward',
-                                            'StrafeL', 'StrafeR'):
-            target = 'Idle'
+                                            'StrafeL', 'StrafeR',
+                                            'RifleRunForward', 'RifleRunBackward',
+                                            'RifleStrafeL', 'RifleStrafeR'):
+            target = self._loco_anim('Idle')
         loco_w = {a: (1.0 if a == target else 0.0) for a in self.anim_names}
         # lower: 항상 locomotion. Shoot 단발 중에도 다리는 안 멈춤.
         self._target_w['lower'] = dict(loco_w)
@@ -2063,7 +2258,13 @@ class ZombieGame(ShowBase):
         if self._swap_state != 'idle':
             return  # 무기 교체(스왑) 모션 중 — 발사 안 함
         if self.ammo <= 0:
-            return  # 빈 탄창 — 발사 안 함 (R 로 재장전)
+            # 빈 탄창 — 발사 대신 빈총 클릭음 (권총·소총 공통). 연타/연사 방지 쿨다운.
+            if self._reload_oneshot:
+                return
+            if self.sfx_empty is not None and self._empty_click_t <= 0:
+                self.sfx_empty.play()
+                self._empty_click_t = 0.35
+            return  # R 로 재장전
         if self.shoot_cooldown_t > 0:
             return  # 발사 간격 쿨다운
         if 'Shoot' not in self.anim_names or self._reload_oneshot:
@@ -2080,8 +2281,11 @@ class ZombieGame(ShowBase):
         # 히트 판정 — 카메라 위치에서 yaw+pitch 방향으로 ray, 각 좀비의 3 zone
         # (head/body/foot) sphere 와 교차 검사. 가장 가까운 zone 에 damage.
         self._resolve_shot_hit()
-        # hands 만 Shoot 자세로 — 다리/상체는 그대로.
-        self.ybot.play('Shoot', partName='hands')
+        # 권총 등은 hands 만 Shoot 단발 자세로. 소총은 그 포즈(권총 파지)가 어색해서
+        # 생략 → 손은 소총 파지 자세 유지, 권총처럼 몸 반동(뒤로 밀림)만. (oneshot 도 스킵)
+        is_rifle = (name == 'rifle')
+        if not is_rifle:
+            self.ybot.play('Shoot', partName='hands')
         self.recoil_back = self.recoil_shoot_back
         self.slide_recoil = self.slide_recoil_kick
         # Muzzle flash — anchor 에 parent 라 위치는 자동. show + timer 만.
@@ -2094,41 +2298,45 @@ class ZombieGame(ShowBase):
             self.tracer.setHpr(self.player_yaw, self.player_pitch, 0)
             self.tracer.show()
             self.tracer_t = self.tracer_dur
-        self._hands_oneshot = True
-        self._target_w['hands'] = {
-            a: (1.0 if a == 'Shoot' else 0.0) for a in self.anim_names
-        }
-        self._hands_token += 1
-        token = self._hands_token
-        dur = self.ybot.getDuration('Shoot')
-        back_after = max(dur - self.blend_out_time, 0.05)
+        if not is_rifle:
+            self._hands_oneshot = True
+            self._target_w['hands'] = {
+                a: (1.0 if a == 'Shoot' else 0.0) for a in self.anim_names
+            }
+            self._hands_token += 1
+            token = self._hands_token
+            dur = self.ybot.getDuration('Shoot')
+            back_after = max(dur - self.blend_out_time, 0.05)
 
-        def _back(task, t=token):
-            if t != self._hands_token:
+            def _back(task, t=token):
+                if t != self._hands_token:
+                    return Task.done
+                self._hands_oneshot = False
+                # upper 의 현재 target 으로 hands 동기화.
+                self._target_w['hands'] = dict(self._target_w['upper'])
                 return Task.done
-            self._hands_oneshot = False
-            # upper 의 현재 target 으로 hands 동기화.
-            self._target_w['hands'] = dict(self._target_w['upper'])
-            return Task.done
 
-        self.taskMgr.doMethodLater(back_after, _back, 'hands_return')
+            self.taskMgr.doMethodLater(back_after, _back, 'hands_return')
 
     def _play_reload_oneshot(self):
-        if ('Reload' not in self.anim_names or self._reload_oneshot
+        # 소총 장착 시 RifleReload, 그 외 Reload.
+        anim = ('RifleReload' if (self.weapon_name == 'rifle'
+                                  and 'RifleReload' in self.anim_names) else 'Reload')
+        if (anim not in self.anim_names or self._reload_oneshot
                 or self.kneel_state in ('going_down', 'going_up')):
             return
         # upper + hands 두 파트만 단발 (lower 는 locomotion 유지 → 달리며 재장전)
-        self.ybot.play('Reload', partName='upper')
-        self.ybot.play('Reload', partName='hands')
+        self.ybot.play(anim, partName='upper')
+        self.ybot.play(anim, partName='hands')
         self._reload_oneshot = True
         if self.sfx_reload is not None:
             self.sfx_reload.play()
-        rl = {a: (1.0 if a == 'Reload' else 0.0) for a in self.anim_names}
+        rl = {a: (1.0 if a == anim else 0.0) for a in self.anim_names}
         self._target_w['upper'] = dict(rl)
         self._target_w['hands'] = dict(rl)
         self._reload_token += 1
         token = self._reload_token
-        dur = self._reload_play_dur   # 사운드와 동기화된 실제 재생 시간
+        dur = self._reload_dur.get(anim, self.ybot.getDuration(anim))  # 동기화된 재생 시간
 
         # 슬라이드 래킹 — reload 후반에 기존 slide_recoil 재사용
         def _slide_kick(task, t=token):
@@ -2144,6 +2352,8 @@ class ZombieGame(ShowBase):
             if t != self._reload_token:
                 return Task.done
             self._reload_oneshot = False
+            # 재장전 자세 → 평상시 자세 복귀를 느린 블렌드로 부드럽게 (휙 튐 방지)
+            self._slow_blend_t = self.reload_return_slow_dur
             self.ammo = self.ammo_max   # 탄창 충전
             # upper/hands 를 다음 프레임에 locomotion 으로 강제 재평가시키는 sentinel
             self.current_anim = '__reload_done__'
@@ -2153,7 +2363,13 @@ class ZombieGame(ShowBase):
 
     def _update_blend(self, dt):
         # 지수 평활: 각 파트마다 current_w 를 target_w 쪽으로 비례 수렴.
-        alpha = min(1.0, dt * self.blend_speed)
+        # 재장전 복귀 중에는 느린 블렌드(slow_blend_speed)로 부드럽게.
+        if self._slow_blend_t > 0.0:
+            self._slow_blend_t -= dt
+            speed = self.slow_blend_speed
+        else:
+            speed = self.blend_speed
+        alpha = min(1.0, dt * speed)
         for p in self._parts:
             cur_w = self._current_w[p]
             tgt_w = self._target_w[p]
@@ -3146,6 +3362,8 @@ class ZombieGame(ShowBase):
         # 발사 쿨다운 감쇠
         if self.shoot_cooldown_t > 0:
             self.shoot_cooldown_t -= dt
+        if self._empty_click_t > 0:
+            self._empty_click_t -= dt
 
         # 연발(full-auto) — 좌클릭 hold 동안 쿨다운마다 자동 발사. (반자동은 클릭당 1발)
         if getattr(self, '_auto_fire', False) and getattr(self, '_mouse1_down', False):
@@ -3290,11 +3508,20 @@ class ZombieGame(ShowBase):
         ads_offset_world = (ads_right_w * self.ads_body_offset.x
                             + ads_fwd_w * self.ads_body_offset.y
                             + Vec3(0, 0, self.ads_body_offset.z)) * self.aim_t
+        # 무기별 보이는 몸 오프셋 — 항상 적용 (aim_t 무관). 카메라·히트박스 불변.
+        bo = self.weapon_body_offset
+        body_off_world = (ads_right_w * bo.x
+                          + ads_fwd_w * bo.y
+                          + Vec3(0, 0, bo.z))
 
         self.ybot.setPos(self.player_pos + recoil_offset
-                         + Vec3(0, 0, bob_z + self._swap_z) + ads_offset_world)
+                         + Vec3(0, 0, bob_z + self._swap_z)
+                         + ads_offset_world + body_off_world)
         # 일단 pitch=0 으로 세팅 → 아래에서 shoulder 피벗 트릭으로 pitch 적용.
-        self.ybot.setHpr(self.player_yaw + 180, 0, 0)
+        # 보이는 몸 회전 오프셋(weapon_body_hpr) 을 더함 — 몸+총 같이 회전(같은 축).
+        # 총은 손 본을 그대로 따라가므로 몸과 동일하게 움직임. H=x P=y R=z.
+        bh = self.weapon_body_hpr
+        self.ybot.setHpr(self.player_yaw + 180 + bh.x, bh.y, bh.z)
         # 애니메이션을 현재 시각으로 강제 동기화. 안 하면 joint 의 world 좌표가
         # 1프레임 lag 된 상태를 반환해서 카메라가 머리에서 떨림.
         self.ybot.update(force=True)
@@ -3316,7 +3543,8 @@ class ZombieGame(ShowBase):
         if (not self.editor_mode and self.rshoulder_joint is not None
                 and abs(self.player_pitch) > 0.001):
             sh_up = self.rshoulder_joint.getPos(self.render)
-            self.ybot.setHpr(self.player_yaw + 180, -self.player_pitch, 0)
+            self.ybot.setHpr(self.player_yaw + 180 + bh.x,
+                             -self.player_pitch + bh.y, bh.z)
             sh_pitched = self.rshoulder_joint.getPos(self.render)
             self.ybot.setPos(self.ybot.getPos() + (sh_up - sh_pitched))
 
@@ -3363,6 +3591,9 @@ class ZombieGame(ShowBase):
         if (self.weapon is not None
                 and self.right_hand_joint is not None
                 and not self.right_hand_joint.isEmpty()):
+            # 총은 손 본(=몸의 일부)을 그대로 따라감 → 몸과 완전히 같은 축으로 회전.
+            # (이전엔 weapon_body_hpr 보정으로 총만 발 원점 기준 역회전시켜 몸과 축이
+            #  달라 시야 바꿀 때 어긋났음. 그 보정 제거 → 몸+총 함께 움직임.)
             self.weapon_anchor.setPos(self.right_hand_joint.getPos(self.render))
             self.weapon_anchor.setHpr(self.right_hand_joint.getHpr(self.render))
 
