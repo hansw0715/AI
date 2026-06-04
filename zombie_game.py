@@ -2,7 +2,12 @@
 zombie_game — Mirror's Edge style 1인칭 좀비 슈터 (Panda3D)
 Stage 1: 1인칭 카메라 + Y Bot 풀바디 + 기본 입력.
 """
+import atexit
 import random
+import socket
+import struct
+import sys
+import threading
 from math import atan2, cos, degrees, radians, sin
 from pathlib import Path
 
@@ -43,11 +48,9 @@ loadPrcFileData('', 'matrix-palette #t')
 # Panda3D 기본 폰트엔 한글 글리프가 없어 OnscreenText / TextNode / DirectGui 에
 # 들어간 한글이 □ 로 깨진다. text-default-font 를 PRC 로 등록하면 ShowBase 가
 # 만들어지며 자동으로 이 폰트를 기본으로 쓴다 (위젯별 명시 지정 불필요).
-# 배포용은 OFL 라이선스 나눔고딕 (assets/fonts/NanumGothic.ttf). 그게 없으면
-# 픽셀 한글 폰트 (OFL 라이선스, x12y12pxMaruMinyaHangul). 게임 톤(sci-fi 픽셀
-# HUD)과 어울리고, 한글 + 영문 + 숫자 글리프 다 포함. fallback 은 윈도우 맑은 고딕.
-_FONT_BUNDLED = (Path(__file__).parent / 'assets' / 'fonts'
-                 / 'x12y12pxMaruMinyaHangul.ttf')
+# 폰트는 '온글잎 긍정' (레포 루트의 온글잎 긍정.ttf). 한글 + 영문 + 숫자 글리프
+# 다 포함. 그게 없으면 fallback 으로 윈도우 맑은 고딕(malgun.ttf) 을 쓴다.
+_FONT_BUNDLED = Path(__file__).parent / '온글잎 긍정.ttf'
 _FONT_FALLBACK = Path('C:/Windows/Fonts/malgun.ttf')
 _FONT_PATH = _FONT_BUNDLED if _FONT_BUNDLED.exists() else _FONT_FALLBACK
 loadPrcFileData('', f'text-default-font {_FONT_PATH.as_posix()}')
@@ -129,6 +132,18 @@ ENABLE_MUZZLE_MARKER = True
 RIFLE_PATH = Filename.from_os_specific(
     str(SCRIPT_DIR / 'assets' / 'weapons' / 'low-poly_armalite_ar-10.glb')
 )
+
+# ── 온라인(1:1 멀티) 릴레이 서버 ───────────────────────────────────────────
+# 'python zombie_game.py --online' 일 때만 이 서버에 바깥으로 TCP 접속한다.
+# 서버는 raw 바이트 중계기(NAT 통과/포트포워딩 불필요) — 한쪽이 보낸 20바이트
+# 프레임을 그대로 반대쪽에 흘려준다. 프레이밍/언패킹은 클라(여기)가 책임짐.
+# Fly 에 배포한 릴레이(앱 tcp-relay-1v1, dedicated v4) — 포트는 8080.
+RELAY_HOST = "37.16.31.147"
+RELAY_PORT = 8080
+# 내 상태 패킷 포맷: (pos.x, pos.y, pos.z, yaw, pitch) = 고정 20바이트.
+NET_STATE_FMT = '<5f'
+NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 20
+NET_SEND_HZ = 25.0                                # 송신 스로틀(20~30Hz 권장)
 
 # 무기별 스탯 — _equip_weapon 이 적용. ammo_max=탄창, cooldown=발사간격(s),
 # auto=연발(mouse1 hold 연사), head_onekill=헤드샷 즉사.
@@ -978,8 +993,21 @@ class Gate:
 
 
 class ZombieGame(ShowBase):
-    def __init__(self):
+    def __init__(self, online=False):
         super().__init__()
+
+        # ── 온라인(1:1 멀티) 모드 플래그 + 네트워크 상태 ────────────────────
+        # online=True ('--online') 일 때만 소켓 접속 + 상대 아바타 + 좀비/웨이브
+        # 정지 + 튜닝키 차단. 싱글(False)은 아래 변수들을 일절 안 쓰므로 동작 동일.
+        self.online_mode = online
+        self.remote_state = None      # 수신 스레드가 최신 (x,y,z,yaw,pitch) 저장
+        self.remote_avatar = None     # 상대 3인칭 아바타 Actor (online 일 때만 생성)
+        self._sock = None
+        self._net_alive = False
+        self._net_send_t = 0.0        # 송신 스로틀 누적(초)
+        self._remote_smooth = None    # 보간된 현재 위치 Vec3
+        self._remote_prev = None      # 직전 프레임 위치(애니 run/idle 판정용)
+        self._remote_anim = None      # 현재 상대 아바타 루프 애니 이름
 
         # 윈도우/마우스
         props = WindowProperties()
@@ -1252,7 +1280,8 @@ class ZombieGame(ShowBase):
         # 총구(muzzle) marker — 평소엔 비활성. ENABLE_MUZZLE_MARKER=True 일 때만
         # 붙는다 (muzzle_marker.py). RIFLE_MUZZLE_POS 재조정용 튜닝 하네스.
         self.muzzle_marker = None
-        if ENABLE_MUZZLE_MARKER:
+        if ENABLE_MUZZLE_MARKER and not self.online_mode:
+            # 멀티에선 개발용 튜닝 하네스(L 토글 포함) 안 붙임.
             from muzzle_marker import MuzzleMarker
             self.muzzle_marker = MuzzleMarker(self)
         print('[weapon-tune] B로 모드 순환(weapon→body→both→ads) | '
@@ -1346,19 +1375,6 @@ class ZombieGame(ShowBase):
         self._combo_window = 0.0        # 콤보 유지 남은 시간(초)
         self.kill_combo_dur = 5.0       # 연속킬 인정 시간
         self.kills = 0                  # 총 처치 수 (HUD)
-
-        # ── 포인트(연산 자원) ───────────────────────────────────────────────
-        # 적 처치 시 "마지막에 맞힌 부위" 기준으로 적립. 숫자만 바꾸면 밸런싱 끝.
-        #   other(팔·다리 = 데미지 5 받는 곳) = 기준점
-        #   body(몸통샷 처치)  = 기준점 + 2
-        #   head(헤드샷 처치)  = 기준점 + 5
-        self.points = 0
-        self.KILL_POINTS_BASE = 10              # other(사지) 처치 기준 점수 ← 취향대로
-        self.KILL_POINTS = {
-            'other': self.KILL_POINTS_BASE,
-            'body':  self.KILL_POINTS_BASE + 2,
-            'head':  self.KILL_POINTS_BASE + 5,
-        }
 
         # 피격 사운드 — 부위(head/body/other) 상관없이 Voicy_Headshot 으로 통일.
         # 연사로 빠르게 겹칠 수 있어 풀로 로드해 라운드로빈 재생.
@@ -1468,6 +1484,13 @@ class ZombieGame(ShowBase):
         self.gates = []
         self._damage_numbers = []     # [{np, t, dur}, ...] — _update 가 animate
         self._spawn_zombies()
+        # 온라인: 좀비/웨이브 완전 정지 — _spawn_points 만 비우면 _update 의 웨이브
+        # 매니저('if self._spawn_points:')가 통째로 안 돌아 스폰/인터미션/WAVE
+        # 메시지가 전부 멈춘다. (다른 데 if 흩뿌리지 않는다.) 좀비 목록도 비움.
+        if self.online_mode:
+            self._spawn_points = []
+            self.zombies = []
+            self._setup_online()      # 상대 아바타 생성 + 릴레이 접속(데몬 수신 스레드)
 
         # 메인 루프
         self.taskMgr.add(self._update, 'game_update')
@@ -1617,27 +1640,30 @@ class ZombieGame(ShowBase):
         #   이동(POS):  ←/→ = X(좌/우),  ↑/↓ = Y(앞/뒤, 총신),  PageUp/Down = Z(위/아래)
         #   회전(HPR):  [ ] = H(좌우 yaw),  ; ' = P(상하 pitch),  , . = R(roll)
         #   P = 현재 값 PowerShell 출력 + 화면 표시
-        weapon_pos_binds = {
-            'arrow_right': (0,  1), 'arrow_left': (0, -1),   # ±X
-            'arrow_up':    (1,  1), 'arrow_down': (1, -1),   # ±Y (총신 전후)
-            'page_up':     (2,  1), 'page_down':  (2, -1),   # ±Z
-        }
-        for key, args in weapon_pos_binds.items():
-            self.accept(key, self._nudge_weapon_pos, list(args))
-            self.accept(f'{key}-repeat', self._nudge_weapon_pos, list(args))
-        # Panda3D 는 구두점 키를 'bracketleft' 같은 단어가 아니라 글자 그대로
-        # ('[' / ']' / ';' / "'" / ',' / '.') 이벤트로 보낸다.
-        weapon_hpr_binds = {
-            ']': (0,  1), '[': (0, -1),   # ±H (yaw)
-            "'": (1,  1), ';': (1, -1),   # ±P (pitch)
-            '.': (2,  1), ',': (2, -1),   # ±R (roll)
-        }
-        for key, args in weapon_hpr_binds.items():
-            self.accept(key, self._nudge_weapon_hpr, list(args))
-            self.accept(f'{key}-repeat', self._nudge_weapon_hpr, list(args))
+        # 멀티(online_mode)에선 실수로 총 위치가 틀어지지 않게 이 개발용 키들을
+        # 아예 바인딩하지 않는다 (B/P/화살표/PgUp·Dn/[ ];'/, . 전부).
+        if not self.online_mode:
+            weapon_pos_binds = {
+                'arrow_right': (0,  1), 'arrow_left': (0, -1),   # ±X
+                'arrow_up':    (1,  1), 'arrow_down': (1, -1),   # ±Y (총신 전후)
+                'page_up':     (2,  1), 'page_down':  (2, -1),   # ±Z
+            }
+            for key, args in weapon_pos_binds.items():
+                self.accept(key, self._nudge_weapon_pos, list(args))
+                self.accept(f'{key}-repeat', self._nudge_weapon_pos, list(args))
+            # Panda3D 는 구두점 키를 'bracketleft' 같은 단어가 아니라 글자 그대로
+            # ('[' / ']' / ';' / "'" / ',' / '.') 이벤트로 보낸다.
+            weapon_hpr_binds = {
+                ']': (0,  1), '[': (0, -1),   # ±H (yaw)
+                "'": (1,  1), ';': (1, -1),   # ±P (pitch)
+                '.': (2,  1), ',': (2, -1),   # ±R (roll)
+            }
+            for key, args in weapon_hpr_binds.items():
+                self.accept(key, self._nudge_weapon_hpr, list(args))
+                self.accept(f'{key}-repeat', self._nudge_weapon_hpr, list(args))
 
-        self.accept('b', self._toggle_tune_mode)  # B → 모드 순환(weapon→body→both)
-        self.accept('p', self._dump_weapon)   # P → 무기 위치/회전 콘솔 출력
+            self.accept('b', self._toggle_tune_mode)  # B → 모드 순환(weapon→body→both)
+            self.accept('p', self._dump_weapon)   # P → 무기 위치/회전 콘솔 출력
 
     def _set_key(self, k, v):
         self.keys[k] = v
@@ -1659,6 +1685,12 @@ class ZombieGame(ShowBase):
         except Exception as e:
             print(f'[weapon] {name} load failed: {e}', flush=True)
             return
+        # AR-10 GLB 에 소품으로 딸려오는, 공중에 뜬 예비 탄창(총알 든 풀 탄창)과
+        # 낱알 총알을 제거. 총에 꽂힌 탄창(magempty.001)은 유지. 권총 등 해당
+        # 노드가 없는 모델에선 매칭 0개라 무해. (flatten 전에 원본 이름으로 매칭.)
+        for _prop in ('7.62x51 mag.001', '76251'):
+            for _np in model.findAllMatches(f'**/*{_prop}*'):
+                _np.removeNode()
         model.flattenLight()                # glTF RootNode self-transform 우회 (named node 보존)
         node = self.weapon_anchor.attachNewNode(f'{name}_weapon')
         model.reparentTo(node)
@@ -2014,6 +2046,12 @@ class ZombieGame(ShowBase):
         if not cfg:
             return 0.0, 0.0
         n = self._spray_shots   # 이번 버스트에서 이미 쏜 발수 (0=첫발)
+        # 소총: 가만히 있을 때 첫 두 발(n<2)은 무조건 조준점 정중앙(편차 0).
+        # 단 이동 중엔 적용 안 함 — 이동 중엔 첫발부터 퍼지는 게 맞음.
+        # (연발 3발째부터 퍼짐. idle 시 _spray_shots 리셋돼 첫 두 발 정확 보장.)
+        if cfg['mode'] == 'pattern' and n < 2 \
+                and not any(self.keys[k] for k in ('w', 'a', 's', 'd')):
+            return 0.0, 0.0
         if cfg['mode'] == 'pattern':
             # 소총: 약한 상승 중심 둘레로 사방(0~360°) 랜덤 콘. 연사할수록 콘이 커져
             # 위·아래·좌·우 골고루 튐 (한 방향 쏠림 방지).
@@ -2186,12 +2224,10 @@ class ZombieGame(ShowBase):
         self.sfx_foot[i].play()
 
     def _on_zombie_killed(self, zone):
-        """좀비 처치 시 호출 — 킬 카운트 + 부위별 포인트 적립 + 콤보 단계 갱신 + 킬 사운드.
-        zone: 마지막에 맞혀 죽인 부위('head'/'body'/'other'). 포인트·콤보 판정에 사용."""
+        """좀비 처치 시 호출 — 킬 카운트 + 콤보 단계 갱신 + 킬 사운드.
+        zone: 마지막에 맞혀 죽인 부위('head'/'body'/'other'). 콤보 판정에 사용."""
         headshot = (zone == 'head')
         self.kills += 1
-        # 부위별 포인트 적립 (혹시 모를 미정의 zone 은 기준점으로 폴백).
-        self.points += self.KILL_POINTS.get(zone, self.KILL_POINTS_BASE)
         # 직전 킬 5초 이내 + 이번이 헤드샷이면 단계 상승(최대 5), 아니면 1로 리셋.
         if headshot and self._combo_window > 0.0:
             self._kill_tier = min(self._kill_tier + 1, 5)
@@ -3076,15 +3112,6 @@ class ZombieGame(ShowBase):
             parent=self.a2dBottomLeft)
         self.php_num.setBin('fixed', 22)
 
-        # 좌하단 — 연산 자원(포인트). 코어 무결성 바가 숨김이라 비어 있는 코너에 표시.
-        # 처치로 적립 → 추후 Wall Buy 무기 구매 / 구역 개방 비용으로 사용 예정.
-        self.hud_points_lbl = OnscreenText(
-            text='연산 자원', pos=(0.05, 0.215), scale=0.036,
-            fg=HUD_CYAN_DIM, align=TextNode.ALeft, mayChange=True, parent=BL)
-        self.hud_points_num = OnscreenText(
-            text='0', pos=(0.05, 0.120), scale=0.080,
-            fg=HUD_WHITE, align=TextNode.ALeft, mayChange=True, parent=BL)
-
         # 우하단 — 탄약 카운터. 라벨("정화 카트리지")·카트리지 아이콘 UI 제거하고
         # "현재/최대" 숫자(예: 3/8, 7/25)만 표시. 재장전 중엔 위에 "reloading...".
         self.hud_ammo_num = OnscreenText(
@@ -3244,8 +3271,9 @@ class ZombieGame(ShowBase):
         # 웨이브 모드 HUD — 총 처치 수 + 현재 웨이브/남은 적
         alive = sum(1 for z in self.zombies if z.hp > 0)
         self.hud_kills_num.setText(f'{self.kills:02d}')
-        self.hud_points_num.setText(f'{self.points:,}')
-        if self.wave_active:
+        if self.online_mode:
+            self.hud_zone.setText('')   # 멀티: "WAVE N 남은 적" 표시 제거
+        elif self.wave_active:
             self.hud_zone.setText(f'WAVE {self.wave}  남은 적 {alive}')
         elif self.wave >= 1:
             self.hud_zone.setText(f'WAVE {self.wave + 1} 준비…')
@@ -3397,6 +3425,135 @@ class ZombieGame(ShowBase):
                     continue
         return Task.done
 
+    # --- 온라인(1:1 멀티) -----------------------------------------------------
+    # 1단계: 두 플레이어가 서로 보이고 움직임이 동기화되는 것만. 사격/피격/라운드/
+    # 점수/리스폰 없음. 모든 메서드는 online_mode 일 때만 호출된다.
+
+    def _setup_online(self):
+        """상대 3인칭 아바타 생성 + 릴레이 서버 접속(데몬 수신 스레드 시작)."""
+        self._setup_remote_avatar()
+        self._connect_relay()
+
+    def _setup_remote_avatar(self):
+        """상대용 ybot Actor 하나 더 생성 — 평범한 3인칭 월드 Actor.
+        내 1인칭 트릭(머리뼈 카메라 부착/어깨 피벗 pitch/walk-bob/hips anchor 보정/
+        바디 메쉬 숨김)은 일절 적용하지 않는다. 첫 패킷 수신 전까지 숨김."""
+        av = Actor(BAM_PATH)
+        av.reparentTo(self.render)
+        av.setPos(0, 0, 0)
+        av.setH(180)                  # self.ybot 과 동일한 +180 기준
+        idle = 'Idle' if 'Idle' in self.anim_names else (
+            self.anim_names[0] if self.anim_names else None)
+        if idle:
+            av.loop(idle)
+            self._remote_anim = idle
+        av.hide()                     # remote_state 도착 전엔 안 보이게
+        self.remote_avatar = av
+        print('[net] 상대 아바타 준비 (첫 패킷까지 숨김)', flush=True)
+
+    def _connect_relay(self):
+        """릴레이 서버에 TCP 접속. 실패해도 크래시 없이 경고만 찍고 계속(싱글처럼)."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect((RELAY_HOST, RELAY_PORT))
+            s.settimeout(None)        # 이후 blocking recv/send
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self._sock = s
+            self._net_alive = True
+            atexit.register(self._net_shutdown)   # 프로세스 종료 시 소켓 정리
+            threading.Thread(target=self._net_recv_loop, daemon=True).start()
+            print(f'[net] 릴레이 접속 성공 {RELAY_HOST}:{RELAY_PORT}', flush=True)
+        except Exception as e:
+            self._sock = None
+            self._net_alive = False
+            print(f'[net] 릴레이 접속 실패 ({e}) — 네트워크 없이 계속', flush=True)
+
+    def _net_recv_loop(self):
+        """데몬 스레드: TCP 스트림에서 정확히 NET_STATE_SIZE(20)바이트씩 프레임을
+        모아 언패킹 → self.remote_state 에 최신값만 저장. 부분수신/연결끊김 안전."""
+        sock = self._sock
+        buf = b''
+        try:
+            while self._net_alive:
+                data = sock.recv(4096)
+                if not data:
+                    break             # 상대/서버 연결 종료(스트림 끝)
+                buf += data
+                # TCP 는 스트림 — 20바이트가 다 모였을 때만 한 프레임으로 해석.
+                while len(buf) >= NET_STATE_SIZE:
+                    frame = buf[:NET_STATE_SIZE]
+                    buf = buf[NET_STATE_SIZE:]
+                    try:
+                        x, y, z, yaw, pitch = struct.unpack(NET_STATE_FMT, frame)
+                    except struct.error:
+                        continue
+                    self.remote_state = (x, y, z, yaw, pitch)  # 참조 교체(원자적)
+        except OSError:
+            pass                      # 끊김 — 마지막 remote_state 유지
+        finally:
+            self._net_alive = False
+        print('[net] 수신 스레드 종료', flush=True)
+
+    def _net_send(self, dt):
+        """내 위치/시점을 ~NET_SEND_HZ 로 스로틀해서 고정 20바이트로 전송."""
+        if self._sock is None or not self._net_alive:
+            return
+        self._net_send_t += dt
+        if self._net_send_t < (1.0 / NET_SEND_HZ):
+            return
+        self._net_send_t = 0.0
+        try:
+            pkt = struct.pack(NET_STATE_FMT,
+                              self.player_pos.x, self.player_pos.y,
+                              self.player_pos.z, self.player_yaw,
+                              self.player_pitch)
+            self._sock.sendall(pkt)
+        except OSError as e:
+            print(f'[net] 송신 실패 ({e}) — 연결 종료', flush=True)
+            self._net_alive = False
+
+    def _update_remote_avatar(self, dt):
+        """수신한 remote_state 로 상대 아바타를 부드럽게 보간 이동 + 방향 + run/idle.
+        몸 전체 pitch 는 적용 안 함(요청대로). 데이터 없으면 숨김 유지."""
+        av = self.remote_avatar
+        if av is None:
+            return
+        rs = self.remote_state        # 스레드가 최신값으로 교체 — 한 번만 읽음
+        if rs is None:
+            return                    # 아직 첫 패킷 없음 → 숨김 유지(크래시 없음)
+        target = Vec3(rs[0], rs[1], rs[2])
+        if self._remote_smooth is None:
+            self._remote_smooth = Vec3(target)   # 첫 패킷은 즉시 배치(점프 방지)
+            self._remote_prev = Vec3(target)
+            av.show()
+        else:
+            # 핑 대응 — 현재→목표 지수 보간(계수 12). 순간이동/덜덜 떨림 방지.
+            self._remote_smooth += ((target - self._remote_smooth)
+                                    * min(1.0, dt * 12.0))
+        av.setPos(self._remote_smooth)
+        av.setH(rs[3] + 180)          # yaw 만 — pitch 로 몸 전체를 기울이지 않음
+        # 애니: 직전 프레임 대비 이동 속도로 run/idle 판정. 실제 있는 이름만 사용.
+        moved = (self._remote_smooth - self._remote_prev).length()
+        self._remote_prev = Vec3(self._remote_smooth)
+        run = 'RunForward' if 'RunForward' in self.anim_names else None
+        idle = 'Idle' if 'Idle' in self.anim_names else None
+        want = run if (run and moved > dt * 0.5) else idle   # >0.5 m/s 면 run
+        if want and want != self._remote_anim:
+            av.loop(want)
+            self._remote_anim = want
+
+    def _net_shutdown(self):
+        """소켓 close + 수신 스레드 종료 신호(데몬이라 프로세스와 함께 사라짐)."""
+        self._net_alive = False
+        s = self._sock
+        self._sock = None
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
     # --- main loop ----------------------------------------------------------
 
     def _update(self, task):
@@ -3408,6 +3565,12 @@ class ZombieGame(ShowBase):
         # pause 직후 첫 프레임 wall-clock 누적 dt 폭발 cap — 좀비 워프 방지.
         if dt > 0.1:
             dt = 0.1
+
+        # ── 온라인: 내 상태 송신(스로틀) + 상대 아바타 보간/애니 ──────────────
+        # 싱글이면 online_mode=False 라 통째로 건너뜀(네트워크 코드 안 탐).
+        if self.online_mode:
+            self._net_send(dt)
+            self._update_remote_avatar(dt)
 
         # 애니메이션 블렌딩 weight 수렴
         self._update_blend(dt)
@@ -3734,4 +3897,6 @@ class ZombieGame(ShowBase):
 
 
 if __name__ == '__main__':
-    ZombieGame().run()
+    # 인자 없음 → 기존 그대로 싱글(100% 보존). '--online' → 멀티(릴레이 접속).
+    online = '--online' in sys.argv
+    ZombieGame(online=online).run()
