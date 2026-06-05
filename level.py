@@ -310,3 +310,89 @@ def build_level(render, draw_wall_cards=True):
         ],
     }
     return LevelCollider(walls), level_data
+
+
+def _barrier_shimmer(parent, wall, color=IMMUNE_COLOR, alpha=0.25, height=WALL_HEIGHT):
+    """스폰 배리어용 반투명 shimmer 카드 — 벽 중심선을 따라 세운 빛벽 한 장.
+    Wall.make_card 와 같은 배치(중심/heading)지만 단색 벽이 아니라 alpha 반투명.
+    해제 시 런타임이 이 카드의 setColor alpha 를 0 으로 fade out 한다
+    (_floor_stain 의 setColor+Transparency 방식과 동일). 카드 NodePath 반환."""
+    length = hypot(wall.bx - wall.ax, wall.by - wall.ay)
+    holder = parent.attachNewNode('spawn_barrier_shimmer')
+    holder.setPos((wall.ax + wall.bx) / 2.0, (wall.ay + wall.by) / 2.0, 0.0)
+    holder.setH(degrees(atan2(wall.by - wall.ay, wall.bx - wall.ax)))
+    cm = CardMaker('shimmer')
+    cm.setFrame(-length / 2.0, length / 2.0, 0.0, height)
+    card = holder.attachNewNode(cm.generate())
+    card.setColor(color[0], color[1], color[2], alpha)
+    card.setTransparency(True)
+    card.setTwoSided(True)
+    card.setLightOff()
+    card.setDepthWrite(False)
+    return card
+
+
+def build_arena(render, draw_wall_cards=True):
+    """1대1 PvP 슈터용 대칭 아레나. (LevelCollider, arena_data) 반환.
+
+    build_level 과 동일한 Wall / LevelCollider / room_walls / pillar 헬퍼와 좌표계
+    (Z-up, Y-forward, m)를 그대로 사용한다. 새 충돌 코드는 만들지 않는다 —
+    충돌/총알 차단은 호출측이 LevelCollider.resolve / segment_blocked 로 처리.
+
+    레이아웃 (원점 점대칭 — 두 스폰이 완전히 공평):
+      외벽 24×36 (x[-12,12], y[-18,18]), 4면 막힘.
+      스폰 A (0,-15,yaw0=북향) / 스폰 B (0,15,yaw180=남향).
+      엄폐물은 (x,y) 에 두면 (-x,-y) 에도 동일 — 중앙 기둥이 일직선 사거리 차단.
+
+    스폰 배리어(arena_data['spawn_barriers'])는 walls 에 미리 넣지 않는다 —
+    런타임이 직접 collider.walls 에 add(가둠) 했다가 5초 후 remove(해제)한다.
+    draw_wall_cards 여도 배리어는 단색 벽 카드를 그리지 않고, 대신 반투명 shimmer
+    카드(arena_data['shimmer_cards'])만 둬서 해제 시 fade out 한다.
+    """
+    root = render.attachNewNode('arena')
+    walls = []
+
+    # ── 외벽 24m × 36m — 4면 막힘(문 없음). ────────────────────────────────
+    walls += room_walls(-12, 12, -18, 18)
+
+    # ── 엄폐물 (원점 대칭 — (x,y) 마다 (-x,-y) 동일) ───────────────────────
+    walls += pillar(0, 0)            # 중앙 기둥 — 양 스폰 일직선 사거리 차단(핵심)
+    walls += pillar(-5, 5)           # 저각 엄폐 한 쌍
+    walls += pillar(5, -5)
+    walls += [Wall(-8, 2, -8, -2)]   # 좌측 세로 짧은 벽 4m
+    walls += [Wall(8, -2, 8, 2)]     # 우측 세로 짧은 벽 4m (대칭)
+    walls += pillar(-6, -8)          # 추가 엄폐 한 쌍
+    walls += pillar(6, 8)
+
+    if draw_wall_cards:
+        for w in walls:
+            w.make_card(root)
+
+    # ── 스폰 배리어 (walls 에 안 넣음 — 런타임이 add/remove) ───────────────
+    # 각 스폰을 6m × 6m 포켓으로 가둠: 입구 가로벽 + 좌우 세로벽(x=±3).
+    # 포켓 뒤쪽은 외벽(y=±18)이 막아 준다.
+    spawn_barriers = [
+        # 스폰 A 포켓 (0,-15): 입구 y=-12, 좌우 x=±3 (y[-18,-12])
+        Wall(-3, -12, 3, -12),
+        Wall(-3, -18, -3, -12),
+        Wall(3, -18, 3, -12),
+        # 스폰 B 포켓 (0,15): 입구 y=12, 좌우 x=±3 (y[12,18])
+        Wall(-3, 12, 3, 12),
+        Wall(-3, 12, -3, 18),
+        Wall(3, 12, 3, 18),
+    ]
+    shimmer_cards = []
+    if draw_wall_cards:
+        for w in spawn_barriers:
+            shimmer_cards.append(_barrier_shimmer(root, w))
+
+    arena_data = {
+        'spawns': [(0, -15, 0), (0, 15, 180)],   # (x, y, yaw)
+        'spawn_barriers': spawn_barriers,         # 런타임이 add/remove
+        'shimmer_cards': shimmer_cards,           # 해제 시 fade out
+        # build_level 호환용 빈 키 (zombie_game._spawn_zombies 가 참조해도 안전).
+        'rooms': [],
+        'gates': [],
+        'cage_stain': None,
+    }
+    return LevelCollider(walls), arena_data

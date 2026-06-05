@@ -8,7 +8,7 @@ import socket
 import struct
 import sys
 import threading
-from math import atan2, cos, degrees, radians, sin
+from math import atan2, ceil, cos, degrees, radians, sin
 from pathlib import Path
 
 from direct.actor.Actor import Actor
@@ -28,7 +28,7 @@ from panda3d.core import (
 )
 
 from level import (PLAYER_RADIUS, ZOMBIE_RADIUS, WALL_HEIGHT, Wall,
-                   IMMUNE_COLOR, LESION_COLOR, build_level)
+                   IMMUNE_COLOR, LESION_COLOR, build_level, build_arena)
 from weapon_config import (
     WEAPON_LOCAL_SCALE, WEAPON_LOCAL_POS, WEAPON_LOCAL_HPR, WEAPON_MUZZLE_POS,
     RIFLE_LOCAL_SCALE, RIFLE_LOCAL_POS, RIFLE_LOCAL_HPR, RIFLE_MUZZLE_POS,
@@ -1010,8 +1010,11 @@ class Gate:
 
 
 class ZombieGame(ShowBase):
-    def __init__(self, online=False):
+    def __init__(self, online=False, spawn_b=False):
         super().__init__()
+        # 아레나 스폰 측 — False=스폰 A(0,-15 북향), True=스폰 B(0,15 남향).
+        # 두 클라이언트가 겹치지 않게 한쪽은 '--p2' 로 띄운다(릴레이는 역할 배정 못함).
+        self._spawn_b = spawn_b
 
         # ── 온라인(1:1 멀티) 모드 플래그 + 네트워크 상태 ────────────────────
         # online=True ('--online') 일 때만 소켓 접속 + 상대 아바타 + 좀비/웨이브
@@ -1060,6 +1063,17 @@ class ZombieGame(ShowBase):
         self._match_over = False          # 매치 종료 플래그(이후 점수/리스폰 정지)
         self._remote_tracer = None        # 상대 총알 궤적 노드(online 일 때 생성)
         self._remote_tracer_t = 0.0       # 상대 트레이서 표시 남은 시간(초)
+        # PvP 아레나 — 스폰 배리어로 5초 가둠 후 해제(FIGHT). build_arena 데이터.
+        self._arena_data = None
+        self._spawn_barriers = []         # 런타임이 collider.walls 에 add/remove
+        self._shimmer_cards = []          # 배리어 반투명 카드(해제 시 fade)
+        self._barriers_active = False     # 배리어가 walls 에 들어가 있는 동안 True
+        self._countdown_t = None          # None=상대 대기, 5.0→0 카운트다운
+        self._fight_t = 0.0               # FIGHT! 배너 잔여 표시(초)
+        self._shimmer_a = 0.25            # shimmer 현재 alpha (fade 용)
+        self._shimmer_fading = False
+        self._spawn_pos = Vec3(0, 0, 0)   # 리스폰 지점(아레나면 내 스폰)
+        self._spawn_yaw = 0.0
 
         # 윈도우/마우스
         props = WindowProperties()
@@ -1083,9 +1097,16 @@ class ZombieGame(ShowBase):
         # 키트 .bam 이 있으면 단색 벽 카드를 끄고(z-fighting 방지) kit_map 메쉬로 대체.
         import os
         kit_available = USE_KIT_MAP and os.path.isfile("assets/kit/Wall_1.bam")
-        self.level_collider, self.level_data = build_level(
-            self.render, draw_wall_cards=not kit_available)
         self.kit_root = None
+        if self.online_mode:
+            # 1대1 PvP — 좀비 캠페인 레벨 대신 대칭 아레나. kit_map 미적용(단색 벽).
+            self.level_collider, self.level_data = build_arena(
+                self.render, draw_wall_cards=True)
+            self._arena_data = self.level_data
+            kit_available = False
+        else:
+            self.level_collider, self.level_data = build_level(
+                self.render, draw_wall_cards=not kit_available)
         if kit_available:
             # kit_map.py 가 같은 collider.walls 위에 Quaternius sci-fi 키트 메쉬를
             # 입힌다 (보이는 벽 = 부딪히는 벽).
@@ -1650,9 +1671,9 @@ class ZombieGame(ShowBase):
         self.flashlight = None
 
     def _make_ground(self):
-        # level.py 의 5방 라인업 (y=-2 ~ y=70) 을 여유 있게 덮음.
+        # level.py 의 5방 라인업(y=-2~70) + 아레나(y=-18~18)를 모두 여유 있게 덮음.
         cm = CardMaker('ground')
-        cm.setFrame(-32, 32, -8, 76)
+        cm.setFrame(-32, 32, -20, 76)
         gnd = self.render.attachNewNode(cm.generate())
         gnd.setHpr(0, -90, 0)        # XY 평면으로 눕히기 — 법선 +Z 위
         gnd.setColor(0.55, 0.55, 0.58, 1)
@@ -1661,7 +1682,7 @@ class ZombieGame(ShowBase):
         # setHpr(0, 90, 0) 으로 P=+90 → 카드 법선이 -Z 로 뒤집힘 → 아래에서 비추는
         # 플래시 빛만 받음. 색은 바닥보다 어둡게 (실내 천장 톤).
         cm_c = CardMaker('ceiling')
-        cm_c.setFrame(-32, 32, -8, 76)
+        cm_c.setFrame(-32, 32, -20, 76)
         ceil = self.render.attachNewNode(cm_c.generate())
         ceil.setHpr(0, 90, 0)
         ceil.setZ(WALL_HEIGHT)
@@ -2179,7 +2200,9 @@ class ZombieGame(ShowBase):
         remote_hit_pos = None
         if self.online_mode:
             res = self._remote_hit_test(cam_pos, ray_dir, best_t)
-            if res is not None:
+            # 총알이 벽을 못 뚫게 — 나→상대 2D 경로가 벽으로 막히면 명중 취소.
+            if res is not None and not self.level_collider.segment_blocked(
+                    cam_pos.x, cam_pos.y, res[2].x, res[2].y):
                 best_t, best_zone, remote_hit_pos = res
                 best_z = None
                 best_barrier = None
@@ -3126,6 +3149,12 @@ class ZombieGame(ShowBase):
             fg=(1, 1, 1, 1), align=TextNode.ACenter, mayChange=True,
             parent=self.aspect2d)
         self.hud_match_result.hide()
+        # 라운드 시작 카운트다운 — 화면 중앙 "5..1 / FIGHT!" (스폰 배리어 해제 타이밍).
+        self.hud_countdown = OnscreenText(
+            text='', pos=(0, 0.30), scale=0.20,
+            fg=(1, 0.92, 0.4, 1), align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d)
+        self.hud_countdown.hide()
 
         # 우상단 미니맵 — minimap.png (1040×1040, 정사각)
         # 가운데 도트는 별도 DirectFrame (위치/색 갱신용).
@@ -3517,7 +3546,24 @@ class ZombieGame(ShowBase):
     # 점수/리스폰 없음. 모든 메서드는 online_mode 일 때만 호출된다.
 
     def _setup_online(self):
-        """상대 3인칭 아바타 생성 + 릴레이 서버 접속(데몬 수신 스레드 시작)."""
+        """상대 3인칭 아바타 생성 + 릴레이 접속 + 아레나 스폰/배리어 세팅."""
+        # ── 내 스폰 위치 — 아레나 spawns[0]=A, [1]=B. '--p2' 면 B. ───────────
+        if self._arena_data is not None:
+            sp = self._arena_data['spawns'][1 if self._spawn_b else 0]
+            self._spawn_pos = Vec3(sp[0], sp[1], 0)
+            self._spawn_yaw = sp[2]
+            self.player_pos = Vec3(self._spawn_pos)
+            self.player_yaw = self._spawn_yaw
+            # 스폰 배리어로 즉시 가둠 — 양쪽 준비되면 5초 후 해제(FIGHT).
+            self._spawn_barriers = list(self._arena_data.get('spawn_barriers', []))
+            self._shimmer_cards = list(self._arena_data.get('shimmer_cards', []))
+            self.level_collider.walls.extend(self._spawn_barriers)
+            self._barriers_active = True
+            self._countdown_t = None      # 상대 아바타 보이면 카운트다운 시작
+            print(f'[arena] 스폰 {"B" if self._spawn_b else "A"} '
+                  f'({self.player_pos.x:.0f},{self.player_pos.y:.0f}) — 배리어 가둠',
+                  flush=True)
+
         self._setup_remote_avatar()
         self._connect_relay()
         # PvP 점수 HUD 표시 (먼저 10점 승리). 단일플레이에선 숨김 유지.
@@ -3648,6 +3694,57 @@ class ZombieGame(ShowBase):
         s.setVolume(vol)
         s.play()
         setattr(self, idx_attr, (i + 1) % len(pool))
+
+    # --- 아레나 스폰 배리어 라운드 흐름 -------------------------------------
+
+    def _arena_update(self, dt):
+        """스폰 배리어 흐름 — 양쪽 준비되면 5초 카운트다운, 끝나면 배리어 제거
+        (가둠 해제) + shimmer fade out + FIGHT! 배너. 아레나(online) 전용."""
+        # shimmer fade out (해제 후 진행)
+        if self._shimmer_fading and self._shimmer_cards:
+            self._shimmer_a = max(0.0, self._shimmer_a - dt / 0.6)
+            for card in self._shimmer_cards:
+                card.setColor(IMMUNE_COLOR[0], IMMUNE_COLOR[1], IMMUNE_COLOR[2],
+                              self._shimmer_a)
+            if self._shimmer_a <= 0.0:
+                self._shimmer_fading = False
+                for card in self._shimmer_cards:
+                    card.hide()
+        # FIGHT! 배너 잔여 시간
+        if self._fight_t > 0.0:
+            self._fight_t -= dt
+            if self._fight_t <= 0.0:
+                self.hud_countdown.hide()
+        # 카운트다운 — 배리어가 살아있는 동안만.
+        if not self._barriers_active:
+            return
+        if self._countdown_t is None:
+            # 상대 아바타가 보이면(첫 패킷) 양쪽 준비 완료 → 카운트다운 시작.
+            if self.remote_avatar is not None and not self.remote_avatar.isHidden():
+                self._countdown_t = 5.0
+                print('[arena] 양쪽 준비 — 5초 카운트다운 시작', flush=True)
+            return
+        self._countdown_t -= dt
+        if self._countdown_t > 0.0:
+            self.hud_countdown.setText(str(int(ceil(self._countdown_t))))
+            self.hud_countdown.show()
+        else:
+            self._arena_release()
+
+    def _arena_release(self):
+        """카운트다운 종료 — 배리어를 walls 에서 같은 객체로 remove(가둠 해제) +
+        shimmer fade 시작 + FIGHT! 배너. 이때부터 이동 자유 = 게임 시작."""
+        for w in self._spawn_barriers:
+            if w in self.level_collider.walls:
+                self.level_collider.walls.remove(w)
+        self._barriers_active = False
+        self._countdown_t = 0.0
+        self._shimmer_fading = True
+        self.hud_countdown.setText('FIGHT!')
+        self.hud_countdown.setFg((1, 0.45, 0.3, 1))
+        self.hud_countdown.show()
+        self._fight_t = 1.2
+        print('[arena] 배리어 해제 — FIGHT!', flush=True)
 
     def _handle_remote_events(self, rs):
         """패킷의 shot_seq/ reloading 변화를 감지해 상대 발사음·재장전 모션/소리 재생.
@@ -3843,8 +3940,9 @@ class ZombieGame(ShowBase):
                                    'pvp_respawn')
 
     def _pvp_respawn(self, task=None):
-        """스폰 지점(원점)으로 복귀 + 체력/탄창 회복."""
-        self.player_pos = Vec3(0, 0, 0)
+        """스폰 지점(아레나면 내 스폰)으로 복귀 + 체력/탄창 회복."""
+        self.player_pos = Vec3(self._spawn_pos)
+        self.player_yaw = self._spawn_yaw
         self.player_vz = 0.0
         self.on_ground = True
         self.core_integrity = self.core_integrity_max
@@ -4051,6 +4149,7 @@ class ZombieGame(ShowBase):
         if self.online_mode:
             self._net_send(dt)
             self._update_remote_avatar(dt)
+            self._arena_update(dt)        # 스폰 배리어 카운트다운 + shimmer fade
 
         # 애니메이션 블렌딩 weight 수렴
         self._update_blend(dt)
@@ -4378,5 +4477,7 @@ class ZombieGame(ShowBase):
 
 if __name__ == '__main__':
     # 인자 없음 → 기존 그대로 싱글(100% 보존). '--online' → 멀티(릴레이 접속).
+    # '--p2' → 아레나 스폰 B(0,15) 로 시작(상대는 인자 없이 스폰 A). 한 명만 --p2.
     online = '--online' in sys.argv
-    ZombieGame(online=online).run()
+    spawn_b = '--p2' in sys.argv
+    ZombieGame(online=online, spawn_b=spawn_b).run()
