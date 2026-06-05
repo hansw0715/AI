@@ -1106,9 +1106,10 @@ class ZombieGame(ShowBase):
         self.DEATHCAM_DUR = 3.0
         self._deathcam_t = 0.0            # >0 이면 데스캠/유예 진행 중(끝나면 라운드 리셋)
         self._dead = False                # 내가 이번 라운드 사망자인가(시점 고정+시체)
-        self._corpse = None               # 죽은 내 몸 Actor(death 애니 재생)
+        self._corpse = None               # 죽은 사람(나 또는 상대) 시체 Actor
         self._death_yaw = 0.0             # 죽은 순간 방향(데스캠 카메라 각도용)
-        self._remote_death_anim = None    # 상대 아바타에 로드된 death 애니 이름
+        self._remote_death_anim = None    # (구) 미사용
+        self._remote_hidden_for_death = False  # 상대를 시체로 대체하며 av 숨겼는지
         # 스폰 자동 배정 — 세션 고정 랜덤 nonce. 상대 nonce 와 비교해 큰 쪽=A, 작은=B.
         self._nonce = random.randint(1, 0xFFFFFFFF)
         self._role_decided = False        # 첫 상대 패킷의 nonce 로 스폰 확정
@@ -4096,41 +4097,51 @@ class ZombieGame(ShowBase):
         else:
             self._enter_deathcam(victim=True)   # 3초 내 시체 위 3인칭 → 라운드 리셋
 
+    def _make_death_corpse(self, pos, h):
+        """현재 좀비가 죽을 때와 '똑같이' — 좀비 모델(X Bot) + DeathHeadshot 을 1.5배속
+        으로 재생하는 시체 Actor 생성. (DeathHeadshot 은 X Bot 본에서만 정상 스케일이라
+        플레이어 Y Bot 대신 좀비 모델로 시체를 만든다.) NodePath 반환."""
+        c = Actor(ZOMBIE_BAM)
+        c.reparentTo(self.render)
+        c.setPos(pos)
+        c.setH(h)
+        if ZOMBIE_DEATH_BAM.exists():
+            try:
+                c.loadAnims({Zombie.DEATH_ANIM: ZOMBIE_DEATH_BAM})
+                c.play(Zombie.DEATH_ANIM)
+                c.setPlayRate(Zombie.DEATH_PLAY_RATE, Zombie.DEATH_ANIM)
+            except Exception as e:
+                print('[pvp] 시체 death 애니 실패:', e, flush=True)
+        return c
+
     def _enter_deathcam(self, victim):
-        """사망 처리 3초 유예. victim=True(죽은 사람): 시점 고정 + 내 시체(death 애니)
-        를 머리 위 3인칭으로 본다. victim=False(죽인 사람): 3초 자유 이동, 상대 아바타는
-        쓰러진다. 3초 뒤 _arena_update 가 _exit_deathcam + 라운드 리셋."""
+        """사망 처리 3초 유예. victim=True(죽은 사람): 시점 고정 + 내 시체(현재 좀비와
+        동일한 DeathHeadshot)를 머리 위 3인칭으로 본다. victim=False(죽인 사람): 3초
+        자유 이동, 상대(죽은 자)는 시체로 쓰러짐. 3초 뒤 _exit_deathcam + 라운드 리셋."""
         if self._match_over:
             return
         self._deathcam_t = self.DEATHCAM_DUR
         if victim:
             self._dead = True
             self._death_yaw = self.player_yaw
-            # 1인칭 팔/총 숨기고, 그 자리에 death 애니 재생하는 시체 Actor 생성.
+            # 1인칭 팔/총 숨기고, 그 자리에 좀비식 death 시체 생성(데스캠으로 봄).
             self.ybot.hide()
             self.weapon_anchor.hide()
-            corpse = Actor(BAM_PATH)
-            corpse.reparentTo(self.render)
-            corpse.setPos(self.player_pos)
-            corpse.setH(self.player_yaw + 180)
-            # 모델 네이티브 'Death' 사용(올바른 스케일). 좀비와 동일하게 1.5배속.
-            if 'Death' in corpse.getAnimNames():
-                corpse.play('Death')
-                corpse.setPlayRate(Zombie.DEATH_PLAY_RATE, 'Death')
-            self._corpse = corpse
+            self._corpse = self._make_death_corpse(self.player_pos,
+                                                   self.player_yaw + 180)
             print('[pvp] 사망 — 3초 데스캠', flush=True)
         else:
-            # 상대(죽은 자)를 쓰러뜨리는 모션 — 상대 아바타에 death 애니 재생.
+            # 죽은 상대 — Y Bot 아바타 숨기고 그 자리에 좀비식 death 시체로 대체.
             av = self.remote_avatar
-            if av is not None and self._remote_death_anim is not None:
-                av.play(self._remote_death_anim)
-                av.setPlayRate(Zombie.DEATH_PLAY_RATE, self._remote_death_anim)  # 좀비와 동일 1.5x
-                self._remote_anim = self._remote_death_anim
-                self._remote_action_t = self.DEATHCAM_DUR   # loco 억제(쓰러진 채 유지)
+            if av is not None:
+                self._corpse = self._make_death_corpse(av.getPos(self.render),
+                                                       av.getH())
+                av.hide()
+                self._remote_hidden_for_death = True
             print('[pvp] 처치 — 3초 자유 이동', flush=True)
 
     def _exit_deathcam(self):
-        """데스캠 종료 — 시체 제거 + 1인칭 복구. (라운드 리셋 직전 호출.)"""
+        """데스캠 종료 — 시체 제거 + 1인칭/상대 아바타 복구. (라운드 리셋 직전 호출.)"""
         if self._corpse is not None:
             try:
                 self._corpse.cleanup()
@@ -4142,7 +4153,11 @@ class ZombieGame(ShowBase):
             self._dead = False
             self.ybot.show()
             self.weapon_anchor.show()
-        self._remote_action_t = 0.0   # 상대 death 모션 해제 → loco 자동 복귀
+        if self._remote_hidden_for_death:
+            self._remote_hidden_for_death = False
+            if self.remote_avatar is not None:
+                self.remote_avatar.show()
+        self._remote_action_t = 0.0
         self._remote_anim = None
 
     def _arena_round_reset(self):
