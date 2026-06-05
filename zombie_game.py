@@ -1053,6 +1053,11 @@ class ZombieGame(ShowBase):
         self._pvp_dead_t = 0.0            # 사망 후 리스폰까지 남은 시간(초; >0 이면 사망중)
         self._deaths = 0                  # 내가 죽은 누적 횟수(패킷에 실어 보냄)
         self._remote_last_deaths = None   # 상대 사망 누적값 마지막(첫=None; 증가=내 킬)
+        # PvP 점수 — 상대를 죽이면 내 점수 +1, 내가 죽으면 상대 점수 +1. 먼저 10점=승리.
+        self.WIN_SCORE = 10
+        self._my_score = 0                # 내가 상대를 처치한 횟수(= 내 점수)
+        self._enemy_score = 0             # 내가 죽은 횟수(= 상대 점수, self._deaths 와 동일)
+        self._match_over = False          # 매치 종료 플래그(이후 점수/리스폰 정지)
         self._remote_tracer = None        # 상대 총알 궤적 노드(online 일 때 생성)
         self._remote_tracer_t = 0.0       # 상대 트레이서 표시 남은 시간(초)
 
@@ -3109,6 +3114,19 @@ class ZombieGame(ShowBase):
             text='구역 확보 0%', pos=(-0.05, -0.255), scale=0.036,
             fg=HUD_CYAN, align=TextNode.ARight, mayChange=True, parent=R)
 
+        # ── PvP 점수(online 전용) — 상단 중앙 "내점수 : 상대점수", 먼저 10점이면 승리.
+        self.hud_score = OnscreenText(
+            text='0 : 0', pos=(0, 0.86), scale=0.085,
+            fg=(1, 1, 1, 0.96), align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d)
+        self.hud_score.hide()             # online 일 때만 _setup_online 에서 show
+        # 승/패 결과 배너 — 매치 종료 시 화면 중앙에 크게.
+        self.hud_match_result = OnscreenText(
+            text='', pos=(0, 0.12), scale=0.18,
+            fg=(1, 1, 1, 1), align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d)
+        self.hud_match_result.hide()
+
         # 우상단 미니맵 — minimap.png (1040×1040, 정사각)
         # 가운데 도트는 별도 DirectFrame (위치/색 갱신용).
         self.hud_map_img = self._hud_img(
@@ -3502,6 +3520,9 @@ class ZombieGame(ShowBase):
         """상대 3인칭 아바타 생성 + 릴레이 서버 접속(데몬 수신 스레드 시작)."""
         self._setup_remote_avatar()
         self._connect_relay()
+        # PvP 점수 HUD 표시 (먼저 10점 승리). 단일플레이에선 숨김 유지.
+        self.hud_score.show()
+        self._update_score_hud()
 
     def _setup_remote_avatar(self):
         """상대용 ybot Actor 하나 더 생성 — 평범한 3인칭 월드 Actor.
@@ -3769,6 +3790,8 @@ class ZombieGame(ShowBase):
 
     def _apply_pvp_damage(self, amount):
         """상대 총에 맞아 내 체력(core_integrity) 감소. 피격 방향 아크 + 0 되면 리스폰."""
+        if self._match_over:
+            return                        # 매치 끝나면 더 이상 피해/점수 없음
         self.core_integrity = max(0, self.core_integrity - amount)
         # 피격 방향 — 상대 아바타 위치를 source 로 빨간 아크 표시(좀비 피격과 동일).
         if self._remote_smooth is not None:
@@ -3778,16 +3801,43 @@ class ZombieGame(ShowBase):
             self._pvp_die()
 
     def _on_remote_player_killed(self):
-        """상대를 처치(상대 사망 카운터 증가 감지) — 좀비 처치와 동일한 킬 배너 + 사운드."""
+        """상대를 처치(상대 사망 카운터 증가 감지) — 킬 배너 + 사운드 + 내 점수 +1.
+        내 점수가 WIN_SCORE(10) 이상이면 매치 승리."""
+        if self._match_over:
+            return
         self._on_zombie_killed('body')   # kills+1 + 콤보/킬 사운드 + 발로란트 킬 배너
-        print('[pvp] 상대 처치! 킬 배너 + 사운드', flush=True)
+        self._my_score += 1
+        self._update_score_hud()
+        print(f'[pvp] 상대 처치! 점수 {self._my_score}:{self._enemy_score}', flush=True)
+        if self._my_score >= self.WIN_SCORE:
+            self._end_match(True)
+
+    def _update_score_hud(self):
+        """상단 중앙 점수 텍스트 갱신 (online 일 때만 보임)."""
+        self.hud_score.setText(f'{self._my_score} : {self._enemy_score}')
+
+    def _end_match(self, won):
+        """매치 종료 — 승/패 배너 표시 + 이후 점수/리스폰 정지."""
+        self._match_over = True
+        self.hud_match_result.setText('승리!' if won else '패배...')
+        self.hud_match_result.setFg((0.30, 1.0, 0.45, 1.0) if won
+                                    else (1.0, 0.35, 0.35, 1.0))
+        self.hud_match_result.show()
+        print(f'[pvp] 매치 종료 — {"WIN" if won else "LOSE"} '
+              f'{self._my_score}:{self._enemy_score}', flush=True)
 
     def _pvp_die(self):
-        """체력 0 — 짧은 사망 후 스폰 지점으로 리스폰(체력/탄 회복). 점수는 없음.
-        내 누적 사망 횟수를 올려 상대가 '처치'를 인지(킬 배너)하게 한다."""
+        """체력 0 — 내 사망 +1(상대 점수 +1). 상대가 10점이면 패배(리스폰 안 함),
+        아니면 2초 뒤 스폰 지점으로 리스폰(체력/탄 회복). 내 누적 사망 횟수를 올려
+        상대가 '처치'를 인지(킬 배너/점수)하게 한다."""
         self._deaths = (self._deaths + 1) & 0xFF
+        self._enemy_score = self._deaths   # 상대가 나를 죽인 횟수 = 상대 점수
+        self._update_score_hud()
+        print(f'[pvp] 사망 — 점수 {self._my_score}:{self._enemy_score}', flush=True)
+        if self._enemy_score >= self.WIN_SCORE:
+            self._end_match(False)
+            return                         # 매치 종료 — 리스폰 안 함
         self._pvp_dead_t = 2.0
-        print('[pvp] 사망 — 리스폰 대기', flush=True)
         # 2초 뒤 리스폰. (doMethodLater 단발 — pause 와 무관히 실시간으로 흐름)
         self.taskMgr.doMethodLater(self._pvp_dead_t, self._pvp_respawn,
                                    'pvp_respawn')
