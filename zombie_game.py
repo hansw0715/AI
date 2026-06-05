@@ -1039,6 +1039,8 @@ class ZombieGame(ShowBase):
         self._r_sfx_reload = None
         self._r_sfx_foot = []
         self._r_last_foot_i = -1
+        # 상대 플레이어 히트박스 — 좀비와 동일한 본 기반 (캡슐/머리 구). 사격 ray 로 검사.
+        self._remote_hitboxes = []        # [(npa, npb, r, zone), ...]
 
         # 윈도우/마우스
         props = WindowProperties()
@@ -2145,6 +2147,19 @@ class ZombieGame(ShowBase):
             best_barrier = b
             best_z = None
 
+        # 상대 플레이어(온라인) — 좀비/방화벽과 같은 ray 로 히트박스 검사.
+        # best_t 보다 더 가까우면 상대를 맞힌 것 → 좀비/방화벽 판정 무효.
+        remote_hit_pos = None
+        if self.online_mode:
+            res = self._remote_hit_test(cam_pos, ray_dir, best_t)
+            if res is not None:
+                best_t, best_zone, remote_hit_pos = res
+                best_z = None
+                best_barrier = None
+
+        if remote_hit_pos is not None:
+            self._on_remote_player_hit(best_zone, remote_hit_pos)
+            return
         if best_barrier is not None:
             best_barrier.hit()
             return
@@ -3506,8 +3521,12 @@ class ZombieGame(ShowBase):
                                         self._load_sfx('f2.mp3'),
                                         self._load_sfx('f3.mp3')) if s is not None]
 
+        # 상대 플레이어 히트박스 — 좀비와 동일한 본 기반 캡슐/머리 구를 av 본으로 구성.
+        self._remote_hitboxes = self._build_remote_hitboxes(av)
+
         print('[net] 상대 아바타 준비 (첫 패킷까지 숨김) '
-              f'무기 {len(self._remote_weapon_order)}종', flush=True)
+              f'무기 {len(self._remote_weapon_order)}종 '
+              f'히트박스 {len(self._remote_hitboxes)}개', flush=True)
 
     def _register_remote_weapon(self, name, path, scale, pos, hpr, prerot=(0, 0, 0)):
         """상대 아바타용 무기 등록 — 로컬 _register_weapon 의 배치 로직(prerot +
@@ -3609,7 +3628,8 @@ class ZombieGame(ShowBase):
             # 재생 시간만큼 loco 루프 억제 → 끝나면 _update_remote_avatar 가 자동 복귀.
             self._remote_action_t = av.getDuration(anim)
         if self._r_sfx_reload is not None:
-            vol = self._remote_dist_volume(1.0, 4.0, 35.0)
+            # 가까울수록 크게, 24m 너머는 0(안 들림). near 3m 이내 최대.
+            vol = self._remote_dist_volume(1.0, 3.0, 24.0)
             if vol > 0.0:
                 self._r_sfx_reload.setVolume(vol)
                 self._r_sfx_reload.play()
@@ -3619,7 +3639,7 @@ class ZombieGame(ShowBase):
         pool = self._r_sfx_foot
         if not pool:
             return
-        vol = self._remote_dist_volume(0.9, 2.0, 18.0)
+        vol = self._remote_dist_volume(1.0, 3.0, 26.0)
         if vol <= 0.0:
             return                        # 너무 멀면 안 들림 → 재생 생략
         n = len(pool)
@@ -3629,6 +3649,65 @@ class ZombieGame(ShowBase):
         self._r_last_foot_i = i
         pool[i].setVolume(vol)
         pool[i].play()
+
+    # --- 상대 플레이어 히트박스(PvP 명중 판정) ------------------------------
+
+    def _build_remote_hitboxes(self, av):
+        """상대 아바타 본을 Zombie.HITBOX_SPEC 와 동일하게 expose →
+        (npa, npb, r, zone) 리스트. 없는 본이 낀 항목은 건너뜀(실패 시 빈 리스트)."""
+        boxes = []
+        try:
+            names = [j.getName() for j in av.getJoints()]
+            cache = {}
+
+            def expose(suffix):
+                if suffix in cache:
+                    return cache[suffix]
+                full = next((n for n in names if n.endswith(suffix)), None)
+                np_j = av.exposeJoint(None, 'modelRoot', full) if full else None
+                cache[suffix] = np_j
+                return np_j
+
+            for a, b, r, zone in Zombie.HITBOX_SPEC:
+                npa, npb = expose(a), expose(b)
+                if npa is None or npb is None:
+                    continue
+                boxes.append((npa, npb, r, zone))
+        except Exception as e:
+            print('[net] 상대 히트박스 생성 실패:', e, flush=True)
+        return boxes
+
+    def _remote_hit_test(self, cam_pos, ray_dir, max_t):
+        """사격 ray vs 상대 아바타 히트박스. max_t 보다 가까운 최단 (t, zone, world_pos)
+        반환, 없으면 None. 아바타 미접속(숨김)이면 검사 안 함."""
+        av = self.remote_avatar
+        if av is None or av.isHidden() or not self._remote_hitboxes:
+            return None
+        best = None
+        for npa, npb, r, zone in self._remote_hitboxes:
+            a = npa.getPos(self.render)
+            b = a if npb is npa else npb.getPos(self.render)
+            if zone == 'head':
+                off = Vec3(0, 0, Zombie.HEAD_UP_OFFSET)
+                a = a + off
+                b = b + off
+            t = _ray_capsule(cam_pos, ray_dir, a, b, r)
+            if t is None or t < 0.0 or t >= max_t:
+                continue
+            max_t = t
+            best = (t, zone, Vec3(cam_pos + ray_dir * t))
+        return best
+
+    def _on_remote_player_hit(self, zone, world_pos):
+        """상대 플레이어 명중 — 좀비와 같은 피드백(피격음 + 파티클 + 데미지 숫자).
+        동기화 전용 1:1 모드라 HP/사망/점수는 없고 '맞았다' 피드백만 준다."""
+        dmg = Zombie.DAMAGE.get(zone, 5)
+        if zone == 'head' and getattr(self, '_head_onekill', False):
+            dmg = max(dmg, 100)
+        self._play_pool(self.sfx_hit, '_hit_i')
+        self._spawn_hit_particle(world_pos)
+        self._spawn_damage_number(world_pos, dmg)
+        print(f'[pvp] 상대 명중 zone={zone} dmg={dmg}', flush=True)
 
     def _connect_relay(self):
         """릴레이 서버에 TCP 접속. 실패해도 크래시 없이 경고만 찍고 계속(싱글처럼)."""
@@ -3722,7 +3801,8 @@ class ZombieGame(ShowBase):
         # 애니: 직전 프레임 대비 이동 속도로 run/idle 판정. 실제 있는 이름만 사용.
         moved = (self._remote_smooth - self._remote_prev).length()
         self._remote_prev = Vec3(self._remote_smooth)
-        moving = moved > dt * 0.5     # >0.5 m/s 면 이동 중
+        speed = moved / max(dt, 1e-5)   # 프레임율 독립 속도(m/s) — 스무딩 위치 기준
+        moving = speed > 0.6            # >0.6 m/s 면 이동 중(걷기·달리기 모두 포함)
 
         # 발사/재장전 이벤트 — 패킷 카운터/플래그 변화를 감지해 소리 + 단발 모션 재생.
         # (위치 보간이 끝난 뒤라 거리별 음량 계산이 정확함.)
