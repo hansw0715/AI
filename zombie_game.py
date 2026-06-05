@@ -141,18 +141,21 @@ RIFLE_PATH = Filename.from_os_specific(
 RELAY_HOST = "37.16.31.147"
 RELAY_PORT = 8080
 # 내 상태 패킷 포맷: (pos.x, pos.y, pos.z, yaw, pitch, weapon_idx).
-# '<5fBBBH' = float32 ×5 + uint8 ×3 + uint16 ×1 = 고정 25바이트.
+# '<5fBBBHB' = float32 ×5 + uint8 ×3 + uint16 ×1 + uint8 ×1 = 고정 26바이트.
 #   floats: x, y, z, yaw, pitch
 #   bytes : widx(0=권총 1=소총), reloading(0/1 재장전 중), shot_seq(발사 카운터 uint8)
 #   uint16: dmg_dealt(이 클라가 상대에게 누적으로 입힌 총 피해; PvP 체력 동기화용)
+#   uint8 : deaths(이 클라가 죽은 누적 횟수; 상대가 이 증가를 보면 '내가 처치' 판정)
 # reloading/shot_seq 는 상대 화면에서 재장전 모션 + 총소리를 재현하기 위한 필드.
 # (shot_seq 는 발사할 때마다 1씩 증가; 수신측이 직전값과 달라지면 '새 발사'로 판정.)
 # dmg_dealt 는 누적값 — 수신측은 직전값과의 증가분만큼 자기 체력을 깎는다(패킷
 #   합쳐짐/유실에도 안전; TCP 라 순서 보장). 65535 에서 wrap(한 세션엔 충분).
-# ⚠ 송신·수신 양쪽이 반드시 이 새 25바이트 포맷이어야 한다. 옛 23/21바이트 클라와
+# deaths 는 누적 사망 횟수 — 상대측이 증가를 감지하면 킬 배너/사운드 재생(1:1 이라
+#   상대가 죽었다 = 내가 죽인 것).
+# ⚠ 송신·수신 양쪽이 반드시 이 새 26바이트 포맷이어야 한다. 옛 25/23바이트 클라와
 #   섞이면 프레임 정렬이 어긋나 좌표가 깨지므로, 두 클라 모두 새 버전이어야 함.
-NET_STATE_FMT = '<5fBBBH'
-NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 25
+NET_STATE_FMT = '<5fBBBHB'
+NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 26
 # [수정1] 상대 움직임 지연 완화 — 송신 빈도 ↑ + 수신 보간 수렴 ↑. (외삽/예측은 안 씀;
 # 부작용 분리를 위해 다음 단계에서 별도로.) 둘 다 여기 상수로 빼서 튜닝 쉽게.
 NET_SEND_HZ = 45.0          # 송신 스로틀(40~50Hz 권장; 위치 패킷 21바이트라 부담 적음)
@@ -1048,6 +1051,8 @@ class ZombieGame(ShowBase):
         self._dmg_dealt = 0               # 내가 상대에 입힌 총 피해(패킷에 실어 보냄)
         self._remote_last_dmg_total = None  # 상대가 나에게 입힌 누적값 마지막(첫=None)
         self._pvp_dead_t = 0.0            # 사망 후 리스폰까지 남은 시간(초; >0 이면 사망중)
+        self._deaths = 0                  # 내가 죽은 누적 횟수(패킷에 실어 보냄)
+        self._remote_last_deaths = None   # 상대 사망 누적값 마지막(첫=None; 증가=내 킬)
         self._remote_tracer = None        # 상대 총알 궤적 노드(online 일 때 생성)
         self._remote_tracer_t = 0.0       # 상대 트레이서 표시 남은 시간(초)
 
@@ -1231,6 +1236,7 @@ class ZombieGame(ShowBase):
         self._spray_idle = 0.0    # 마지막 발 이후 경과(초)
         self._shot_yaw_off = 0.0  # 이번 발 좌우 편차 (deg) — ray/tracer 둘 다 적용
         self._shot_pitch_off = 0.0
+        self.JUMP_SPREAD_DEG = 9.0  # 공중(점프) 사격 시 첫발부터 더해지는 큰 랜덤 콘(deg)
 
         # Reload 중 W/S 걸을 때 lower 가 Idle 로 고정되어 몸이 미끄러지는 느낌
         # → ybot 에 사인파 Z bob 을 더하고 카메라엔 같은 값을 빼서 상쇄. 화면은
@@ -2088,10 +2094,11 @@ class ZombieGame(ShowBase):
         if not cfg:
             return 0.0, 0.0
         n = self._spray_shots   # 이번 버스트에서 이미 쏜 발수 (0=첫발)
+        airborne = not self.on_ground   # 점프/낙하 중 — 첫발부터 크게 튐
         # 소총: 가만히 있을 때 첫 두 발(n<2)은 무조건 조준점 정중앙(편차 0).
-        # 단 이동 중엔 적용 안 함 — 이동 중엔 첫발부터 퍼지는 게 맞음.
+        # 단 이동 중·공중에선 적용 안 함 — 첫발부터 퍼지는 게 맞음.
         # (연발 3발째부터 퍼짐. idle 시 _spray_shots 리셋돼 첫 두 발 정확 보장.)
-        if cfg['mode'] == 'pattern' and n < 2 \
+        if cfg['mode'] == 'pattern' and n < 2 and not airborne \
                 and not any(self.keys[k] for k in ('w', 'a', 's', 'd')):
             return 0.0, 0.0
         if cfg['mode'] == 'pattern':
@@ -2117,6 +2124,12 @@ class ZombieGame(ShowBase):
         if moving and mv > 0.0:
             ang = random.uniform(0.0, 6.28318)
             r = mv * random.uniform(0.4, 1.0)
+            yaw_off += r * cos(ang)
+            pitch_off += r * sin(ang)
+        # 공중(점프) 사격 — 첫발부터 '엄청 튀게' 큰 랜덤 콘 추가(무기/연사 무관).
+        if airborne:
+            ang = random.uniform(0.0, 6.28318)
+            r = self.JUMP_SPREAD_DEG * random.uniform(0.6, 1.0)
             yaw_off += r * cos(ang)
             pitch_off += r * sin(ang)
         # 조준(ADS) 시 전체 퍼짐 축소 — aim_t(0=hip,1=줌)로 1.0 ↔ ads 보간.
@@ -3648,6 +3661,14 @@ class ZombieGame(ShowBase):
             if delta > 0 and self._pvp_dead_t <= 0.0:
                 self._apply_pvp_damage(delta)
 
+        # PvP 킬 — 상대 사망 누적(rs[9])이 늘면 내가 처치한 것(1:1). 배너 + 킬 사운드.
+        deaths = rs[9]
+        if self._remote_last_deaths is None:
+            self._remote_last_deaths = deaths           # 첫 수신은 baseline 만
+        elif deaths != self._remote_last_deaths:
+            self._remote_last_deaths = deaths
+            self._on_remote_player_killed()
+
     def _play_remote_reload(self, is_rifle):
         """상대 아바타에 재장전 단발 모션 + 거리별 음량 재장전 소리.
         단일 파트 Actor 라 전신 단발로 재생하고, 재생 시간 동안 loco 를 억제한다."""
@@ -3756,8 +3777,15 @@ class ZombieGame(ShowBase):
         if self.core_integrity <= 0:
             self._pvp_die()
 
+    def _on_remote_player_killed(self):
+        """상대를 처치(상대 사망 카운터 증가 감지) — 좀비 처치와 동일한 킬 배너 + 사운드."""
+        self._on_zombie_killed('body')   # kills+1 + 콤보/킬 사운드 + 발로란트 킬 배너
+        print('[pvp] 상대 처치! 킬 배너 + 사운드', flush=True)
+
     def _pvp_die(self):
-        """체력 0 — 짧은 사망 후 스폰 지점으로 리스폰(체력/탄 회복). 점수는 없음."""
+        """체력 0 — 짧은 사망 후 스폰 지점으로 리스폰(체력/탄 회복). 점수는 없음.
+        내 누적 사망 횟수를 올려 상대가 '처치'를 인지(킬 배너)하게 한다."""
+        self._deaths = (self._deaths + 1) & 0xFF
         self._pvp_dead_t = 2.0
         print('[pvp] 사망 — 리스폰 대기', flush=True)
         # 2초 뒤 리스폰. (doMethodLater 단발 — pause 와 무관히 실시간으로 흐름)
@@ -3826,14 +3854,14 @@ class ZombieGame(ShowBase):
                     frame = buf[:NET_STATE_SIZE]
                     buf = buf[NET_STATE_SIZE:]
                     try:
-                        (x, y, z, yaw, pitch, widx,
-                         reloading, shot_seq, dmg_total) = struct.unpack(
+                        (x, y, z, yaw, pitch, widx, reloading,
+                         shot_seq, dmg_total, deaths) = struct.unpack(
                             NET_STATE_FMT, frame)
                     except struct.error:
                         continue
-                    # 참조 교체(원자적) — 위치/시점 + 무기 + 재장전/발사 + 누적 피해.
+                    # 참조 교체(원자적) — 위치/시점 + 무기 + 재장전/발사 + 피해 + 사망.
                     self.remote_state = (x, y, z, yaw, pitch, widx,
-                                         reloading, shot_seq, dmg_total)
+                                         reloading, shot_seq, dmg_total, deaths)
         except OSError:
             pass                      # 끊김 — 마지막 remote_state 유지
         finally:
@@ -3856,7 +3884,8 @@ class ZombieGame(ShowBase):
                               self._weapon_idx & 0xFF,            # 0=권총 1=소총 (uint8)
                               1 if self._reload_oneshot else 0,   # 재장전 중 플래그
                               self._net_shot_seq & 0xFF,          # 발사 카운터
-                              self._dmg_dealt & 0xFFFF)           # 상대에 입힌 누적 피해
+                              self._dmg_dealt & 0xFFFF,           # 상대에 입힌 누적 피해
+                              self._deaths & 0xFF)                # 내 누적 사망 횟수
             self._sock.sendall(pkt)
         except OSError as e:
             print(f'[net] 송신 실패 ({e}) — 연결 종료', flush=True)
