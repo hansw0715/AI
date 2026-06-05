@@ -3662,13 +3662,10 @@ class ZombieGame(ShowBase):
         av.reparentTo(self.render)
         av.setPos(0, 0, 0)
         av.setH(180)                  # self.ybot 과 동일한 +180 기준
-        # 사망 애니(death_headshot.bam) 바인딩 — 좀비와 동일 mixamorig 본. 처치 감지 시 재생.
-        if ZOMBIE_DEATH_BAM.exists():
-            try:
-                av.loadAnims({'DeathHeadshot': ZOMBIE_DEATH_BAM})
-                self._remote_death_anim = 'DeathHeadshot'
-            except Exception as e:
-                print('[net] 상대 death 애니 로드 실패:', e, flush=True)
+        # 사망 애니 — 플레이어 모델(Y Bot)의 네이티브 'Death' 사용. 외부 death_headshot.bam
+        # 을 loadAnims 하면 Mixamo cm 스케일 보정이 안 맞아 몸이 거대해지므로 안 씀.
+        # (좀비가 최종적으로 눕는 포즈도 Y Bot 'Death' 라 결과적으로 동일.)
+        self._remote_death_anim = 'Death' if 'Death' in self.anim_names else None
         idle = 'Idle' if 'Idle' in self.anim_names else (
             self.anim_names[0] if self.anim_names else None)
         if idle:
@@ -4116,14 +4113,10 @@ class ZombieGame(ShowBase):
             corpse.reparentTo(self.render)
             corpse.setPos(self.player_pos)
             corpse.setH(self.player_yaw + 180)
-            if ZOMBIE_DEATH_BAM.exists():
-                try:
-                    corpse.loadAnims({'DeathHeadshot': ZOMBIE_DEATH_BAM})
-                    corpse.play('DeathHeadshot')
-                    # 좀비 죽음과 '똑같이' — 동일 애니(DeathHeadshot) + 동일 재생속도(1.5x).
-                    corpse.setPlayRate(Zombie.DEATH_PLAY_RATE, 'DeathHeadshot')
-                except Exception as e:
-                    print('[pvp] 시체 death 애니 실패:', e, flush=True)
+            # 모델 네이티브 'Death' 사용(올바른 스케일). 좀비와 동일하게 1.5배속.
+            if 'Death' in corpse.getAnimNames():
+                corpse.play('Death')
+                corpse.setPlayRate(Zombie.DEATH_PLAY_RATE, 'Death')
             self._corpse = corpse
             print('[pvp] 사망 — 3초 데스캠', flush=True)
         else:
