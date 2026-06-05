@@ -3878,7 +3878,7 @@ class ZombieGame(ShowBase):
         pool = self._r_sfx_foot
         if not pool:
             return
-        vol = self._remote_dist_volume(1.6, 3.0, 28.0)  # base>1 = 증폭(가까이서 크게)
+        vol = self._remote_dist_volume(2.6, 2.0, 26.0)  # base>1 증폭 — 가까이서 더 크게
         if vol <= 0.0:
             return                        # 너무 멀면 안 들림 → 재생 생략
         n = len(pool)
@@ -3981,9 +3981,9 @@ class ZombieGame(ShowBase):
               flush=True)
 
     def _apply_pvp_damage(self, amount):
-        """상대 총에 맞아 내 체력(core_integrity) 감소. 피격 방향 아크 + 0 되면 리스폰."""
-        if self._match_over:
-            return                        # 매치 끝나면 더 이상 피해/점수 없음
+        """상대 총에 맞아 내 체력(core_integrity) 감소. 피격 방향 아크 + 0 되면 라운드 리셋."""
+        if self._match_over or self._barriers_active:
+            return                        # 매치 종료/카운트다운(가둠) 중엔 피해 없음
         self.core_integrity = max(0, self.core_integrity - amount)
         # 피격 방향 — 상대 아바타 위치를 source 로 빨간 아크 표시(좀비 피격과 동일).
         if self._remote_smooth is not None:
@@ -4003,6 +4003,8 @@ class ZombieGame(ShowBase):
         print(f'[pvp] 상대 처치! 점수 {self._my_score}:{self._enemy_score}', flush=True)
         if self._my_score >= self.WIN_SCORE:
             self._end_match(True)
+        else:
+            self._arena_round_reset()    # 양쪽 스폰 복귀 + 5초 후 재시작
 
     def _update_score_hud(self):
         """상단 중앙 점수 텍스트 갱신 (online 일 때만 보임)."""
@@ -4019,20 +4021,46 @@ class ZombieGame(ShowBase):
               f'{self._my_score}:{self._enemy_score}', flush=True)
 
     def _pvp_die(self):
-        """체력 0 — 내 사망 +1(상대 점수 +1). 상대가 10점이면 패배(리스폰 안 함),
-        아니면 2초 뒤 스폰 지점으로 리스폰(체력/탄 회복). 내 누적 사망 횟수를 올려
-        상대가 '처치'를 인지(킬 배너/점수)하게 한다."""
+        """체력 0 — 내 사망 +1(상대 점수 +1). 상대가 10점이면 패배(매치 종료),
+        아니면 라운드 리셋(양쪽 스폰 복귀 + 5초 후 재시작). 내 누적 사망 횟수를
+        올려 상대가 '처치'를 인지(킬 배너/점수)하게 한다."""
         self._deaths = (self._deaths + 1) & 0xFF
         self._enemy_score = self._deaths   # 상대가 나를 죽인 횟수 = 상대 점수
         self._update_score_hud()
         print(f'[pvp] 사망 — 점수 {self._my_score}:{self._enemy_score}', flush=True)
         if self._enemy_score >= self.WIN_SCORE:
-            self._end_match(False)
-            return                         # 매치 종료 — 리스폰 안 함
-        self._pvp_dead_t = 2.0
-        # 2초 뒤 리스폰. (doMethodLater 단발 — pause 와 무관히 실시간으로 흐름)
-        self.taskMgr.doMethodLater(self._pvp_dead_t, self._pvp_respawn,
-                                   'pvp_respawn')
+            self._end_match(False)         # 매치 종료
+        else:
+            self._arena_round_reset()      # 양쪽 스폰 복귀 + 5초 후 재시작
+
+    def _arena_round_reset(self):
+        """한 명이 죽으면 호출 — 내 스폰으로 복귀 + 체력/탄 회복 + 스폰 배리어 재가둠
+        + 5초 카운트다운 후 재시작. (양 클라가 각자 사망/처치를 인지하는 시점에
+        독립적으로 호출 — 둘 다 똑같이 리셋되어 라운드가 다시 시작된다.)"""
+        if self._match_over:
+            return
+        self.player_pos = Vec3(self._spawn_pos)
+        self.player_yaw = self._spawn_yaw
+        self.player_pitch = 0.0
+        self.player_vz = 0.0
+        self.on_ground = True
+        self.core_integrity = self.core_integrity_max
+        self.ammo = self.ammo_max
+        self._pvp_dead_t = 0.0
+        # 스폰 배리어 재가둠(중복 add 방지) + shimmer 다시 보이게.
+        if self._spawn_barriers and not self._barriers_active:
+            self.level_collider.walls.extend(self._spawn_barriers)
+            self._barriers_active = True
+        self._shimmer_fading = False
+        self._shimmer_a = 0.25
+        for card in self._shimmer_cards:
+            card.show()
+            card.setColor(IMMUNE_COLOR[0], IMMUNE_COLOR[1], IMMUNE_COLOR[2],
+                          self._shimmer_a)
+        # 5초 카운트다운 재시작 — _arena_update 가 끝에서 배리어 제거 + FIGHT!.
+        self._countdown_t = 5.0
+        self.hud_countdown.setFg((1, 0.92, 0.4, 1))
+        print('[arena] 라운드 리셋 — 5초 후 재시작', flush=True)
 
     def _pvp_respawn(self, task=None):
         """스폰 지점(아레나면 내 스폰)으로 복귀 + 체력/탄창 회복."""
