@@ -135,15 +135,23 @@ RIFLE_PATH = Filename.from_os_specific(
 
 # ── 온라인(1:1 멀티) 릴레이 서버 ───────────────────────────────────────────
 # 'python zombie_game.py --online' 일 때만 이 서버에 바깥으로 TCP 접속한다.
-# 서버는 raw 바이트 중계기(NAT 통과/포트포워딩 불필요) — 한쪽이 보낸 20바이트
+# 서버는 raw 바이트 중계기(NAT 통과/포트포워딩 불필요) — 한쪽이 보낸 고정크기
 # 프레임을 그대로 반대쪽에 흘려준다. 프레이밍/언패킹은 클라(여기)가 책임짐.
 # Fly 에 배포한 릴레이(앱 tcp-relay-1v1, dedicated v4) — 포트는 8080.
 RELAY_HOST = "37.16.31.147"
 RELAY_PORT = 8080
-# 내 상태 패킷 포맷: (pos.x, pos.y, pos.z, yaw, pitch) = 고정 20바이트.
-NET_STATE_FMT = '<5f'
-NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 20
-NET_SEND_HZ = 25.0                                # 송신 스로틀(20~30Hz 권장)
+# 내 상태 패킷 포맷: (pos.x, pos.y, pos.z, yaw, pitch, weapon_idx).
+# '<5fB' = float32 ×5 + uint8 ×1 = 고정 21바이트. (이전엔 '<5f' 20바이트였는데
+# 무기 인덱스 1바이트(0=권총 1=소총)를 추가했다.)
+# ⚠ 송신·수신 양쪽이 반드시 이 새 21바이트 포맷이어야 한다. 옛 20바이트 클라와
+#   섞이면 프레임 정렬이 어긋나 좌표가 깨지므로, 두 클라 모두 새 버전이어야 함.
+NET_STATE_FMT = '<5fB'
+NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 21
+# [수정1] 상대 움직임 지연 완화 — 송신 빈도 ↑ + 수신 보간 수렴 ↑. (외삽/예측은 안 씀;
+# 부작용 분리를 위해 다음 단계에서 별도로.) 둘 다 여기 상수로 빼서 튜닝 쉽게.
+NET_SEND_HZ = 45.0          # 송신 스로틀(40~50Hz 권장; 위치 패킷 21바이트라 부담 적음)
+REMOTE_SMOOTH_LERP = 18.0   # 상대 위치 보간 계수 min(1, dt*이값). 클수록 빨리 수렴,
+#                             너무 크면 떨림 — 부드러움 유지되는 선(12 → 18).
 
 # 무기별 스탯 — _equip_weapon 이 적용. ammo_max=탄창, cooldown=발사간격(s),
 # auto=연발(mouse1 hold 연사), head_onekill=헤드샷 즉사.
@@ -1008,6 +1016,12 @@ class ZombieGame(ShowBase):
         self._remote_smooth = None    # 보간된 현재 위치 Vec3
         self._remote_prev = None      # 직전 프레임 위치(애니 run/idle 판정용)
         self._remote_anim = None      # 현재 상대 아바타 루프 애니 이름
+        # 상대 아바타 손에 들 무기 — 로컬 weapon_anchor/right_hand_joint 방식을 복제.
+        self._remote_hand = None          # av 의 RightHand 본 expose
+        self._remote_weapon_anchor = None # av 손 본 월드 트랜스폼을 매 프레임 따라감
+        self._remote_weapons = {}         # name -> 무기 NodePath
+        self._remote_weapon_order = []    # 등록 순서(로컬과 동일: 0=권총 1=소총)
+        self._remote_weapon_shown = None  # 현재 보이는 상대 무기 이름
 
         # 윈도우/마우스
         props = WindowProperties()
@@ -3449,7 +3463,62 @@ class ZombieGame(ShowBase):
             self._remote_anim = idle
         av.hide()                     # remote_state 도착 전엔 안 보이게
         self.remote_avatar = av
-        print('[net] 상대 아바타 준비 (첫 패킷까지 숨김)', flush=True)
+
+        # 상대 손에 무기 부착 — 로컬(right_hand_joint + weapon_anchor + _weapons)을
+        # 그대로 복제. av 는 subpart 가 없으니 part='modelRoot' 로 RightHand 본 expose.
+        rhand_name = next(
+            (j.getName() for j in av.getJoints()
+             if j.getName().endswith('RightHand')), None)
+        self._remote_hand = (av.exposeJoint(None, 'modelRoot', rhand_name)
+                             if rhand_name else None)
+        self._remote_weapon_anchor = self.render.attachNewNode('remote_weapon_anchor')
+        # 로컬과 동일한 순서/배치 상수로 등록 → 인덱스 매핑이 로컬과 일치(0=권총 1=소총).
+        self._register_remote_weapon('pistol', WEAPON_PATH, WEAPON_LOCAL_SCALE,
+                                     WEAPON_LOCAL_POS, WEAPON_LOCAL_HPR)
+        self._register_remote_weapon('rifle', RIFLE_PATH, RIFLE_LOCAL_SCALE,
+                                     RIFLE_LOCAL_POS, RIFLE_LOCAL_HPR,
+                                     prerot=RIFLE_LOCAL_PREROT)
+        print('[net] 상대 아바타 준비 (첫 패킷까지 숨김) '
+              f'무기 {len(self._remote_weapon_order)}종', flush=True)
+
+    def _register_remote_weapon(self, name, path, scale, pos, hpr, prerot=(0, 0, 0)):
+        """상대 아바타용 무기 등록 — 로컬 _register_weapon 의 배치 로직(prerot +
+        scale/pos/hpr, AR-10 소품 제거)을 그대로 따르되, 1인칭 트릭/슬라이드/muzzle 은
+        빼고 '손에 보이기'만 한다. _remote_weapon_anchor 의 자식으로 붙여 숨겨둔다."""
+        if not path.exists():
+            return
+        try:
+            model = self.loader.loadModel(path)
+        except Exception as e:
+            print(f'[net] 상대 무기 {name} 로드 실패: {e}', flush=True)
+            return
+        for _prop in ('7.62x51 mag.001', '76251'):   # AR-10 딸려오는 소품 제거(로컬과 동일)
+            for _np in model.findAllMatches(f'**/*{_prop}*'):
+                _np.removeNode()
+        model.flattenLight()
+        node = self._remote_weapon_anchor.attachNewNode(f'remote_{name}')
+        model.reparentTo(node)
+        model.setHpr(*prerot)
+        node.setScale(scale)
+        node.setPos(*pos)
+        node.setHpr(*hpr)
+        node.setTwoSided(True)
+        node.hide()
+        self._remote_weapons[name] = node
+        self._remote_weapon_order.append(name)
+
+    def _show_remote_weapon(self, widx):
+        """무기 인덱스(0=권총 1=소총)에 맞는 상대 무기만 show, 나머지 hide.
+        로컬이 무기를 바꾸면 패킷의 인덱스가 바뀌어 상대 화면 손 총도 바뀐다."""
+        if not self._remote_weapon_order:
+            return
+        name = (self._remote_weapon_order[widx]
+                if 0 <= widx < len(self._remote_weapon_order) else None)
+        if name == self._remote_weapon_shown:
+            return
+        for n, nd in self._remote_weapons.items():
+            nd.show() if n == name else nd.hide()
+        self._remote_weapon_shown = name
 
     def _connect_relay(self):
         """릴레이 서버에 TCP 접속. 실패해도 크래시 없이 경고만 찍고 계속(싱글처럼)."""
@@ -3470,7 +3539,7 @@ class ZombieGame(ShowBase):
             print(f'[net] 릴레이 접속 실패 ({e}) — 네트워크 없이 계속', flush=True)
 
     def _net_recv_loop(self):
-        """데몬 스레드: TCP 스트림에서 정확히 NET_STATE_SIZE(20)바이트씩 프레임을
+        """데몬 스레드: TCP 스트림에서 정확히 NET_STATE_SIZE(21)바이트씩 프레임을
         모아 언패킹 → self.remote_state 에 최신값만 저장. 부분수신/연결끊김 안전."""
         sock = self._sock
         buf = b''
@@ -3480,15 +3549,17 @@ class ZombieGame(ShowBase):
                 if not data:
                     break             # 상대/서버 연결 종료(스트림 끝)
                 buf += data
-                # TCP 는 스트림 — 20바이트가 다 모였을 때만 한 프레임으로 해석.
+                # TCP 는 스트림 — 21바이트가 다 모였을 때만 한 프레임으로 해석.
                 while len(buf) >= NET_STATE_SIZE:
                     frame = buf[:NET_STATE_SIZE]
                     buf = buf[NET_STATE_SIZE:]
                     try:
-                        x, y, z, yaw, pitch = struct.unpack(NET_STATE_FMT, frame)
+                        x, y, z, yaw, pitch, widx = struct.unpack(
+                            NET_STATE_FMT, frame)
                     except struct.error:
                         continue
-                    self.remote_state = (x, y, z, yaw, pitch)  # 참조 교체(원자적)
+                    # 참조 교체(원자적) — 위치/시점 + 무기 인덱스.
+                    self.remote_state = (x, y, z, yaw, pitch, widx)
         except OSError:
             pass                      # 끊김 — 마지막 remote_state 유지
         finally:
@@ -3496,7 +3567,7 @@ class ZombieGame(ShowBase):
         print('[net] 수신 스레드 종료', flush=True)
 
     def _net_send(self, dt):
-        """내 위치/시점을 ~NET_SEND_HZ 로 스로틀해서 고정 20바이트로 전송."""
+        """내 위치/시점/무기인덱스를 ~NET_SEND_HZ 로 스로틀해서 고정 21바이트로 전송."""
         if self._sock is None or not self._net_alive:
             return
         self._net_send_t += dt
@@ -3507,7 +3578,8 @@ class ZombieGame(ShowBase):
             pkt = struct.pack(NET_STATE_FMT,
                               self.player_pos.x, self.player_pos.y,
                               self.player_pos.z, self.player_yaw,
-                              self.player_pitch)
+                              self.player_pitch,
+                              self._weapon_idx & 0xFF)   # 0=권총 1=소총 (uint8)
             self._sock.sendall(pkt)
         except OSError as e:
             print(f'[net] 송신 실패 ({e}) — 연결 종료', flush=True)
@@ -3528,9 +3600,9 @@ class ZombieGame(ShowBase):
             self._remote_prev = Vec3(target)
             av.show()
         else:
-            # 핑 대응 — 현재→목표 지수 보간(계수 12). 순간이동/덜덜 떨림 방지.
+            # 핑 대응 — 현재→목표 지수 보간(계수 REMOTE_SMOOTH_LERP). 외삽 없음.
             self._remote_smooth += ((target - self._remote_smooth)
-                                    * min(1.0, dt * 12.0))
+                                    * min(1.0, dt * REMOTE_SMOOTH_LERP))
         av.setPos(self._remote_smooth)
         av.setH(rs[3] + 180)          # yaw 만 — pitch 로 몸 전체를 기울이지 않음
         # 애니: 직전 프레임 대비 이동 속도로 run/idle 판정. 실제 있는 이름만 사용.
@@ -3542,6 +3614,21 @@ class ZombieGame(ShowBase):
         if want and want != self._remote_anim:
             av.loop(want)
             self._remote_anim = want
+
+        # 상대 손에 든 무기 — av 손 본의 월드 트랜스폼을 anchor 가 따라가게.
+        # (1인칭 트릭은 일절 안 씀: 머리뼈 카메라/어깨피벗/ADS 오프셋/walk-bob 전부 X.
+        #  3인칭으로 그냥 손에 총만 들려 있으면 됨.) 손 본 좌표를 현재 프레임으로
+        # 동기화하려고 av.update 후 읽는다(로컬 ybot.update(force=True) 와 동일 패턴).
+        av.update(force=True)
+        if (self._remote_weapon_anchor is not None
+                and self._remote_hand is not None
+                and not self._remote_hand.isEmpty()):
+            self._remote_weapon_anchor.setPos(
+                self._remote_hand.getPos(self.render))
+            self._remote_weapon_anchor.setHpr(
+                self._remote_hand.getHpr(self.render))
+        # 무기 종류 동기화 — 패킷의 무기 인덱스(rs[5])에 맞는 모델만 보이게.
+        self._show_remote_weapon(rs[5])
 
     def _net_shutdown(self):
         """소켓 close + 수신 스레드 종료 신호(데몬이라 프로세스와 함께 사라짐)."""
