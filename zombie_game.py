@@ -28,7 +28,8 @@ from panda3d.core import (
 )
 
 from level import (PLAYER_RADIUS, ZOMBIE_RADIUS, WALL_HEIGHT, Wall,
-                   IMMUNE_COLOR, LESION_COLOR, build_level, build_arena)
+                   IMMUNE_COLOR, LESION_COLOR, build_level, build_arena,
+                   LevelCollider)
 from weapon_config import (
     WEAPON_LOCAL_SCALE, WEAPON_LOCAL_POS, WEAPON_LOCAL_HPR, WEAPON_MUZZLE_POS,
     RIFLE_LOCAL_SCALE, RIFLE_LOCAL_POS, RIFLE_LOCAL_HPR, RIFLE_MUZZLE_POS,
@@ -233,6 +234,28 @@ def _ray_capsule(o, d, a, b, r):
                         if 0.0 <= axial <= length:
                             best = t
     return best
+
+
+def _ray_aabb(ox, oy, oz, dx, dy, dz, x0, x1, y0, y1, z0, z1):
+    """ray(o, d) vs 축정렬 박스 [x0,x1]×[y0,y1]×[z0,z1]. 진입 t>=0 반환(내부에서
+    시작하면 0), 안 맞으면 None. 총알이 3D 로 벽/플랫폼에 막히는지 판정용."""
+    tmin, tmax = 0.0, 1e18
+    for o, d, lo, hi in ((ox, dx, x0, x1), (oy, dy, y0, y1), (oz, dz, z0, z1)):
+        if -1e-12 < d < 1e-12:
+            if o < lo or o > hi:
+                return None
+        else:
+            t1 = (lo - o) / d
+            t2 = (hi - o) / d
+            if t1 > t2:
+                t1, t2 = t2, t1
+            if t1 > tmin:
+                tmin = t1
+            if t2 < tmax:
+                tmax = t2
+            if tmin > tmax:
+                return None
+    return tmin
 
 
 class Zombie:
@@ -1077,6 +1100,8 @@ class ZombieGame(ShowBase):
         self._shimmer_fading = False
         self._spawn_pos = Vec3(0, 0, 0)   # 리스폰 지점(아레나면 내 스폰)
         self._spawn_yaw = 0.0
+        self._platforms = []              # 올라타는 박스 [{x0,x1,y0,y1,top,collider}]
+        self._step_assist = 0.45          # 이 높이 차 이내면 옆면 통과+윗면 스냅(스텝업)
         # 스폰 자동 배정 — 세션 고정 랜덤 nonce. 상대 nonce 와 비교해 큰 쪽=A, 작은=B.
         self._nonce = random.randint(1, 0xFFFFFFFF)
         self._role_decided = False        # 첫 상대 패킷의 nonce 로 스폰 확정
@@ -1165,7 +1190,7 @@ class ZombieGame(ShowBase):
         self.head_height = 1.65
         self.move_speed = 4.0   # 좀비 추격 속도와 동일 (Zombie.move_speed)
         self.mouse_sens = 0.03    # 기본값 — ESC pause 메뉴 슬라이더로 0.02~0.30 조정
-        self.jump_speed = 4.5
+        self.jump_speed = 5.0   # 정점 ~1.04m — 낮은 플랫폼(≤1.0)에 점프해 올라설 수 있게
         self.gravity = 12.0
 
         # Y Bot Actor (월드에 직접 부착)
@@ -2206,9 +2231,9 @@ class ZombieGame(ShowBase):
         remote_hit_pos = None
         if self.online_mode:
             res = self._remote_hit_test(cam_pos, ray_dir, best_t)
-            # 총알이 벽을 못 뚫게 — 나→상대 2D 경로가 벽으로 막히면 명중 취소.
-            if res is not None and not self.level_collider.segment_blocked(
-                    cam_pos.x, cam_pos.y, res[2].x, res[2].y):
+            # 총알이 벽을 못 뚫게 — 나→상대 ray 가 벽/플랫폼(높이 인식)에 막히면 취소.
+            if res is not None and not self._bullet_blocked(
+                    cam_pos, ray_dir, res[0]):
                 best_t, best_zone, remote_hit_pos = res
                 best_z = None
                 best_barrier = None
@@ -3569,7 +3594,17 @@ class ZombieGame(ShowBase):
             self._barriers_active = True
             self._role_decided = False
             self._countdown_t = None      # 역할 확정 + 상대 보이면 카운트다운 시작
-            print(f'[arena] 대기 — nonce={self._nonce} (스폰 자동배정)', flush=True)
+            # 올라타는 플랫폼 — 각 박스 footprint 를 두께 0 Wall 1개로 만든 LevelCollider
+            # 로 옆면 충돌 처리(아래에서만 막음). 윗면 지지는 이동 코드가 top 으로 판정.
+            self._platforms = []
+            for pd in self._arena_data.get('platforms', []):
+                box = Wall(pd['x0'], pd['y0'], pd['x1'], pd['y1'],
+                           thickness=0.0, height=pd['top'])
+                self._platforms.append({
+                    'x0': pd['x0'], 'x1': pd['x1'], 'y0': pd['y0'], 'y1': pd['y1'],
+                    'top': pd['top'], 'collider': LevelCollider([box])})
+            print(f'[arena] 대기 — nonce={self._nonce} (스폰 자동배정), '
+                  f'플랫폼 {len(self._platforms)}개', flush=True)
 
         self._setup_remote_avatar()
         self._connect_relay()
@@ -3901,6 +3936,35 @@ class ZombieGame(ShowBase):
             max_t = t
             best = (t, zone, Vec3(cam_pos + ray_dir * t))
         return best
+
+    def _bullet_blocked(self, cam, rdir, t_hit):
+        """사격 ray(cam, rdir 정규화)가 벽/플랫폼에 막혀 t_hit(상대까지 거리)보다
+        먼저 차단되는지 3D 로 판정. 벽은 실제 높이까지만 막아(낮은 엄폐는 위로 넘겨
+        쏠 수 있음), 벽 끝단의 두께 확장은 제거 + margin 인셋 → 모서리 옆 살짝 보이는
+        적도 맞는다(과한 차단 수정)."""
+        ox, oy, oz = cam.x, cam.y, cam.z
+        dx, dy, dz = rdir.x, rdir.y, rdir.z
+        m = 0.10                          # 끝단 여유(모서리 피킹 관대)
+        for w in self.level_collider.walls:
+            if abs(w.ay - w.by) < 1e-6:   # 수평벽(긴축 x) — 끝단만 인셋, 두께 정확
+                bx0, bx1 = min(w.ax, w.bx) + m, max(w.ax, w.bx) - m
+                by0, by1 = w.y0, w.y1
+            else:                         # 수직벽(긴축 y)
+                bx0, bx1 = w.x0, w.x1
+                by0, by1 = min(w.ay, w.by) + m, max(w.ay, w.by) - m
+            if bx1 <= bx0 or by1 <= by0:
+                continue
+            hgt = getattr(w, 'height', WALL_HEIGHT)
+            t = _ray_aabb(ox, oy, oz, dx, dy, dz, bx0, bx1, by0, by1, 0.0, hgt)
+            if t is not None and 1e-4 < t < t_hit - 1e-4:
+                return True
+        for p in self._platforms:         # 올라타는 박스도 윗면 높이까지 총알 차단
+            t = _ray_aabb(ox, oy, oz, dx, dy, dz,
+                          p['x0'] + m, p['x1'] - m, p['y0'] + m, p['y1'] - m,
+                          0.0, p['top'])
+            if t is not None and 1e-4 < t < t_hit - 1e-4:
+                return True
+        return False
 
     def _on_remote_player_hit(self, zone, world_pos):
         """상대 플레이어 명중 — 좀비와 같은 피드백(피격음 + 파티클 + 데미지 숫자).
@@ -4297,15 +4361,38 @@ class ZombieGame(ShowBase):
                         self.player_pos.x, self.player_pos.y, PLAYER_RADIUS)
                     self.player_pos.x = nx
                     self.player_pos.y = ny
+                    # 플랫폼(올라타는 박스) — 발이 윗면보다 step_assist 이상 낮으면
+                    # 옆면이 막고, step_assist 이내면 윗면으로 스냅(올라섬). 위/근처면 자유.
+                    for p in self._platforms:
+                        if self.player_pos.z >= p['top'] - self._step_assist:
+                            if (p['x0'] <= self.player_pos.x <= p['x1']
+                                    and p['y0'] <= self.player_pos.y <= p['y1']
+                                    and self.player_pos.z < p['top']):
+                                self.player_pos.z = p['top']   # 윗면으로 올라섬
+                                self.player_vz = 0.0
+                                self.on_ground = True
+                        else:
+                            nx, ny = p['collider'].resolve(
+                                self.player_pos.x, self.player_pos.y, PLAYER_RADIUS)
+                            self.player_pos.x = nx
+                            self.player_pos.y = ny
                 if self.keys['space'] and self.on_ground:
                     self.player_vz = self.jump_speed
                     self.on_ground = False
 
+            # 지지 높이 — 플랫폼 윗면 위(또는 step_assist 이내)에 올라타 있으면 그게 바닥.
+            support = 0.0
+            for p in self._platforms:
+                if (p['x0'] <= self.player_pos.x <= p['x1']
+                        and p['y0'] <= self.player_pos.y <= p['y1']
+                        and self.player_pos.z >= p['top'] - self._step_assist
+                        and p['top'] > support):
+                    support = p['top']
             # 중력은 항상 적용 (무릎자세에서도)
             self.player_vz -= self.gravity * dt
             self.player_pos.z += self.player_vz * dt
-            if self.player_pos.z <= 0:
-                self.player_pos.z = 0
+            if self.player_pos.z <= support:
+                self.player_pos.z = support
                 self.player_vz = 0
                 self.on_ground = True
 
