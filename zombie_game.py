@@ -141,21 +141,24 @@ RIFLE_PATH = Filename.from_os_specific(
 RELAY_HOST = "37.16.31.147"
 RELAY_PORT = 8080
 # 내 상태 패킷 포맷: (pos.x, pos.y, pos.z, yaw, pitch, weapon_idx).
-# '<5fBBBHB' = float32 ×5 + uint8 ×3 + uint16 ×1 + uint8 ×1 = 고정 26바이트.
+# '<5fBBBHBI' = float32 ×5 + uint8 ×3 + uint16 ×1 + uint8 ×1 + uint32 ×1 = 30바이트.
 #   floats: x, y, z, yaw, pitch
 #   bytes : widx(0=권총 1=소총), reloading(0/1 재장전 중), shot_seq(발사 카운터 uint8)
 #   uint16: dmg_dealt(이 클라가 상대에게 누적으로 입힌 총 피해; PvP 체력 동기화용)
 #   uint8 : deaths(이 클라가 죽은 누적 횟수; 상대가 이 증가를 보면 '내가 처치' 판정)
+#   uint32: nonce(접속 시 뽑은 랜덤값; 두 클라가 비교해 스폰 A/B 자동 배정)
 # reloading/shot_seq 는 상대 화면에서 재장전 모션 + 총소리를 재현하기 위한 필드.
 # (shot_seq 는 발사할 때마다 1씩 증가; 수신측이 직전값과 달라지면 '새 발사'로 판정.)
 # dmg_dealt 는 누적값 — 수신측은 직전값과의 증가분만큼 자기 체력을 깎는다(패킷
 #   합쳐짐/유실에도 안전; TCP 라 순서 보장). 65535 에서 wrap(한 세션엔 충분).
 # deaths 는 누적 사망 횟수 — 상대측이 증가를 감지하면 킬 배너/사운드 재생(1:1 이라
 #   상대가 죽었다 = 내가 죽인 것).
-# ⚠ 송신·수신 양쪽이 반드시 이 새 26바이트 포맷이어야 한다. 옛 25/23바이트 클라와
+# nonce 는 세션 고정 랜덤 — 큰 쪽=스폰 A, 작은 쪽=스폰 B. (릴레이가 역할 배정을
+#   못 하므로 두 클라가 nonce 만으로 대칭/자동으로 서로 다른 스폰을 고른다.)
+# ⚠ 송신·수신 양쪽이 반드시 이 새 30바이트 포맷이어야 한다. 옛 26/25바이트 클라와
 #   섞이면 프레임 정렬이 어긋나 좌표가 깨지므로, 두 클라 모두 새 버전이어야 함.
-NET_STATE_FMT = '<5fBBBHB'
-NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 26
+NET_STATE_FMT = '<5fBBBHBI'
+NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 30
 # [수정1] 상대 움직임 지연 완화 — 송신 빈도 ↑ + 수신 보간 수렴 ↑. (외삽/예측은 안 씀;
 # 부작용 분리를 위해 다음 단계에서 별도로.) 둘 다 여기 상수로 빼서 튜닝 쉽게.
 NET_SEND_HZ = 45.0          # 송신 스로틀(40~50Hz 권장; 위치 패킷 21바이트라 부담 적음)
@@ -1074,6 +1077,9 @@ class ZombieGame(ShowBase):
         self._shimmer_fading = False
         self._spawn_pos = Vec3(0, 0, 0)   # 리스폰 지점(아레나면 내 스폰)
         self._spawn_yaw = 0.0
+        # 스폰 자동 배정 — 세션 고정 랜덤 nonce. 상대 nonce 와 비교해 큰 쪽=A, 작은=B.
+        self._nonce = random.randint(1, 0xFFFFFFFF)
+        self._role_decided = False        # 첫 상대 패킷의 nonce 로 스폰 확정
 
         # 윈도우/마우스
         props = WindowProperties()
@@ -3547,22 +3553,23 @@ class ZombieGame(ShowBase):
 
     def _setup_online(self):
         """상대 3인칭 아바타 생성 + 릴레이 접속 + 아레나 스폰/배리어 세팅."""
-        # ── 내 스폰 위치 — 아레나 spawns[0]=A, [1]=B. '--p2' 면 B. ───────────
+        # ── 아레나 — 두 포켓 모두 배리어로 가두고, 임시로 스폰 A 에 둔다.
+        #    실제 스폰(A/B)은 첫 상대 패킷의 nonce 비교로 _decide_role 에서 확정.
         if self._arena_data is not None:
+            # 임시 위치: --p2 면 B, 아니면 A (nonce 결정 전 잠깐). 어차피 둘 다 가둬짐.
             sp = self._arena_data['spawns'][1 if self._spawn_b else 0]
             self._spawn_pos = Vec3(sp[0], sp[1], 0)
             self._spawn_yaw = sp[2]
             self.player_pos = Vec3(self._spawn_pos)
             self.player_yaw = self._spawn_yaw
-            # 스폰 배리어로 즉시 가둠 — 양쪽 준비되면 5초 후 해제(FIGHT).
+            # 스폰 배리어로 즉시 가둠(양 포켓 모두) — 역할 확정 + 준비되면 5초 후 해제.
             self._spawn_barriers = list(self._arena_data.get('spawn_barriers', []))
             self._shimmer_cards = list(self._arena_data.get('shimmer_cards', []))
             self.level_collider.walls.extend(self._spawn_barriers)
             self._barriers_active = True
-            self._countdown_t = None      # 상대 아바타 보이면 카운트다운 시작
-            print(f'[arena] 스폰 {"B" if self._spawn_b else "A"} '
-                  f'({self.player_pos.x:.0f},{self.player_pos.y:.0f}) — 배리어 가둠',
-                  flush=True)
+            self._role_decided = False
+            self._countdown_t = None      # 역할 확정 + 상대 보이면 카운트다운 시작
+            print(f'[arena] 대기 — nonce={self._nonce} (스폰 자동배정)', flush=True)
 
         self._setup_remote_avatar()
         self._connect_relay()
@@ -3718,8 +3725,15 @@ class ZombieGame(ShowBase):
         # 카운트다운 — 배리어가 살아있는 동안만.
         if not self._barriers_active:
             return
+        # 스폰 자동 배정 — 첫 상대 패킷의 nonce(rs[10]) 비교로 A/B 확정.
+        if not self._role_decided:
+            rs = self.remote_state
+            if rs is not None and len(rs) >= 11 and rs[10] != 0:
+                self._decide_role(rs[10])
+            else:
+                return                    # 아직 상대 nonce 없음 → 대기
         if self._countdown_t is None:
-            # 상대 아바타가 보이면(첫 패킷) 양쪽 준비 완료 → 카운트다운 시작.
+            # 역할 확정 + 상대 아바타 보이면 양쪽 준비 완료 → 카운트다운 시작.
             if self.remote_avatar is not None and not self.remote_avatar.isHidden():
                 self._countdown_t = 5.0
                 print('[arena] 양쪽 준비 — 5초 카운트다운 시작', flush=True)
@@ -3730,6 +3744,23 @@ class ZombieGame(ShowBase):
             self.hud_countdown.show()
         else:
             self._arena_release()
+
+    def _decide_role(self, remote_nonce):
+        """상대 nonce 와 비교해 스폰을 확정(큰 쪽=A spawns[0], 작은 쪽=B spawns[1]).
+        동률(극히 드묾)이면 둘 다 A로 떨어질 수 있으나 32비트라 사실상 무시.
+        확정 즉시 해당 스폰으로 텔레포트(두 포켓 다 가둬져 있어 안전)."""
+        am_a = self._nonce >= remote_nonce
+        idx = 0 if am_a else 1
+        sp = self._arena_data['spawns'][idx]
+        self._spawn_pos = Vec3(sp[0], sp[1], 0)
+        self._spawn_yaw = sp[2]
+        self.player_pos = Vec3(self._spawn_pos)
+        self.player_yaw = self._spawn_yaw
+        self.player_vz = 0.0
+        self.on_ground = True
+        self._role_decided = True
+        print(f'[arena] 스폰 자동배정 — 나={"A" if am_a else "B"} '
+              f'({sp[0]},{sp[1]}) nonce {self._nonce} vs {remote_nonce}', flush=True)
 
     def _arena_release(self):
         """카운트다운 종료 — 배리어를 walls 에서 같은 객체로 remove(가둠 해제) +
@@ -4003,13 +4034,13 @@ class ZombieGame(ShowBase):
                     buf = buf[NET_STATE_SIZE:]
                     try:
                         (x, y, z, yaw, pitch, widx, reloading,
-                         shot_seq, dmg_total, deaths) = struct.unpack(
+                         shot_seq, dmg_total, deaths, nonce) = struct.unpack(
                             NET_STATE_FMT, frame)
                     except struct.error:
                         continue
-                    # 참조 교체(원자적) — 위치/시점 + 무기 + 재장전/발사 + 피해 + 사망.
-                    self.remote_state = (x, y, z, yaw, pitch, widx,
-                                         reloading, shot_seq, dmg_total, deaths)
+                    # 참조 교체(원자적) — 위치/시점 + 무기 + 재장전/발사 + 피해 + 사망 + nonce.
+                    self.remote_state = (x, y, z, yaw, pitch, widx, reloading,
+                                         shot_seq, dmg_total, deaths, nonce)
         except OSError:
             pass                      # 끊김 — 마지막 remote_state 유지
         finally:
@@ -4033,7 +4064,8 @@ class ZombieGame(ShowBase):
                               1 if self._reload_oneshot else 0,   # 재장전 중 플래그
                               self._net_shot_seq & 0xFF,          # 발사 카운터
                               self._dmg_dealt & 0xFFFF,           # 상대에 입힌 누적 피해
-                              self._deaths & 0xFF)                # 내 누적 사망 횟수
+                              self._deaths & 0xFF,                # 내 누적 사망 횟수
+                              self._nonce & 0xFFFFFFFF)           # 스폰 배정용 랜덤
             self._sock.sendall(pkt)
         except OSError as e:
             print(f'[net] 송신 실패 ({e}) — 연결 종료', flush=True)

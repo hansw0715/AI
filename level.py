@@ -355,14 +355,30 @@ def build_arena(render, draw_wall_cards=True):
     # ── 외벽 24m × 36m — 4면 막힘(문 없음). ────────────────────────────────
     walls += room_walls(-12, 12, -18, 18)
 
-    # ── 엄폐물 (원점 대칭 — (x,y) 마다 (-x,-y) 동일) ───────────────────────
-    walls += pillar(0, 0)            # 중앙 기둥 — 양 스폰 일직선 사거리 차단(핵심)
-    walls += pillar(-5, 5)           # 저각 엄폐 한 쌍
-    walls += pillar(5, -5)
-    walls += [Wall(-8, 2, -8, -2)]   # 좌측 세로 짧은 벽 4m
-    walls += [Wall(8, -2, 8, 2)]     # 우측 세로 짧은 벽 4m (대칭)
-    walls += pillar(-6, -8)          # 추가 엄폐 한 쌍
-    walls += pillar(6, 8)
+    # ── 엄폐물 (원점 점대칭 — (cx,cy) 마다 (-cx,-cy) 자동 추가) ────────────
+    # 크기 다양: half 0.45(소)~1.0(대) 기둥 + 길이 4~5m 벽. 중앙(0,0)은 자기대칭.
+    pillar_specs = [
+        (0, 0, 1.0),     # 중앙 큰 블록 — 양 스폰 일직선 사거리 차단(핵심)
+        (-9, 1, 0.9),    # 측면 큰 블록
+        (-10, -4, 0.7),  # 코너 중간 블록
+        (-5, 5, 0.6),    # 중간 엄폐
+        (-2, -4, 0.5),   # 중앙 부근 작은 산개
+        (-6, -8, 0.5),   # 스폰 앞 작은 엄폐
+        (-3, 9, 0.45),   # 전방 작은 엄폐
+    ]
+    for cx, cy, hf in pillar_specs:
+        walls += pillar(cx, cy, hf)
+        if (cx, cy) != (0, 0):       # 중앙은 자기대칭이라 한 번만
+            walls += pillar(-cx, -cy, hf)
+
+    wall_specs = [
+        (-8, 3, -8, -2),     # 좌측 세로벽 5m
+        (2, 7, 7, 7),        # 우중 가로벽 5m
+        (-11, 9, -7, 9),     # 좌상 가로벽 4m
+    ]
+    for ax, ay, bx, by in wall_specs:
+        walls.append(Wall(ax, ay, bx, by))
+        walls.append(Wall(-ax, -ay, -bx, -by))   # 점대칭 쌍
 
     if draw_wall_cards:
         for w in walls:
