@@ -141,12 +141,15 @@ RIFLE_PATH = Filename.from_os_specific(
 RELAY_HOST = "37.16.31.147"
 RELAY_PORT = 8080
 # 내 상태 패킷 포맷: (pos.x, pos.y, pos.z, yaw, pitch, weapon_idx).
-# '<5fB' = float32 ×5 + uint8 ×1 = 고정 21바이트. (이전엔 '<5f' 20바이트였는데
-# 무기 인덱스 1바이트(0=권총 1=소총)를 추가했다.)
-# ⚠ 송신·수신 양쪽이 반드시 이 새 21바이트 포맷이어야 한다. 옛 20바이트 클라와
+# '<5fBBB' = float32 ×5 + uint8 ×3 = 고정 23바이트.
+#   floats: x, y, z, yaw, pitch
+#   bytes : widx(0=권총 1=소총), reloading(0/1 재장전 중), shot_seq(발사 카운터 uint8)
+# reloading/shot_seq 는 상대 화면에서 재장전 모션 + 총소리를 재현하기 위한 추가 필드.
+# (shot_seq 는 발사할 때마다 1씩 증가; 수신측이 직전값과 달라지면 '새 발사'로 판정.)
+# ⚠ 송신·수신 양쪽이 반드시 이 새 23바이트 포맷이어야 한다. 옛 21/20바이트 클라와
 #   섞이면 프레임 정렬이 어긋나 좌표가 깨지므로, 두 클라 모두 새 버전이어야 함.
-NET_STATE_FMT = '<5fB'
-NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 21
+NET_STATE_FMT = '<5fBBB'
+NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 23
 # [수정1] 상대 움직임 지연 완화 — 송신 빈도 ↑ + 수신 보간 수렴 ↑. (외삽/예측은 안 씀;
 # 부작용 분리를 위해 다음 단계에서 별도로.) 둘 다 여기 상수로 빼서 튜닝 쉽게.
 NET_SEND_HZ = 45.0          # 송신 스로틀(40~50Hz 권장; 위치 패킷 21바이트라 부담 적음)
@@ -1022,6 +1025,20 @@ class ZombieGame(ShowBase):
         self._remote_weapons = {}         # name -> 무기 NodePath
         self._remote_weapon_order = []    # 등록 순서(로컬과 동일: 0=권총 1=소총)
         self._remote_weapon_shown = None  # 현재 보이는 상대 무기 이름
+        # 상대 발사/재장전 이벤트 재현 + 발소리 — 패킷의 reloading/shot_seq 로 감지.
+        self._net_shot_seq = 0            # 내 발사 카운터(상대가 새 발사 감지용)
+        self._remote_last_shot_seq = None # 마지막으로 본 상대 shot_seq (None=첫 패킷)
+        self._remote_last_reloading = 0   # 직전 프레임 상대 재장전 플래그(상승 에지 감지)
+        self._remote_action_t = 0.0       # 상대 단발 모션(재장전) 재생 중 loco 억제 타이머
+        self._remote_foot_t = 0.0         # 상대 발소리 보폭 누적(초)
+        # 상대 사운드 — 거리별 음량을 매번 바꿔야 해서 로컬과 별도 인스턴스로 로드(online).
+        self._r_sfx_shot = []
+        self._r_sfx_shot_i = 0
+        self._r_sfx_m16 = []
+        self._r_sfx_m16_i = 0
+        self._r_sfx_reload = None
+        self._r_sfx_foot = []
+        self._r_last_foot_i = -1
 
         # 윈도우/마우스
         props = WindowProperties()
@@ -2311,6 +2328,7 @@ class ZombieGame(ShowBase):
         if 'Shoot' not in self.anim_names or self._reload_oneshot:
             return
         self.ammo -= 1
+        self._net_shot_seq = (self._net_shot_seq + 1) & 0xFF  # 상대에 '새 발사' 알림
         self.shoot_cooldown_t = self.shoot_cooldown_dur
         # 발사음 — 활성 무기에 맞춰 선택. 소총=M16(겹침 풀), 그 외=기본 shot.
         name = (self._weapon_order[self._weapon_idx]
@@ -3478,6 +3496,16 @@ class ZombieGame(ShowBase):
         self._register_remote_weapon('rifle', RIFLE_PATH, RIFLE_LOCAL_SCALE,
                                      RIFLE_LOCAL_POS, RIFLE_LOCAL_HPR,
                                      prerot=RIFLE_LOCAL_PREROT)
+
+        # 상대 사운드(총소리/재장전/발소리) — 거리별 음량을 재생할 때마다 setVolume 하므로
+        # 로컬 사운드와 섞이지 않게 별도 인스턴스로 로드한다. (없으면 빈 리스트/None → 무음)
+        self._r_sfx_shot = self._load_sfx_pool('shot.wav', 4)
+        self._r_sfx_m16 = self._load_sfx_pool('m16sound.mp3', 8)
+        self._r_sfx_reload = self._load_sfx('Reload.wav')
+        self._r_sfx_foot = [s for s in (self._load_sfx('f1.mp3'),
+                                        self._load_sfx('f2.mp3'),
+                                        self._load_sfx('f3.mp3')) if s is not None]
+
         print('[net] 상대 아바타 준비 (첫 패킷까지 숨김) '
               f'무기 {len(self._remote_weapon_order)}종', flush=True)
 
@@ -3520,6 +3548,88 @@ class ZombieGame(ShowBase):
             nd.show() if n == name else nd.hide()
         self._remote_weapon_shown = name
 
+    # --- 상대 사운드(거리별 음량) + 발사/재장전 이벤트 ------------------------
+
+    def _remote_dist_volume(self, base, near, far):
+        """상대 아바타와 내 위치 거리로 음량을 스케일해 반환.
+        near 이내 = base(최대), far 이상 = 0(안 들림), 그 사이는 선형 감쇠.
+        (가까울수록 크게 — 총소리/발소리/재장전 공통.)"""
+        if self._remote_smooth is None:
+            return 0.0
+        d = (self._remote_smooth - self.player_pos).length()
+        if d <= near:
+            return base
+        if d >= far:
+            return 0.0
+        return base * (1.0 - (d - near) / (far - near))
+
+    def _play_pool_vol(self, pool, idx_attr, vol):
+        """겹침 풀에서 라운드로빈 재생하되 이번 재생 음량을 vol 로 설정."""
+        if not pool or vol <= 0.0 or self.paused:
+            return
+        i = getattr(self, idx_attr)
+        s = pool[i]
+        s.setVolume(vol)
+        s.play()
+        setattr(self, idx_attr, (i + 1) % len(pool))
+
+    def _handle_remote_events(self, rs):
+        """패킷의 shot_seq/ reloading 변화를 감지해 상대 발사음·재장전 모션/소리 재생.
+        첫 패킷은 기준값만 잡고 아무 것도 재생하지 않는다(접속 직후 오발 방지)."""
+        widx, reloading, shot_seq = rs[5], rs[6], rs[7]
+        is_rifle = (0 <= widx < len(self._remote_weapon_order)
+                    and self._remote_weapon_order[widx] == 'rifle')
+        # 발사 — 카운터가 직전과 다르면 '새 발사'. 거리별 음량으로 총소리 재생.
+        if self._remote_last_shot_seq is None:
+            self._remote_last_shot_seq = shot_seq      # 첫 수신은 baseline 만
+        elif shot_seq != self._remote_last_shot_seq:
+            self._remote_last_shot_seq = shot_seq
+            if is_rifle and self._r_sfx_m16:
+                self._play_pool_vol(self._r_sfx_m16, '_r_sfx_m16_i',
+                                    self._remote_dist_volume(1.3, 5.0, 90.0))
+            else:
+                self._play_pool_vol(self._r_sfx_shot, '_r_sfx_shot_i',
+                                    self._remote_dist_volume(1.0, 5.0, 90.0))
+        # 재장전 — 0→1 상승 에지에서 모션 + 소리(한 번만).
+        if reloading and not self._remote_last_reloading:
+            self._play_remote_reload(is_rifle)
+        self._remote_last_reloading = reloading
+
+    def _play_remote_reload(self, is_rifle):
+        """상대 아바타에 재장전 단발 모션 + 거리별 음량 재장전 소리.
+        단일 파트 Actor 라 전신 단발로 재생하고, 재생 시간 동안 loco 를 억제한다."""
+        av = self.remote_avatar
+        if av is None:
+            return
+        anim = ('RifleReload' if (is_rifle and 'RifleReload' in self.anim_names)
+                else ('Reload' if 'Reload' in self.anim_names else None))
+        if anim is not None:
+            av.play(anim)
+            self._remote_anim = anim
+            # 재생 시간만큼 loco 루프 억제 → 끝나면 _update_remote_avatar 가 자동 복귀.
+            self._remote_action_t = av.getDuration(anim)
+        if self._r_sfx_reload is not None:
+            vol = self._remote_dist_volume(1.0, 4.0, 35.0)
+            if vol > 0.0:
+                self._r_sfx_reload.setVolume(vol)
+                self._r_sfx_reload.play()
+
+    def _play_remote_footstep(self):
+        """상대 발소리 한 발 — f1/f2/f3 중 직전과 다른 것을, 거리별 음량으로."""
+        pool = self._r_sfx_foot
+        if not pool:
+            return
+        vol = self._remote_dist_volume(0.9, 2.0, 18.0)
+        if vol <= 0.0:
+            return                        # 너무 멀면 안 들림 → 재생 생략
+        n = len(pool)
+        i = random.randrange(n) if n > 1 else 0
+        while n > 1 and i == self._r_last_foot_i:
+            i = random.randrange(n)
+        self._r_last_foot_i = i
+        pool[i].setVolume(vol)
+        pool[i].play()
+
     def _connect_relay(self):
         """릴레이 서버에 TCP 접속. 실패해도 크래시 없이 경고만 찍고 계속(싱글처럼)."""
         try:
@@ -3554,12 +3664,14 @@ class ZombieGame(ShowBase):
                     frame = buf[:NET_STATE_SIZE]
                     buf = buf[NET_STATE_SIZE:]
                     try:
-                        x, y, z, yaw, pitch, widx = struct.unpack(
+                        (x, y, z, yaw, pitch, widx,
+                         reloading, shot_seq) = struct.unpack(
                             NET_STATE_FMT, frame)
                     except struct.error:
                         continue
-                    # 참조 교체(원자적) — 위치/시점 + 무기 인덱스.
-                    self.remote_state = (x, y, z, yaw, pitch, widx)
+                    # 참조 교체(원자적) — 위치/시점 + 무기 인덱스 + 재장전/발사 카운터.
+                    self.remote_state = (x, y, z, yaw, pitch, widx,
+                                         reloading, shot_seq)
         except OSError:
             pass                      # 끊김 — 마지막 remote_state 유지
         finally:
@@ -3579,7 +3691,9 @@ class ZombieGame(ShowBase):
                               self.player_pos.x, self.player_pos.y,
                               self.player_pos.z, self.player_yaw,
                               self.player_pitch,
-                              self._weapon_idx & 0xFF)   # 0=권총 1=소총 (uint8)
+                              self._weapon_idx & 0xFF,            # 0=권총 1=소총 (uint8)
+                              1 if self._reload_oneshot else 0,   # 재장전 중 플래그
+                              self._net_shot_seq & 0xFF)          # 발사 카운터
             self._sock.sendall(pkt)
         except OSError as e:
             print(f'[net] 송신 실패 ({e}) — 연결 종료', flush=True)
@@ -3608,12 +3722,42 @@ class ZombieGame(ShowBase):
         # 애니: 직전 프레임 대비 이동 속도로 run/idle 판정. 실제 있는 이름만 사용.
         moved = (self._remote_smooth - self._remote_prev).length()
         self._remote_prev = Vec3(self._remote_smooth)
-        run = 'RunForward' if 'RunForward' in self.anim_names else None
-        idle = 'Idle' if 'Idle' in self.anim_names else None
-        want = run if (run and moved > dt * 0.5) else idle   # >0.5 m/s 면 run
-        if want and want != self._remote_anim:
+        moving = moved > dt * 0.5     # >0.5 m/s 면 이동 중
+
+        # 발사/재장전 이벤트 — 패킷 카운터/플래그 변화를 감지해 소리 + 단발 모션 재생.
+        # (위치 보간이 끝난 뒤라 거리별 음량 계산이 정확함.)
+        self._handle_remote_events(rs)
+
+        # 소총 장착 시 Rifle* 변형 로코모션을 써서 '소총 든 자세'가 상대에게 보이게.
+        # (로컬 _loco_anim 과 동일한 규칙: Rifle 변형이 있으면 그걸, 없으면 기본.)
+        is_rifle = (0 <= rs[5] < len(self._remote_weapon_order)
+                    and self._remote_weapon_order[rs[5]] == 'rifle')
+
+        def _ranim(base):
+            if is_rifle and ('Rifle' + base) in self.anim_names:
+                return 'Rifle' + base
+            return base if base in self.anim_names else None
+
+        run = _ranim('RunForward')
+        idle = _ranim('Idle')
+        want = run if (run and moving) else idle
+        # 재장전 등 단발 모션 재생 중에는 loco 루프로 덮어쓰지 않음(억제 타이머).
+        if self._remote_action_t > 0.0:
+            self._remote_action_t -= dt
+            if self._remote_action_t <= 0.0:
+                self._remote_anim = None   # 모션 끝 → 아래에서 loco 강제 재개
+        if self._remote_action_t <= 0.0 and want and want != self._remote_anim:
             av.loop(want)
             self._remote_anim = want
+
+        # 발소리 — 상대가 이동 중이면 보폭 간격마다 한 발, 거리 가까울수록 크게.
+        if moving and self._remote_action_t <= 0.0:
+            self._remote_foot_t -= dt
+            if self._remote_foot_t <= 0.0:
+                self._play_remote_footstep()
+                self._remote_foot_t = self.footstep_interval
+        else:
+            self._remote_foot_t = 0.0     # 멈추면 다음 이동 첫 발은 즉시
 
         # 상대 손에 든 무기 — av 손 본의 월드 트랜스폼을 anchor 가 따라가게.
         # (1인칭 트릭은 일절 안 씀: 머리뼈 카메라/어깨피벗/ADS 오프셋/walk-bob 전부 X.
