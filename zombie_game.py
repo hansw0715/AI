@@ -4120,6 +4120,8 @@ class ZombieGame(ShowBase):
                 try:
                     corpse.loadAnims({'DeathHeadshot': ZOMBIE_DEATH_BAM})
                     corpse.play('DeathHeadshot')
+                    # 좀비 죽음과 '똑같이' — 동일 애니(DeathHeadshot) + 동일 재생속도(1.5x).
+                    corpse.setPlayRate(Zombie.DEATH_PLAY_RATE, 'DeathHeadshot')
                 except Exception as e:
                     print('[pvp] 시체 death 애니 실패:', e, flush=True)
             self._corpse = corpse
@@ -4129,6 +4131,7 @@ class ZombieGame(ShowBase):
             av = self.remote_avatar
             if av is not None and self._remote_death_anim is not None:
                 av.play(self._remote_death_anim)
+                av.setPlayRate(Zombie.DEATH_PLAY_RATE, self._remote_death_anim)  # 좀비와 동일 1.5x
                 self._remote_anim = self._remote_death_anim
                 self._remote_action_t = self.DEATHCAM_DUR   # loco 억제(쓰러진 채 유지)
             print('[pvp] 처치 — 3초 자유 이동', flush=True)
