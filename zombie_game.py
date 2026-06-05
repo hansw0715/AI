@@ -141,15 +141,18 @@ RIFLE_PATH = Filename.from_os_specific(
 RELAY_HOST = "37.16.31.147"
 RELAY_PORT = 8080
 # 내 상태 패킷 포맷: (pos.x, pos.y, pos.z, yaw, pitch, weapon_idx).
-# '<5fBBB' = float32 ×5 + uint8 ×3 = 고정 23바이트.
+# '<5fBBBH' = float32 ×5 + uint8 ×3 + uint16 ×1 = 고정 25바이트.
 #   floats: x, y, z, yaw, pitch
 #   bytes : widx(0=권총 1=소총), reloading(0/1 재장전 중), shot_seq(발사 카운터 uint8)
-# reloading/shot_seq 는 상대 화면에서 재장전 모션 + 총소리를 재현하기 위한 추가 필드.
+#   uint16: dmg_dealt(이 클라가 상대에게 누적으로 입힌 총 피해; PvP 체력 동기화용)
+# reloading/shot_seq 는 상대 화면에서 재장전 모션 + 총소리를 재현하기 위한 필드.
 # (shot_seq 는 발사할 때마다 1씩 증가; 수신측이 직전값과 달라지면 '새 발사'로 판정.)
-# ⚠ 송신·수신 양쪽이 반드시 이 새 23바이트 포맷이어야 한다. 옛 21/20바이트 클라와
+# dmg_dealt 는 누적값 — 수신측은 직전값과의 증가분만큼 자기 체력을 깎는다(패킷
+#   합쳐짐/유실에도 안전; TCP 라 순서 보장). 65535 에서 wrap(한 세션엔 충분).
+# ⚠ 송신·수신 양쪽이 반드시 이 새 25바이트 포맷이어야 한다. 옛 23/21바이트 클라와
 #   섞이면 프레임 정렬이 어긋나 좌표가 깨지므로, 두 클라 모두 새 버전이어야 함.
-NET_STATE_FMT = '<5fBBB'
-NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 23
+NET_STATE_FMT = '<5fBBBH'
+NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 25
 # [수정1] 상대 움직임 지연 완화 — 송신 빈도 ↑ + 수신 보간 수렴 ↑. (외삽/예측은 안 씀;
 # 부작용 분리를 위해 다음 단계에서 별도로.) 둘 다 여기 상수로 빼서 튜닝 쉽게.
 NET_SEND_HZ = 45.0          # 송신 스로틀(40~50Hz 권장; 위치 패킷 21바이트라 부담 적음)
@@ -1041,6 +1044,12 @@ class ZombieGame(ShowBase):
         self._r_last_foot_i = -1
         # 상대 플레이어 히트박스 — 좀비와 동일한 본 기반 (캡슐/머리 구). 사격 ray 로 검사.
         self._remote_hitboxes = []        # [(npa, npb, r, zone), ...]
+        # PvP 체력 — 내가 상대에게 입힌 누적 피해(송신) / 상대가 나에게 입힌 누적값(수신).
+        self._dmg_dealt = 0               # 내가 상대에 입힌 총 피해(패킷에 실어 보냄)
+        self._remote_last_dmg_total = None  # 상대가 나에게 입힌 누적값 마지막(첫=None)
+        self._pvp_dead_t = 0.0            # 사망 후 리스폰까지 남은 시간(초; >0 이면 사망중)
+        self._remote_tracer = None        # 상대 총알 궤적 노드(online 일 때 생성)
+        self._remote_tracer_t = 0.0       # 상대 트레이서 표시 남은 시간(초)
 
         # 윈도우/마우스
         props = WindowProperties()
@@ -3524,6 +3533,20 @@ class ZombieGame(ShowBase):
         # 상대 플레이어 히트박스 — 좀비와 동일한 본 기반 캡슐/머리 구를 av 본으로 구성.
         self._remote_hitboxes = self._build_remote_hitboxes(av)
 
+        # 상대 총알 궤적(트레이서) — 로컬 self.tracer 와 동일한 모양의 월드 노드 1개.
+        ls_rt = LineSegs('remote_tracer')
+        ls_rt.setThickness(1)
+        ls_rt.setColor(1.0, 0.9, 0.55, 0.65)
+        ls_rt.moveTo(0, 0, 0)
+        ls_rt.drawTo(0, 30, 0)                # local +Y 로 30m
+        self._remote_tracer = self.render.attachNewNode(ls_rt.create())
+        self._remote_tracer.setTransparency(True)
+        self._remote_tracer.setLightOff()
+        self._remote_tracer.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd))
+        self._remote_tracer.setBin('fixed', 99)
+        self._remote_tracer.setDepthWrite(False)
+        self._remote_tracer.hide()
+
         print('[net] 상대 아바타 준비 (첫 패킷까지 숨김) '
               f'무기 {len(self._remote_weapon_order)}종 '
               f'히트박스 {len(self._remote_hitboxes)}개', flush=True)
@@ -3598,7 +3621,7 @@ class ZombieGame(ShowBase):
         widx, reloading, shot_seq = rs[5], rs[6], rs[7]
         is_rifle = (0 <= widx < len(self._remote_weapon_order)
                     and self._remote_weapon_order[widx] == 'rifle')
-        # 발사 — 카운터가 직전과 다르면 '새 발사'. 거리별 음량으로 총소리 재생.
+        # 발사 — 카운터가 직전과 다르면 '새 발사'. 거리별 음량 총소리 + 총알 궤적.
         if self._remote_last_shot_seq is None:
             self._remote_last_shot_seq = shot_seq      # 첫 수신은 baseline 만
         elif shot_seq != self._remote_last_shot_seq:
@@ -3609,10 +3632,21 @@ class ZombieGame(ShowBase):
             else:
                 self._play_pool_vol(self._r_sfx_shot, '_r_sfx_shot_i',
                                     self._remote_dist_volume(1.0, 5.0, 90.0))
+            self._show_remote_tracer(rs)               # 상대 총알 궤적
         # 재장전 — 0→1 상승 에지에서 모션 + 소리(한 번만).
         if reloading and not self._remote_last_reloading:
             self._play_remote_reload(is_rifle)
         self._remote_last_reloading = reloading
+
+        # PvP 체력 — 상대가 나에게 입힌 누적 피해(rs[8])의 증가분만큼 내 체력을 깎는다.
+        dmg_total = rs[8]
+        if self._remote_last_dmg_total is None:
+            self._remote_last_dmg_total = dmg_total     # 첫 수신은 baseline 만
+        elif dmg_total != self._remote_last_dmg_total:
+            delta = (dmg_total - self._remote_last_dmg_total) & 0xFFFF
+            self._remote_last_dmg_total = dmg_total
+            if delta > 0 and self._pvp_dead_t <= 0.0:
+                self._apply_pvp_damage(delta)
 
     def _play_remote_reload(self, is_rifle):
         """상대 아바타에 재장전 단발 모션 + 거리별 음량 재장전 소리.
@@ -3628,8 +3662,8 @@ class ZombieGame(ShowBase):
             # 재생 시간만큼 loco 루프 억제 → 끝나면 _update_remote_avatar 가 자동 복귀.
             self._remote_action_t = av.getDuration(anim)
         if self._r_sfx_reload is not None:
-            # 가까울수록 크게, 24m 너머는 0(안 들림). near 3m 이내 최대.
-            vol = self._remote_dist_volume(1.0, 3.0, 24.0)
+            # 작게 — base 0.55. 가까울수록 크게, 24m 너머는 0(안 들림). near 3m 이내 최대.
+            vol = self._remote_dist_volume(0.55, 3.0, 24.0)
             if vol > 0.0:
                 self._r_sfx_reload.setVolume(vol)
                 self._r_sfx_reload.play()
@@ -3639,7 +3673,7 @@ class ZombieGame(ShowBase):
         pool = self._r_sfx_foot
         if not pool:
             return
-        vol = self._remote_dist_volume(1.0, 3.0, 26.0)
+        vol = self._remote_dist_volume(1.6, 3.0, 28.0)  # base>1 = 증폭(가까이서 크게)
         if vol <= 0.0:
             return                        # 너무 멀면 안 들림 → 재생 생략
         n = len(pool)
@@ -3707,7 +3741,56 @@ class ZombieGame(ShowBase):
         self._play_pool(self.sfx_hit, '_hit_i')
         self._spawn_hit_particle(world_pos)
         self._spawn_damage_number(world_pos, dmg)
-        print(f'[pvp] 상대 명중 zone={zone} dmg={dmg}', flush=True)
+        # 누적 피해 적립 → 다음 송신 패킷으로 상대에게 전달되어 상대 체력이 깎인다.
+        self._dmg_dealt = (self._dmg_dealt + dmg) & 0xFFFF
+        print(f'[pvp] 상대 명중 zone={zone} dmg={dmg} 누적={self._dmg_dealt}',
+              flush=True)
+
+    def _apply_pvp_damage(self, amount):
+        """상대 총에 맞아 내 체력(core_integrity) 감소. 피격 방향 아크 + 0 되면 리스폰."""
+        self.core_integrity = max(0, self.core_integrity - amount)
+        # 피격 방향 — 상대 아바타 위치를 source 로 빨간 아크 표시(좀비 피격과 동일).
+        if self._remote_smooth is not None:
+            self._show_damage_dir(self._remote_smooth)
+        print(f'[pvp] 피격 -{amount} → 체력 {self.core_integrity}', flush=True)
+        if self.core_integrity <= 0:
+            self._pvp_die()
+
+    def _pvp_die(self):
+        """체력 0 — 짧은 사망 후 스폰 지점으로 리스폰(체력/탄 회복). 점수는 없음."""
+        self._pvp_dead_t = 2.0
+        print('[pvp] 사망 — 리스폰 대기', flush=True)
+        # 2초 뒤 리스폰. (doMethodLater 단발 — pause 와 무관히 실시간으로 흐름)
+        self.taskMgr.doMethodLater(self._pvp_dead_t, self._pvp_respawn,
+                                   'pvp_respawn')
+
+    def _pvp_respawn(self, task=None):
+        """스폰 지점(원점)으로 복귀 + 체력/탄창 회복."""
+        self.player_pos = Vec3(0, 0, 0)
+        self.player_vz = 0.0
+        self.on_ground = True
+        self.core_integrity = self.core_integrity_max
+        self.ammo = self.ammo_max
+        self._pvp_dead_t = 0.0
+        print('[pvp] 리스폰 완료', flush=True)
+        return Task.done
+
+    def _show_remote_tracer(self, rs):
+        """상대 발사 시 상대 무기 머즐에서 상대 조준 방향으로 총알 궤적(트레이서) 표시.
+        로컬 self.tracer 와 동일한 방식 — 월드 노드를 위치/방향만 잡고 잠깐 보였다 숨김."""
+        tr = self._remote_tracer
+        if tr is None:
+            return
+        # 머즐 위치 — 상대 무기 앵커(손 본)를 따라가므로 그 월드 좌표를 시작점으로.
+        if (self._remote_weapon_anchor is not None
+                and not self._remote_weapon_anchor.isEmpty()):
+            tr.setPos(self._remote_weapon_anchor.getPos(self.render))
+        elif self._remote_smooth is not None:
+            tr.setPos(self._remote_smooth + Vec3(0, 0, self.head_height))
+        # 방향 — 상대 yaw/pitch(rs[3], rs[4]). 로컬 트레이서와 동일한 heading 규칙.
+        tr.setHpr(rs[3], rs[4], 0)
+        tr.show()
+        self._remote_tracer_t = self.tracer_dur
 
     def _connect_relay(self):
         """릴레이 서버에 TCP 접속. 실패해도 크래시 없이 경고만 찍고 계속(싱글처럼)."""
@@ -3744,13 +3827,13 @@ class ZombieGame(ShowBase):
                     buf = buf[NET_STATE_SIZE:]
                     try:
                         (x, y, z, yaw, pitch, widx,
-                         reloading, shot_seq) = struct.unpack(
+                         reloading, shot_seq, dmg_total) = struct.unpack(
                             NET_STATE_FMT, frame)
                     except struct.error:
                         continue
-                    # 참조 교체(원자적) — 위치/시점 + 무기 인덱스 + 재장전/발사 카운터.
+                    # 참조 교체(원자적) — 위치/시점 + 무기 + 재장전/발사 + 누적 피해.
                     self.remote_state = (x, y, z, yaw, pitch, widx,
-                                         reloading, shot_seq)
+                                         reloading, shot_seq, dmg_total)
         except OSError:
             pass                      # 끊김 — 마지막 remote_state 유지
         finally:
@@ -3772,7 +3855,8 @@ class ZombieGame(ShowBase):
                               self.player_pitch,
                               self._weapon_idx & 0xFF,            # 0=권총 1=소총 (uint8)
                               1 if self._reload_oneshot else 0,   # 재장전 중 플래그
-                              self._net_shot_seq & 0xFF)          # 발사 카운터
+                              self._net_shot_seq & 0xFF,          # 발사 카운터
+                              self._dmg_dealt & 0xFFFF)           # 상대에 입힌 누적 피해
             self._sock.sendall(pkt)
         except OSError as e:
             print(f'[net] 송신 실패 ({e}) — 연결 종료', flush=True)
@@ -3853,6 +3937,12 @@ class ZombieGame(ShowBase):
                 self._remote_hand.getHpr(self.render))
         # 무기 종류 동기화 — 패킷의 무기 인덱스(rs[5])에 맞는 모델만 보이게.
         self._show_remote_weapon(rs[5])
+
+        # 상대 총알 궤적 — 잠깐 보였다 시간 지나면 숨김(로컬 tracer 와 동일 방식).
+        if self._remote_tracer_t > 0.0:
+            self._remote_tracer_t -= dt
+            if self._remote_tracer_t <= 0.0 and self._remote_tracer is not None:
+                self._remote_tracer.hide()
 
     def _net_shutdown(self):
         """소켓 close + 수신 스레드 종료 신호(데몬이라 프로세스와 함께 사라짐)."""
