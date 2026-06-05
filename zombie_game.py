@@ -1102,6 +1102,13 @@ class ZombieGame(ShowBase):
         self._spawn_yaw = 0.0
         self._platforms = []              # 올라타는 박스 [{x0,x1,y0,y1,top,collider}]
         self._step_assist = 0.45          # 이 높이 차 이내면 옆면 통과+윗면 스냅(스텝업)
+        # 데스캠 — 사망 시 3초간: 죽은 사람은 자기 시체 위 3인칭 뷰(고정), 죽인 사람은 자유 이동.
+        self.DEATHCAM_DUR = 3.0
+        self._deathcam_t = 0.0            # >0 이면 데스캠/유예 진행 중(끝나면 라운드 리셋)
+        self._dead = False                # 내가 이번 라운드 사망자인가(시점 고정+시체)
+        self._corpse = None               # 죽은 내 몸 Actor(death 애니 재생)
+        self._death_yaw = 0.0             # 죽은 순간 방향(데스캠 카메라 각도용)
+        self._remote_death_anim = None    # 상대 아바타에 로드된 death 애니 이름
         # 스폰 자동 배정 — 세션 고정 랜덤 nonce. 상대 nonce 와 비교해 큰 쪽=A, 작은=B.
         self._nonce = random.randint(1, 0xFFFFFFFF)
         self._role_decided = False        # 첫 상대 패킷의 nonce 로 스폰 확정
@@ -2409,6 +2416,8 @@ class ZombieGame(ShowBase):
     def _play_shoot_oneshot(self):
         if self.paused:
             return
+        if self._dead or self._barriers_active:
+            return  # 사망 중/라운드 카운트다운(가둠) 중엔 발사 안 함
         if self._swap_state != 'idle':
             return  # 무기 교체(스왑) 모션 중 — 발사 안 함
         if self.ammo <= 0:
@@ -3187,6 +3196,35 @@ class ZombieGame(ShowBase):
             parent=self.aspect2d)
         self.hud_countdown.hide()
 
+        # 결과/대기 배경은 가장 마지막에 만들어 다른 HUD 보다 뒤(bin)에 깔리게 하고,
+        # 그 위 텍스트는 더 앞 bin 으로 → 어두운 패널 위에 글자가 보인다.
+        self.hud_match_result.setBin('fixed', 60)
+        # ── 대기방 — 상대 접속 전 어둡게 + 안내문(online 시작 직후). ───────────
+        self.hud_wait_bg = DirectFrame(
+            frameColor=(0.02, 0.03, 0.05, 0.80), frameSize=(-2, 2, -2, 2),
+            parent=self.aspect2d)
+        self.hud_wait_bg.setBin('fixed', 50)
+        self.hud_wait = OnscreenText(
+            text='대기방\n\n다른 플레이어를 기다리는 중...', pos=(0, 0.12),
+            scale=0.085, fg=(0.85, 0.92, 1.0, 1), align=TextNode.ACenter,
+            mayChange=True, parent=self.aspect2d)
+        self.hud_wait.setBin('fixed', 60)
+        self.hud_wait_bg.hide()
+        self.hud_wait.hide()
+
+        # ── 결과창 — 매치 종료 시 승/패 + 킬/데스. (어두운 패널 + 텍스트) ──────
+        self.hud_result_bg = DirectFrame(
+            frameColor=(0.02, 0.03, 0.05, 0.85), frameSize=(-2, 2, -2, 2),
+            parent=self.aspect2d)
+        self.hud_result_bg.setBin('fixed', 50)
+        self.hud_result = OnscreenText(
+            text='', pos=(0, -0.12), scale=0.12,
+            fg=(0.9, 0.95, 1.0, 1), align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d)
+        self.hud_result.setBin('fixed', 60)
+        self.hud_result_bg.hide()
+        self.hud_result.hide()
+
         # 우상단 미니맵 — minimap.png (1040×1040, 정사각)
         # 가운데 도트는 별도 DirectFrame (위치/색 갱신용).
         self.hud_map_img = self._hud_img(
@@ -3611,6 +3649,10 @@ class ZombieGame(ShowBase):
         # PvP 점수 HUD 표시 (먼저 10점 승리). 단일플레이에선 숨김 유지.
         self.hud_score.show()
         self._update_score_hud()
+        # 대기방 — 상대 접속(첫 패킷) 전까지 어둡게 + 안내. 카운트다운 시작 시 숨김.
+        if self._arena_data is not None:
+            self.hud_wait_bg.show()
+            self.hud_wait.show()
 
     def _setup_remote_avatar(self):
         """상대용 ybot Actor 하나 더 생성 — 평범한 3인칭 월드 Actor.
@@ -3620,6 +3662,13 @@ class ZombieGame(ShowBase):
         av.reparentTo(self.render)
         av.setPos(0, 0, 0)
         av.setH(180)                  # self.ybot 과 동일한 +180 기준
+        # 사망 애니(death_headshot.bam) 바인딩 — 좀비와 동일 mixamorig 본. 처치 감지 시 재생.
+        if ZOMBIE_DEATH_BAM.exists():
+            try:
+                av.loadAnims({'DeathHeadshot': ZOMBIE_DEATH_BAM})
+                self._remote_death_anim = 'DeathHeadshot'
+            except Exception as e:
+                print('[net] 상대 death 애니 로드 실패:', e, flush=True)
         idle = 'Idle' if 'Idle' in self.anim_names else (
             self.anim_names[0] if self.anim_names else None)
         if idle:
@@ -3742,6 +3791,13 @@ class ZombieGame(ShowBase):
     def _arena_update(self, dt):
         """스폰 배리어 흐름 — 양쪽 준비되면 5초 카운트다운, 끝나면 배리어 제거
         (가둠 해제) + shimmer fade out + FIGHT! 배너. 아레나(online) 전용."""
+        # 데스캠/유예(사망 후 3초) — 끝나면 시점 복구 + 라운드 리셋. 이 동안은 그 외 정지.
+        if self._deathcam_t > 0.0:
+            self._deathcam_t -= dt
+            if self._deathcam_t <= 0.0:
+                self._exit_deathcam()
+                self._arena_round_reset()
+            return
         # shimmer fade out (해제 후 진행)
         if self._shimmer_fading and self._shimmer_cards:
             self._shimmer_a = max(0.0, self._shimmer_a - dt / 0.6)
@@ -3771,6 +3827,8 @@ class ZombieGame(ShowBase):
             # 역할 확정 + 상대 아바타 보이면 양쪽 준비 완료 → 카운트다운 시작.
             if self.remote_avatar is not None and not self.remote_avatar.isHidden():
                 self._countdown_t = 5.0
+                self.hud_wait_bg.hide()   # 대기방 종료 — 상대 입장
+                self.hud_wait.hide()
                 print('[arena] 양쪽 준비 — 5초 카운트다운 시작', flush=True)
             return
         self._countdown_t -= dt
@@ -3878,7 +3936,7 @@ class ZombieGame(ShowBase):
         pool = self._r_sfx_foot
         if not pool:
             return
-        vol = self._remote_dist_volume(2.6, 2.0, 26.0)  # base>1 증폭 — 가까이서 더 크게
+        vol = self._remote_dist_volume(7.8, 2.0, 26.0)  # base 7.8 = 직전(2.6)의 3배 증폭
         if vol <= 0.0:
             return                        # 너무 멀면 안 들림 → 재생 생략
         n = len(pool)
@@ -3981,9 +4039,9 @@ class ZombieGame(ShowBase):
               flush=True)
 
     def _apply_pvp_damage(self, amount):
-        """상대 총에 맞아 내 체력(core_integrity) 감소. 피격 방향 아크 + 0 되면 라운드 리셋."""
-        if self._match_over or self._barriers_active:
-            return                        # 매치 종료/카운트다운(가둠) 중엔 피해 없음
+        """상대 총에 맞아 내 체력(core_integrity) 감소. 피격 방향 아크 + 0 되면 사망."""
+        if self._match_over or self._barriers_active or self._deathcam_t > 0.0:
+            return                        # 매치 종료/카운트다운/데스캠 중엔 피해 없음
         self.core_integrity = max(0, self.core_integrity - amount)
         # 피격 방향 — 상대 아바타 위치를 source 로 빨간 아크 표시(좀비 피격과 동일).
         if self._remote_smooth is not None:
@@ -4004,21 +4062,29 @@ class ZombieGame(ShowBase):
         if self._my_score >= self.WIN_SCORE:
             self._end_match(True)
         else:
-            self._arena_round_reset()    # 양쪽 스폰 복귀 + 5초 후 재시작
+            self._enter_deathcam(victim=False)   # 3초 자유 이동 → 라운드 리셋
 
     def _update_score_hud(self):
         """상단 중앙 점수 텍스트 갱신 (online 일 때만 보임)."""
         self.hud_score.setText(f'{self._my_score} : {self._enemy_score}')
 
     def _end_match(self, won):
-        """매치 종료 — 승/패 배너 표시 + 이후 점수/리스폰 정지."""
+        """매치 종료 — 결과창(승/패 + 킬/데스) 표시 + 이후 정지. 진행 중이면 데스캠도 정리."""
         self._match_over = True
+        # 데스캠 중이었다면 시점/시체 정리(결과창 잘 보이게).
+        self._deathcam_t = 0.0
+        self._exit_deathcam()
+        # 킬 = 내가 상대를 죽인 횟수(my_score), 데스 = 내가 죽은 횟수(enemy_score).
         self.hud_match_result.setText('승리!' if won else '패배...')
         self.hud_match_result.setFg((0.30, 1.0, 0.45, 1.0) if won
                                     else (1.0, 0.35, 0.35, 1.0))
+        self.hud_result.setText(f'킬  {self._my_score}      데스  {self._enemy_score}')
+        self.hud_result_bg.show()
         self.hud_match_result.show()
+        self.hud_result.show()
+        self.hud_countdown.hide()
         print(f'[pvp] 매치 종료 — {"WIN" if won else "LOSE"} '
-              f'{self._my_score}:{self._enemy_score}', flush=True)
+              f'kills={self._my_score} deaths={self._enemy_score}', flush=True)
 
     def _pvp_die(self):
         """체력 0 — 내 사망 +1(상대 점수 +1). 상대가 10점이면 패배(매치 종료),
@@ -4031,7 +4097,57 @@ class ZombieGame(ShowBase):
         if self._enemy_score >= self.WIN_SCORE:
             self._end_match(False)         # 매치 종료
         else:
-            self._arena_round_reset()      # 양쪽 스폰 복귀 + 5초 후 재시작
+            self._enter_deathcam(victim=True)   # 3초 내 시체 위 3인칭 → 라운드 리셋
+
+    def _enter_deathcam(self, victim):
+        """사망 처리 3초 유예. victim=True(죽은 사람): 시점 고정 + 내 시체(death 애니)
+        를 머리 위 3인칭으로 본다. victim=False(죽인 사람): 3초 자유 이동, 상대 아바타는
+        쓰러진다. 3초 뒤 _arena_update 가 _exit_deathcam + 라운드 리셋."""
+        if self._match_over:
+            return
+        self._deathcam_t = self.DEATHCAM_DUR
+        if victim:
+            self._dead = True
+            self._death_yaw = self.player_yaw
+            # 1인칭 팔/총 숨기고, 그 자리에 death 애니 재생하는 시체 Actor 생성.
+            self.ybot.hide()
+            self.weapon_anchor.hide()
+            corpse = Actor(BAM_PATH)
+            corpse.reparentTo(self.render)
+            corpse.setPos(self.player_pos)
+            corpse.setH(self.player_yaw + 180)
+            if ZOMBIE_DEATH_BAM.exists():
+                try:
+                    corpse.loadAnims({'DeathHeadshot': ZOMBIE_DEATH_BAM})
+                    corpse.play('DeathHeadshot')
+                except Exception as e:
+                    print('[pvp] 시체 death 애니 실패:', e, flush=True)
+            self._corpse = corpse
+            print('[pvp] 사망 — 3초 데스캠', flush=True)
+        else:
+            # 상대(죽은 자)를 쓰러뜨리는 모션 — 상대 아바타에 death 애니 재생.
+            av = self.remote_avatar
+            if av is not None and self._remote_death_anim is not None:
+                av.play(self._remote_death_anim)
+                self._remote_anim = self._remote_death_anim
+                self._remote_action_t = self.DEATHCAM_DUR   # loco 억제(쓰러진 채 유지)
+            print('[pvp] 처치 — 3초 자유 이동', flush=True)
+
+    def _exit_deathcam(self):
+        """데스캠 종료 — 시체 제거 + 1인칭 복구. (라운드 리셋 직전 호출.)"""
+        if self._corpse is not None:
+            try:
+                self._corpse.cleanup()
+                self._corpse.removeNode()
+            except Exception:
+                pass
+            self._corpse = None
+        if self._dead:
+            self._dead = False
+            self.ybot.show()
+            self.weapon_anchor.show()
+        self._remote_action_t = 0.0   # 상대 death 모션 해제 → loco 자동 복귀
+        self._remote_anim = None
 
     def _arena_round_reset(self):
         """한 명이 죽으면 호출 — 내 스폰으로 복귀 + 체력/탄 회복 + 스폰 배리어 재가둠
@@ -4345,9 +4461,9 @@ class ZombieGame(ShowBase):
                 self.editor_yaw -= dx * self.mouse_sens
                 self.editor_pitch -= dy * self.mouse_sens
                 self.editor_pitch = max(-89.0, min(89.0, self.editor_pitch))
-            else:
+            elif not self._dead:
                 # 1인칭 yaw + pitch — 위·아래 ±89° (총 178°) 자유 시야.
-                # ADS 시 감도 낮춤 → 손/총 좌우 swing 천천히·작게.
+                # ADS 시 감도 낮춤 → 손/총 좌우 swing 천천히·작게. (사망 중엔 동결)
                 sens = self.mouse_sens * (
                     1.0 + (self.ads_mouse_factor - 1.0) * self.aim_t)
                 self.player_yaw -= dx * sens
@@ -4376,10 +4492,11 @@ class ZombieGame(ShowBase):
                 forward = Vec3(-sin(yr), cos(yr), 0)
                 right_v = Vec3(cos(yr), sin(yr), 0)
                 mv = Vec3(0, 0, 0)
-                if self.keys['w']: mv += forward
-                if self.keys['s']: mv -= forward
-                if self.keys['d']: mv += right_v
-                if self.keys['a']: mv -= right_v
+                if not self._dead:        # 사망 중엔 이동 동결(데스캠 고정)
+                    if self.keys['w']: mv += forward
+                    if self.keys['s']: mv -= forward
+                    if self.keys['d']: mv += right_v
+                    if self.keys['a']: mv -= right_v
                 if mv.length() > 0:
                     mv.normalize()
                     spd_mult = 1.0 + (self.ads_move_factor - 1.0) * self.aim_t
@@ -4404,7 +4521,7 @@ class ZombieGame(ShowBase):
                                 self.player_pos.x, self.player_pos.y, PLAYER_RADIUS)
                             self.player_pos.x = nx
                             self.player_pos.y = ny
-                if self.keys['space'] and self.on_ground:
+                if self.keys['space'] and self.on_ground and not self._dead:
                     self.player_vz = self.jump_speed
                     self.on_ground = False
 
@@ -4546,6 +4663,15 @@ class ZombieGame(ShowBase):
                        + Vec3(0, 0, new_up))
             self.camera.setPos(cam_pos)
             self.camera.setHpr(self.player_yaw, self.player_pitch, 0)
+
+        # 데스캠 — 죽은 사람은 자기 시체 머리 위(뒤쪽) 3인칭에서 내려다봄.
+        if self._dead and self._corpse is not None:
+            base = self._corpse.getPos(self.render)
+            yr = radians(self._death_yaw)
+            behind = Vec3(sin(yr), -cos(yr), 0)        # 시선 forward 의 반대
+            cam_pos = base + behind * 2.6 + Vec3(0, 0, 3.6)
+            self.camera.setPos(cam_pos)
+            self.camera.lookAt(base + Vec3(0, 0, 0.8))
 
         # weapon anchor 갱신: hand 본 따라감. 이제 ybot 자체가 head 본 피벗으로
         # pitch 되어 손 본도 같이 회전 → player_pitch 를 따로 더할 필요 없음
