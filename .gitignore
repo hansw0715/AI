@@ -22,3 +22,6 @@ _verify_*.py
 kenney_particle-pack/
 # 사용 안 하는 원본 오디오 (f1/f2/f3.mp3 로 대체됨)
 footstep.aiff
+
+# 적 테두리 색 등 런타임 설정(사용자별)
+settings.json

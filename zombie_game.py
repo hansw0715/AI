@@ -3,6 +3,7 @@ zombie_game — Mirror's Edge style 1인칭 좀비 슈터 (Panda3D)
 Stage 1: 1인칭 카메라 + Y Bot 풀바디 + 기본 입력.
 """
 import atexit
+import json
 import random
 import socket
 import struct
@@ -12,7 +13,7 @@ from math import atan2, ceil, cos, degrees, radians, sin
 from pathlib import Path
 
 from direct.actor.Actor import Actor
-from direct.gui.DirectGui import DirectButton, DirectFrame, DirectSlider
+from direct.gui.DirectGui import DirectButton, DirectEntry, DirectFrame, DirectSlider
 from direct.gui.OnscreenImage import OnscreenImage
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
@@ -21,7 +22,8 @@ from direct.interval.IntervalGlobal import (
     Func, LerpColorScaleInterval, LerpScaleInterval, Parallel, Sequence, Wait,
 )
 from panda3d.core import (
-    AmbientLight, CardMaker, ClockObject, ColorBlendAttrib, DirectionalLight, Filename,
+    AmbientLight, CardMaker, ClockObject, ColorBlendAttrib, CullFaceAttrib,
+    DirectionalLight, Filename,
     Geom, GeomNode, GeomTriangles, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
     LineSegs, NodePath, PerspectiveLens, Quat, Spotlight, TextNode, Triangulator,
     Vec3, Vec4, WindowProperties, loadPrcFileData,
@@ -105,6 +107,46 @@ GLITCH_LABELS = {
 
 
 SCRIPT_DIR = Path(__file__).parent
+
+# 적 테두리(아웃라인) 색 팔레트 — 시작 메뉴에서 고른다. (이름, RGBA)
+OUTLINE_PALETTE = [
+    ('빨강', (1.00, 0.05, 0.12, 1.0)),
+    ('주황', (1.00, 0.45, 0.05, 1.0)),
+    ('노랑', (1.00, 0.92, 0.10, 1.0)),
+    ('초록', (0.20, 1.00, 0.28, 1.0)),
+    ('하늘', (0.20, 0.85, 1.00, 1.0)),
+    ('분홍', (1.00, 0.30, 0.80, 1.0)),
+    ('흰색', (1.00, 1.00, 1.00, 1.0)),
+]
+# 설정 파일(JSON) — 고른 테두리 색을 저장해 게임 재시작(메인 복귀) 후에도 유지.
+SETTINGS_PATH = SCRIPT_DIR / 'settings.json'
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_outline_color():
+    c = _load_settings().get('outline_color')
+    if isinstance(c, (list, tuple)) and len(c) == 4:
+        return tuple(c)
+    return OUTLINE_PALETTE[0][1]   # 기본 빨강
+
+
+def _save_outline_color(color):
+    data = _load_settings()
+    data['outline_color'] = list(color)
+    try:
+        with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print('[settings] 저장 실패:', e, flush=True)
+
+
 # Quaternius sci-fi 키트 시각 레이어 사용 여부. False = 기본 맵(level.py 단색 벽).
 USE_KIT_MAP = False
 BAM_PATH = Filename.from_os_specific(
@@ -156,10 +198,13 @@ RELAY_PORT = 8080
 #   상대가 죽었다 = 내가 죽인 것).
 # nonce 는 세션 고정 랜덤 — 큰 쪽=스폰 A, 작은 쪽=스폰 B. (릴레이가 역할 배정을
 #   못 하므로 두 클라가 nonce 만으로 대칭/자동으로 서로 다른 스폰을 고른다.)
-# ⚠ 송신·수신 양쪽이 반드시 이 새 30바이트 포맷이어야 한다. 옛 26/25바이트 클라와
-#   섞이면 프레임 정렬이 어긋나 좌표가 깨지므로, 두 클라 모두 새 버전이어야 함.
-NET_STATE_FMT = '<5fBBBHBI'
-NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)   # = 30
+# name(24s) = 준비방 표시용 플레이어 이름(UTF-8, 24바이트 고정; 남는 자리 \x00 패딩).
+# ready(B) = 준비완료 플래그(0/1) — 양쪽 ready 면 게임 시작(준비방 종료).
+# ⚠ 송신·수신 양쪽이 반드시 이 새 포맷이어야 한다. 옛 클라와 섞이면 프레임 정렬이
+#   어긋나 좌표가 깨지므로, 두 클라 모두 새 버전이어야 함.
+NET_STATE_FMT = '<5fBBBHBI24sB'
+NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)
+NET_NAME_BYTES = 24
 # [수정1] 상대 움직임 지연 완화 — 송신 빈도 ↑ + 수신 보간 수렴 ↑. (외삽/예측은 안 씀;
 # 부작용 분리를 위해 다음 단계에서 별도로.) 둘 다 여기 상수로 빼서 튜닝 쉽게.
 NET_SEND_HZ = 45.0          # 송신 스로틀(40~50Hz 권장; 위치 패킷 21바이트라 부담 적음)
@@ -361,6 +406,9 @@ class Zombie:
         self._anim_prev = None
         self._anim_blend_t = 0.0
         self._play('Idle', loop=True)
+
+        # 발로란트식 빨간 테두리 — 적(좀비)이 눈에 잘 띄게.
+        self.outline = game._attach_outline(self.actor)
 
         # HP / health bar
         self.hp_max = 100
@@ -1036,16 +1084,48 @@ class Gate:
 
 
 class ZombieGame(ShowBase):
-    def __init__(self, online=False, spawn_b=False):
+    def __init__(self, online=False, spawn_b=False, menu=True):
         super().__init__()
         # 아레나 스폰 측 — False=스폰 A(0,-15 북향), True=스폰 B(0,15 남향).
         # 두 클라이언트가 겹치지 않게 한쪽은 '--p2' 로 띄운다(릴레이는 역할 배정 못함).
         self._spawn_b = spawn_b
+        # menu=True → 시작 화면(타이틀+싱글/멀티 선택)부터. False(=--online/--p2 직접
+        # 실행)면 메뉴 건너뛰고 바로 해당 모드로 진입. _build_start_menu/_start_game 참조.
+        self._use_menu = menu
+        # 적 테두리 색 — settings.json 에서 불러옴(없으면 빨강). 시작 메뉴에서 변경.
+        self.outline_color = _load_outline_color()
+        self._remote_outline = None       # 상대 아바타 테두리 노드(라이브 색변경용)
+        self._swatch_hl = None            # 메뉴 색 스와치 선택 하이라이트 프레임
 
         # ── 온라인(1:1 멀티) 모드 플래그 + 네트워크 상태 ────────────────────
         # online=True ('--online') 일 때만 소켓 접속 + 상대 아바타 + 좀비/웨이브
         # 정지 + 튜닝키 차단. 싱글(False)은 아래 변수들을 일절 안 쓰므로 동작 동일.
         self.online_mode = online
+        # AI 대결 모드 — 아레나에서 상대 자리에 AI 봇(소총 추격/무빙/사격). _start_game 이 설정.
+        self.ai_mode = False
+        self.ai_max_hp = 100
+        self.ai_hp = self.ai_max_hp
+        self._ai_pos = Vec3(0, 0, 0)      # AI 봇 현재 위치(이동/충돌 해소 대상)
+        self._ai_spawn = Vec3(0, 0, 0)    # AI 스폰(라운드 리셋 시 복귀)
+        self._ai_yaw = 0.0
+        self._ai_fire_t = 0.0             # 사격 쿨다운 누적(초)
+        self._ai_foot_t = 0.0             # 발소리 보폭 누적(초)
+        self._ai_strafe_dir = 1           # 좌우 스트레이프 방향(+1/-1)
+        self._ai_strafe_t = 0.0           # 스트레이프 방향 전환까지 남은 시간(초)
+        # AI 튜닝 — 이동/교전 거리/사격.
+        self.AI_SPEED = 4.2               # m/s
+        self.AI_PREF_MIN = 5.0            # 이보다 가까우면 후퇴
+        self.AI_PREF_MAX = 11.0           # 이보다 멀면 접근
+        self.AI_SHOOT_RANGE = 32.0        # 이 안이면 사격 시도
+        self.AI_FIRE_INTERVAL = 0.22      # 발 간격(초) — 소총 연사 느낌
+        self.AI_DMG = 10                  # 한 발 명중 시 내 체력 감소
+        # 준비방(로비) — 멀티 입장 시 이름 입력 + 양쪽 준비완료 후 시작.
+        self.player_name = 'PLAYER'   # 멀티 입장 시 이름 입력으로 덮어씀(패킷에 실어 전송)
+        self._in_lobby = False        # 준비방 진행 중(커서 보이게 + 마우스룩/카운트다운 보류)
+        self._ready = False           # 내 준비완료 여부(패킷에 실어 전송)
+        self._remote_ready = 0        # 상대 준비완료(수신)
+        self._remote_name = ''        # 상대 이름(수신)
+        self.lobby_root = None        # 준비방 UI 루트(자식 정리용)
         self.remote_state = None      # 수신 스레드가 최신 (x,y,z,yaw,pitch) 저장
         self.remote_avatar = None     # 상대 3인칭 아바타 Actor (online 일 때만 생성)
         self._sock = None
@@ -1114,14 +1194,33 @@ class ZombieGame(ShowBase):
         self._nonce = random.randint(1, 0xFFFFFFFF)
         self._role_decided = False        # 첫 상대 패킷의 nonce 로 스폰 확정
 
-        # 윈도우/마우스
+        # 윈도우/마우스 — 시작 메뉴 동안은 커서 보이게(버튼 클릭용). 게임 시작 시
+        # _build_world() 가 커서 숨김 + 화면 가둠(FPS 마우스룩)으로 전환한다.
         props = WindowProperties()
         props.setTitle('zombie_game')
-        props.setCursorHidden(True)
-        props.setMouseMode(WindowProperties.M_confined)
         self.win.requestProperties(props)
         self.disableMouse()  # ShowBase 기본 마우스-카메라 비활성
         self._is_fullscreen = False   # F11 토글 — 진짜 전체화면(작업표시줄 가림)
+        self.setBackgroundColor(0.015, 0.020, 0.030)   # 어두운 검푸른 야간 하늘
+
+        # ── 시작 화면 ───────────────────────────────────────────────────────
+        # 타이틀 + 싱글/멀티/종료 메뉴. 월드 빌드(_build_world)는 메뉴 선택 이후로
+        # 미룬다 — online_mode 가 레벨(아레나 vs 캠페인)·좀비·네트워크를 좌우하므로
+        # 모드가 정해지기 전엔 만들 수 없다. _use_menu=False 면 바로 빌드.
+        self._game_started = False
+        self._menu_root = None
+        if self._use_menu:
+            self._build_start_menu()
+        else:
+            self._build_world()
+
+    def _build_world(self):
+        # 게임 진입 — 커서 숨김 + 화면 가둠(FPS 마우스룩). 메뉴를 거쳤든 직접
+        # 실행이든 실제 게임 월드는 여기서 한 번만 만들어진다.
+        gprops = WindowProperties()
+        gprops.setCursorHidden(True)
+        gprops.setMouseMode(WindowProperties.M_confined)
+        self.win.requestProperties(gprops)
 
         # 환경
         self.setBackgroundColor(0.015, 0.020, 0.030)   # 어두운 검푸른 야간 하늘
@@ -1137,8 +1236,8 @@ class ZombieGame(ShowBase):
         import os
         kit_available = USE_KIT_MAP and os.path.isfile("assets/kit/Wall_1.bam")
         self.kit_root = None
-        if self.online_mode:
-            # 1대1 PvP — 좀비 캠페인 레벨 대신 대칭 아레나. kit_map 미적용(단색 벽).
+        if self.online_mode or self.ai_mode:
+            # 1대1 PvP(온라인) / AI 대결 — 좀비 캠페인 레벨 대신 대칭 아레나.
             self.level_collider, self.level_data = build_arena(
                 self.render, draw_wall_cards=True)
             self._arena_data = self.level_data
@@ -1600,16 +1699,173 @@ class ZombieGame(ShowBase):
         # 온라인: 좀비/웨이브 완전 정지 — _spawn_points 만 비우면 _update 의 웨이브
         # 매니저('if self._spawn_points:')가 통째로 안 돌아 스폰/인터미션/WAVE
         # 메시지가 전부 멈춘다. (다른 데 if 흩뿌리지 않는다.) 좀비 목록도 비움.
-        if self.online_mode:
+        if self.online_mode or self.ai_mode:
             self._spawn_points = []
             self.zombies = []
+        if self.online_mode:
             self._setup_online()      # 상대 아바타 생성 + 릴레이 접속(데몬 수신 스레드)
+        elif self.ai_mode:
+            self._setup_ai()          # AI 봇 생성(아레나·아바타·소총, 네트워크 없음)
 
         # 메인 루프
         self.taskMgr.add(self._update, 'game_update')
 
         # 진단: Idle 한 프레임 돌고 나서 본 이름/좌표 한 번 출력
         self.taskMgr.doMethodLater(0.3, self._dump_joints, 'dump_joints')
+
+    def _build_start_menu(self):
+        # 풀스크린 어두운 패널 + 타이틀 + 메뉴 버튼(싱글/멀티/종료). HUD 와 동일한
+        # 시안 임상 톤. 버튼 선택 → _start_game(online) / userExit. aspect2d 부착이라
+        # 가로비가 자동 보정된다(좌표 x∈[-비율,비율], z∈[-1,1]).
+        root = DirectFrame(
+            frameColor=(0.008, 0.020, 0.030, 1.0),
+            frameSize=(-2.0, 2.0, -1.0, 1.0),
+            pos=(0, 0, 0), parent=self.aspect2d,
+        )
+        self._menu_root = root
+        # 상·하단 시안 라인
+        DirectFrame(frameColor=HUD_CYAN, frameSize=(-0.9, 0.9, -0.004, 0.004),
+                    pos=(0, 0, 0.52), parent=root)
+        DirectFrame(frameColor=HUD_CYAN, frameSize=(-0.9, 0.9, -0.004, 0.004),
+                    pos=(0, 0, -0.62), parent=root)
+        OnscreenText(text='GAME', pos=(0, 0.28), scale=0.20,
+                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False,
+                     parent=root)
+        btn_kw = dict(
+            scale=0.08, parent=root,
+            # 상태별 색(정상 / 클릭 / 롤오버 / 비활성) — 마우스 올리면 밝아짐.
+            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
+                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
+            text_fg=HUD_WHITE, relief=1,
+            frameSize=(-4.2, 4.2, -0.7, 1.1),
+            text_scale=0.85,
+        )
+        DirectButton(text='솔로플레이', pos=(0, 0, -0.04),
+                     command=self._prompt_solo_mode, **btn_kw)
+        DirectButton(text='멀티플레이', pos=(0, 0, -0.22),
+                     command=self._prompt_multi_name, **btn_kw)
+        DirectButton(text='종료', pos=(0, 0, -0.40),
+                     command=self.userExit, **btn_kw)
+        OnscreenText(
+            text='솔로 = AI 대결 / 웨이브 버티기    멀티 = 1:1 PvP 아레나(릴레이 접속)',
+            pos=(0, -0.55), scale=0.030,
+            fg=HUD_CYAN_DIM, align=TextNode.ACenter, mayChange=False,
+            parent=root)
+
+    def _prompt_multi_name(self):
+        # 멀티 입장 전 — 이름 입력 패널을 메뉴 위에 띄운다. 입장/엔터 → _confirm_multi_name.
+        if self._menu_root is None or self._game_started:
+            return
+        panel = DirectFrame(
+            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.75, 0.75, -0.32, 0.32),
+            pos=(0, 0, 0.0), parent=self._menu_root)
+        OnscreenText(text='이름을 입력하세요', pos=(0, 0.19), scale=0.06,
+                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=panel)
+        self._name_entry = DirectEntry(
+            parent=panel, scale=0.08, pos=(-0.46, 0, 0.0), width=12, numLines=1,
+            focus=1, initialText=self.player_name, overflow=1,
+            frameColor=(0.05, 0.14, 0.18, 1.0), text_fg=HUD_WHITE,
+            command=lambda *_a: self._confirm_multi_name())
+        DirectButton(
+            text='입장', pos=(0, 0, -0.19), scale=0.075, parent=panel,
+            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
+                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
+            text_fg=HUD_WHITE, relief=1, frameSize=(-3.0, 3.0, -0.7, 1.1),
+            text_scale=0.9, command=self._confirm_multi_name)
+
+    def _confirm_multi_name(self):
+        # 입력한 이름을 확정(빈칸이면 PLAYER) 후 멀티(online=True) 시작.
+        name = (self._name_entry.get() or '').strip() or 'PLAYER'
+        self.player_name = name[:8]   # 표시·전송 길이 제한(대략 한글 8/영문 8)
+        self._start_game(True)
+
+    def _prompt_solo_mode(self):
+        # 솔로 모드 선택 — AI와 대결 / 웨이브 버티기. 메뉴 위에 패널로 띄운다.
+        if self._menu_root is None or self._game_started:
+            return
+        panel = DirectFrame(
+            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.75, 0.75, -0.34, 0.34),
+            pos=(0, 0, 0.0), parent=self._menu_root)
+        OnscreenText(text='솔로 모드 선택', pos=(0, 0.23), scale=0.06,
+                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=panel)
+        sb = dict(
+            scale=0.075, parent=panel,
+            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
+                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
+            text_fg=HUD_WHITE, relief=1, frameSize=(-4.6, 4.6, -0.7, 1.1), text_scale=0.85)
+        DirectButton(text='AI와 대결', pos=(0, 0, 0.06),
+                     command=self._start_game, extraArgs=[False, True], **sb)
+        DirectButton(text='웨이브 버티기', pos=(0, 0, -0.10),
+                     command=self._start_game, extraArgs=[False, False], **sb)
+        OnscreenText(text='AI와 대결 = 소총 AI 봇과 1:1   웨이브 버티기 = 좀비 생존',
+                     pos=(0, -0.24), scale=0.028, fg=HUD_CYAN_DIM,
+                     align=TextNode.ACenter, mayChange=False, parent=panel)
+
+    def _start_game(self, online, ai=False):
+        # 메뉴에서 모드 확정 → 메뉴 제거 후 실제 게임 월드 빌드(한 번만).
+        if self._game_started:
+            return
+        self._game_started = True
+        self.online_mode = online
+        self.ai_mode = ai
+        if self._menu_root is not None:
+            self._menu_root.destroy()
+            self._menu_root = None
+        self._build_world()
+
+    def _attach_outline(self, actor, color=None, grow=1.07):
+        if color is None:
+            color = self.outline_color
+        """발로란트식 적 테두리 — 적이 눈에 잘 띄게. 액터의 Character(스킨드 모델)를
+        한 번 더 instanceTo 해서 살짝 키우고 '앞면 컬' → 확대된 뒷면 헐만 남아 원본
+        실루엣 둘레로 단색 테두리가 보인다(인버티드 헐). outline 은 actor 의 자식이라
+        위치/회전/사망 페이드(colorScale 상속)를 자동으로 따라가고 actor 가 제거되면
+        같이 정리된다. instanceTo 라 본 애니메이션을 공유 → 테두리도 같이 움직인다.
+        auto-shader 는 끄지 않는다(끄면 HW 스키닝이 빠져 바인드 포즈로 굳음)."""
+        char = actor.find('**/+Character')
+        if char.isEmpty():
+            return None
+        # 모델 대략 중심(z≈1.0) 기준으로 확대 → 발 기준 확대보다 머리/발 어긋남이 적다.
+        pivot = actor.attachNewNode('enemy_outline')
+        pivot.setPos(0, 0, 1.0)
+        inner = pivot.attachNewNode('enemy_outline_in')
+        inner.setPos(0, 0, -1.0)
+        char.instanceTo(inner)
+        pivot.setScale(grow)
+        pivot.setColor(color, 1)          # 강제 단색(테두리 색)
+        pivot.setTextureOff(1)            # 텍스처 무시
+        pivot.setLightOff(1)              # 조명 무시 → 평면 단색
+        # 앞면 컬 → 확대된 뒷면 헐만 남는다. + 깊이 오프셋으로 원본보다 뒤로 밀어
+        # 겹치는 중앙은 원본이 덮고, 실루엣 밖으로 삐져나온 둘레만 테두리로 보이게.
+        pivot.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullCounterClockwise))
+        pivot.setDepthOffset(-3)
+        return pivot
+
+    def _set_outline_color(self, color):
+        # 메뉴에서 적 테두리 색 변경 → settings.json 저장 + 이미 생성된 적들 즉시 갱신.
+        self.outline_color = tuple(color)
+        _save_outline_color(self.outline_color)
+        for z in getattr(self, 'zombies', []):
+            if getattr(z, 'outline', None) is not None:
+                z.outline.setColor(self.outline_color, 1)
+        if self._remote_outline is not None:
+            self._remote_outline.setColor(self.outline_color, 1)
+        self._refresh_outline_swatches()
+
+    def _refresh_outline_swatches(self):
+        # 현재 선택된 색 스와치 위로 흰 하이라이트 프레임 이동.
+        if self._swatch_hl is None:
+            return
+        match_x = None
+        for col, x in self._swatch_positions:
+            if tuple(col) == tuple(self.outline_color):
+                match_x = x
+                break
+        if match_x is None:
+            self._swatch_hl.hide()
+        else:
+            self._swatch_hl.setX(match_x)
+            self._swatch_hl.show()
 
     def _spawn_zombies(self):
         # 웨이브 모드 — 방화벽/게이트 진행 대신, 맵의 스폰 지점들에 매 웨이브
@@ -2237,7 +2493,7 @@ class ZombieGame(ShowBase):
         # 상대 플레이어(온라인) — 좀비/방화벽과 같은 ray 로 히트박스 검사.
         # best_t 보다 더 가까우면 상대를 맞힌 것 → 좀비/방화벽 판정 무효.
         remote_hit_pos = None
-        if self.online_mode:
+        if self.online_mode or self.ai_mode:
             res = self._remote_hit_test(cam_pos, ray_dir, best_t)
             # 총알이 벽을 못 뚫게 — 나→상대 ray 가 벽/플랫폼(높이 인식)에 막히면 취소.
             if res is not None and not self._bullet_blocked(
@@ -2408,6 +2664,9 @@ class ZombieGame(ShowBase):
 
     def _on_fire_down(self):
         # 좌클릭 누름 — 즉발 1발. 연발 무기는 _update 가 hold 동안 반복 발사.
+        # 준비방 동안은 버튼 클릭이 발사로 새지 않게 무시.
+        if self._in_lobby:
+            return
         self._mouse1_down = True
         self._play_shoot_oneshot()
 
@@ -2582,7 +2841,7 @@ class ZombieGame(ShowBase):
         # 어두운 패널 + 시안 임상 톤. 부제로 게임 정체성("면역 시스템 일시정지")을 깐다.
         self.pause_frame = DirectFrame(
             frameColor=(0.012, 0.035, 0.050, 0.88),
-            frameSize=(-0.55, 0.55, -0.45, 0.45),
+            frameSize=(-0.55, 0.55, -0.62, 0.45),
             pos=(0, 0, 0),
             parent=self.aspect2d,
         )
@@ -2621,6 +2880,27 @@ class ZombieGame(ShowBase):
             fg=HUD_CYAN, align=TextNode.ACenter, mayChange=True,
             parent=self.pause_frame,
         )
+        # ── 적 테두리 색 선택 — 게임 중 ESC 로 바꾸면 적 테두리가 즉시 반영된다. ──
+        OnscreenText(
+            text='적 테두리 색', pos=(0, -0.11), scale=0.042,
+            fg=HUD_CYAN, align=TextNode.ACenter, mayChange=False,
+            parent=self.pause_frame,
+        )
+        # 선택 하이라이트(스와치 뒤 흰 사각) — 먼저 깔고, 위치는 _refresh 가 잡는다.
+        self._swatch_hl = DirectFrame(
+            frameColor=(1, 1, 1, 1), frameSize=(-1.4, 1.4, -1.4, 1.4),
+            scale=0.045, pos=(0, 0, -0.21), parent=self.pause_frame)
+        self._swatch_positions = []
+        n = len(OUTLINE_PALETTE)
+        for i, (name, col) in enumerate(OUTLINE_PALETTE):
+            x = (i - (n - 1) / 2.0) * 0.13
+            DirectButton(
+                text='', pos=(x, 0, -0.21), scale=0.045, parent=self.pause_frame,
+                frameColor=col, relief=1, frameSize=(-1.1, 1.1, -1.1, 1.1),
+                command=self._set_outline_color, extraArgs=[col])
+            self._swatch_positions.append((col, x))
+        self._refresh_outline_swatches()
+
         btn_kw = dict(
             scale=0.07, parent=self.pause_frame,
             frameColor=(0.05, 0.14, 0.18, 1.0),
@@ -2628,9 +2908,9 @@ class ZombieGame(ShowBase):
             frameSize=(-3.6, 3.6, -0.7, 1.1),
             text_scale=0.9,
         )
-        DirectButton(text='계속하기', pos=(0, 0, -0.14),
+        DirectButton(text='계속하기', pos=(0, 0, -0.36),
                      command=self._toggle_pause, **btn_kw)
-        DirectButton(text='종료', pos=(0, 0, -0.32),
+        DirectButton(text='종료', pos=(0, 0, -0.52),
                      command=self.userExit, **btn_kw)
         self.pause_frame.hide()
 
@@ -3223,8 +3503,15 @@ class ZombieGame(ShowBase):
             fg=(0.9, 0.95, 1.0, 1), align=TextNode.ACenter, mayChange=True,
             parent=self.aspect2d)
         self.hud_result.setBin('fixed', 60)
+        # 결산 화면 하단 — "N초 후 메인 화면으로" 카운트다운 안내.
+        self.hud_result_return = OnscreenText(
+            text='', pos=(0, -0.30), scale=0.045,
+            fg=HUD_CYAN_DIM, align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d)
+        self.hud_result_return.setBin('fixed', 60)
         self.hud_result_bg.hide()
         self.hud_result.hide()
+        self.hud_result_return.hide()
 
         # 우상단 미니맵 — minimap.png (1040×1040, 정사각)
         # 가운데 도트는 별도 DirectFrame (위치/색 갱신용).
@@ -3615,6 +3902,226 @@ class ZombieGame(ShowBase):
     # 1단계: 두 플레이어가 서로 보이고 움직임이 동기화되는 것만. 사격/피격/라운드/
     # 점수/리스폰 없음. 모든 메서드는 online_mode 일 때만 호출된다.
 
+    def _build_lobby_ui(self):
+        """준비방 UI — 정중앙 기준 좌=나 / 우=상대(이름 + 준비 상태) + VS + 준비완료 버튼.
+        상대 이름/준비 상태는 _update_lobby 가 패킷에서 매 프레임 갱신한다."""
+        root = DirectFrame(frameColor=(0.01, 0.025, 0.04, 0.94),
+                           frameSize=(-2, 2, -1, 1), parent=self.aspect2d)
+        root.setBin('fixed', 55)
+        self.lobby_root = root
+        OnscreenText(text='준비방', pos=(0, 0.62), scale=0.10, fg=HUD_WHITE,
+                     align=TextNode.ACenter, mayChange=False, parent=root)
+        DirectFrame(frameColor=HUD_CYAN, frameSize=(-0.75, 0.75, -0.004, 0.004),
+                    pos=(0, 0, 0.50), parent=root)
+        OnscreenText(text='VS', pos=(0, 0.04), scale=0.10, fg=HUD_CYAN,
+                     align=TextNode.ACenter, mayChange=False, parent=root)
+        # 좌 = 나
+        OnscreenText(text='나', pos=(-0.62, 0.30), scale=0.05, fg=HUD_CYAN_DIM,
+                     align=TextNode.ACenter, mayChange=False, parent=root)
+        OnscreenText(text=self.player_name, pos=(-0.62, 0.16), scale=0.072,
+                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=root)
+        self.lobby_my_status = OnscreenText(
+            text='대기 중', pos=(-0.62, -0.04), scale=0.05, fg=HUD_CYAN_DIM,
+            align=TextNode.ACenter, mayChange=True, parent=root)
+        # 우 = 상대
+        OnscreenText(text='상대', pos=(0.62, 0.30), scale=0.05, fg=HUD_CYAN_DIM,
+                     align=TextNode.ACenter, mayChange=False, parent=root)
+        self.lobby_op_name = OnscreenText(
+            text='접속 대기 중...', pos=(0.62, 0.16), scale=0.072, fg=HUD_WHITE,
+            align=TextNode.ACenter, mayChange=True, parent=root)
+        self.lobby_op_status = OnscreenText(
+            text='대기 중', pos=(0.62, -0.04), scale=0.05, fg=HUD_CYAN_DIM,
+            align=TextNode.ACenter, mayChange=True, parent=root)
+        # 준비완료 버튼
+        self.lobby_ready_btn = DirectButton(
+            text='준비완료', pos=(0, 0, -0.42), scale=0.08, parent=root,
+            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
+                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
+            text_fg=HUD_WHITE, relief=1, frameSize=(-3.4, 3.4, -0.7, 1.1),
+            text_scale=0.85, command=self._on_ready)
+        OnscreenText(text='양쪽 모두 준비완료를 누르면 5초 뒤 시작',
+                     pos=(0, -0.60), scale=0.034, fg=HUD_CYAN_DIM,
+                     align=TextNode.ACenter, mayChange=False, parent=root)
+
+    def _on_ready(self):
+        # 내 준비완료 — 상태 표시 갱신 + 버튼 비활성. _ready 는 패킷으로 상대에게 전송됨.
+        if self._ready:
+            return
+        self._ready = True
+        self.lobby_my_status.setText('준비완료!')
+        self.lobby_my_status.setFg((0.30, 1.0, 0.45, 1.0))
+        self.lobby_ready_btn['state'] = 'disabled'
+        self.lobby_ready_btn['text_fg'] = HUD_CYAN_DIM
+        print('[lobby] 내 준비완료', flush=True)
+
+    def _update_lobby(self):
+        # 매 프레임 — 상대 이름/준비 상태를 패킷에서 읽어 UI 갱신.
+        rs = self.remote_state
+        if rs is None or len(rs) < 13:
+            return
+        name, ready = rs[11], rs[12]
+        self._remote_name = name
+        self._remote_ready = ready
+        self.lobby_op_name.setText(name if name else '상대')
+        if ready:
+            self.lobby_op_status.setText('준비완료!')
+            self.lobby_op_status.setFg((0.30, 1.0, 0.45, 1.0))
+        else:
+            self.lobby_op_status.setText('대기 중')
+            self.lobby_op_status.setFg(HUD_CYAN_DIM)
+
+    def _exit_lobby(self):
+        # 양쪽 준비완료 — 준비방 종료. UI 숨기고 커서 잡아(FPS 마우스룩 복귀) 카운트다운으로.
+        self._in_lobby = False
+        if self.lobby_root is not None:
+            self.lobby_root.hide()
+        props = WindowProperties()
+        props.setCursorHidden(True)
+        props.setMouseMode(WindowProperties.M_confined)
+        self.win.requestProperties(props)
+        self.win.movePointer(0, self._win_cx, self._win_cy)
+        self._first_frame = True
+        print('[lobby] 양쪽 준비완료 — 5초 카운트다운 시작', flush=True)
+
+    def _setup_ai(self):
+        """AI 대결 — 아레나 + 상대 자리에 AI 봇(소총). 네트워크 없음. 플레이어=스폰 A,
+        AI=스폰 B 고정. 5초 카운트다운 후 FIGHT. 이동/사격은 _ai_update 가 구동한다."""
+        if self._arena_data is not None:
+            spawns = self._arena_data['spawns']
+            sp = spawns[0]                       # 플레이어 = 스폰 A
+            self._spawn_pos = Vec3(sp[0], sp[1], 0)
+            self._spawn_yaw = sp[2]
+            self.player_pos = Vec3(self._spawn_pos)
+            self.player_yaw = self._spawn_yaw
+            bp = spawns[1]                       # AI = 스폰 B
+            self._ai_spawn = Vec3(bp[0], bp[1], 0)
+            self._ai_pos = Vec3(self._ai_spawn)
+            self._ai_yaw = bp[2]
+            # 스폰 배리어로 양 포켓 가둠 — 카운트다운 끝나면 해제(= 시작).
+            self._spawn_barriers = list(self._arena_data.get('spawn_barriers', []))
+            self._shimmer_cards = list(self._arena_data.get('shimmer_cards', []))
+            self.level_collider.walls.extend(self._spawn_barriers)
+            self._barriers_active = True
+            self._platforms = []
+            for pd in self._arena_data.get('platforms', []):
+                box = Wall(pd['x0'], pd['y0'], pd['x1'], pd['y1'],
+                           thickness=0.0, height=pd['top'])
+                self._platforms.append({
+                    'x0': pd['x0'], 'x1': pd['x1'], 'y0': pd['y0'], 'y1': pd['y1'],
+                    'top': pd['top'], 'collider': LevelCollider([box])})
+        self._setup_remote_avatar()      # 아바타 + 소총 + 히트박스 + 사운드 + 트레이서
+        self.ai_hp = self.ai_max_hp
+        self._role_decided = True         # 스폰 고정(nonce 불필요)
+        self._in_lobby = False            # AI 모드는 준비방 없음
+        self._countdown_t = 5.0           # 바로 5초 카운트다운 → FIGHT
+        self.hud_countdown.setFg((1, 0.92, 0.4, 1))
+        av = self.remote_avatar
+        if av is not None:                # 카운트다운 동안 스폰에 보이게.
+            av.setPos(self._ai_pos)
+            av.setH(self._ai_yaw + 180)
+            av.show()
+            self._remote_smooth = Vec3(self._ai_pos)
+        self.hud_score.show()
+        self._update_score_hud()
+        print(f'[ai] AI 대결 시작 — 플레이어=A, AI=B, hp={self.ai_hp}', flush=True)
+
+    def _ai_update(self, dt):
+        """AI 봇 1프레임 — 거리 유지 + 좌우 스트레이프(무빙)로 플레이어 추격, 항상 조준,
+        시야 트이면 소총 연사. 카운트다운/데스캠/매치종료 중엔 스폰에서 대기."""
+        av = self.remote_avatar
+        if av is None:
+            return
+        frozen = (self._barriers_active or self._deathcam_t > 0.0
+                  or self._match_over)
+        dxp = self.player_pos.x - self._ai_pos.x
+        dyp = self.player_pos.y - self._ai_pos.y
+        dist = (dxp * dxp + dyp * dyp) ** 0.5 or 1e-5
+        ux, uy = dxp / dist, dyp / dist
+        self._ai_yaw = degrees(atan2(-ux, uy))    # 항상 플레이어 향함
+        moving = False
+        if not frozen:
+            # 스트레이프 방향 주기적 전환(저크).
+            self._ai_strafe_t -= dt
+            if self._ai_strafe_t <= 0.0:
+                self._ai_strafe_dir = random.choice((-1, 1))
+                self._ai_strafe_t = random.uniform(0.5, 1.3)
+            fwd = 0.0
+            if dist > self.AI_PREF_MAX:
+                fwd = 1.0                          # 멀면 접근
+            elif dist < self.AI_PREF_MIN:
+                fwd = -1.0                         # 너무 가까우면 후퇴
+            sx, sy = -uy, ux                       # 플레이어 기준 오른쪽(수직)
+            mvx = (ux * fwd + sx * self._ai_strafe_dir * 0.85) * self.AI_SPEED
+            mvy = (uy * fwd + sy * self._ai_strafe_dir * 0.85) * self.AI_SPEED
+            nx0 = self._ai_pos.x + mvx * dt
+            ny0 = self._ai_pos.y + mvy * dt
+            nx, ny = self.level_collider.resolve(nx0, ny0, PLAYER_RADIUS)
+            moved = ((nx - self._ai_pos.x) ** 2 + (ny - self._ai_pos.y) ** 2) ** 0.5
+            self._ai_pos.x, self._ai_pos.y = nx, ny
+            moving = moved > 0.003
+            # 벽에 비비면 스트레이프 방향 뒤집어 빠져나오게.
+            if (mvx * mvx + mvy * mvy) > 1e-4 and moved < 0.3 * self.AI_SPEED * dt:
+                self._ai_strafe_dir *= -1
+        # 아바타 배치/표시.
+        self._remote_smooth = Vec3(self._ai_pos.x, self._ai_pos.y, 0)
+        av.setPos(self._ai_pos.x, self._ai_pos.y, 0)
+        av.setH(self._ai_yaw + 180)
+        if av.isHidden() and not self._remote_hidden_for_death:
+            av.show()
+        # 애니메이션(소총 자세).
+        want = ('RifleRunForward' if (moving and 'RifleRunForward' in self.anim_names)
+                else ('RifleIdle' if 'RifleIdle' in self.anim_names else 'Idle'))
+        if want and want != self._remote_anim:
+            av.loop(want)
+            self._remote_anim = want
+        # 손 본 따라 무기 앵커 갱신 + 소총 표시.
+        av.update(force=True)
+        if (self._remote_weapon_anchor is not None and self._remote_hand is not None
+                and not self._remote_hand.isEmpty()):
+            self._remote_weapon_anchor.setPos(self._remote_hand.getPos(self.render))
+            self._remote_weapon_anchor.setHpr(self._remote_hand.getHpr(self.render))
+        self._show_remote_weapon(1)               # 소총(인덱스 1)
+        # 발소리.
+        if moving and not frozen:
+            self._ai_foot_t -= dt
+            if self._ai_foot_t <= 0.0:
+                self._play_remote_footstep()
+                self._ai_foot_t = self.footstep_interval
+        else:
+            self._ai_foot_t = 0.0
+        # 트레이서 페이드.
+        if self._remote_tracer_t > 0.0:
+            self._remote_tracer_t -= dt
+            if self._remote_tracer_t <= 0.0 and self._remote_tracer is not None:
+                self._remote_tracer.hide()
+        if frozen:
+            return
+        # 사격 — 쿨다운마다 사거리 안 + 시야 트이면 발사.
+        self._ai_fire_t -= dt
+        if self._ai_fire_t <= 0.0 and dist < self.AI_SHOOT_RANGE:
+            self._ai_fire_t = self.AI_FIRE_INTERVAL
+            self._ai_try_shoot(dist)
+
+    def _ai_try_shoot(self, dist):
+        """AI 한 발 — 벽에 막히면 안 쏨. 트레이서 + 거리별 소총음 + 거리 기반 명중 확률로
+        내 체력 감소(_apply_pvp_damage)."""
+        if self.level_collider.segment_blocked(
+                self._ai_pos.x, self._ai_pos.y,
+                self.player_pos.x, self.player_pos.y):
+            return                                # 벽 뒤 — 사격 안 함
+        # 트레이서 방향(상대 yaw/pitch 규칙 재사용) — 내 머리로 피치 조준.
+        gun_z = 1.4
+        tgt_z = self.player_pos.z + self.head_height * 0.9
+        pitch = degrees(atan2(tgt_z - gun_z, dist))
+        self._show_remote_tracer((0, 0, 0, self._ai_yaw, pitch))
+        vol = self._remote_dist_volume(1.3, 5.0, 90.0)
+        if vol > 0.0:
+            self._play_pool_vol(self._r_sfx_m16, '_r_sfx_m16_i', vol)
+        # 명중 확률 — 가까울수록 높게(0.3~0.78). 빗나가면 데미지 없음.
+        acc = max(0.30, min(0.78, 0.82 - dist * 0.018))
+        if random.random() < acc:
+            self._apply_pvp_damage(self.AI_DMG)
+
     def _setup_online(self):
         """상대 3인칭 아바타 생성 + 릴레이 접속 + 아레나 스폰/배리어 세팅."""
         # ── 아레나 — 두 포켓 모두 배리어로 가두고, 임시로 스폰 A 에 둔다.
@@ -3650,10 +4157,15 @@ class ZombieGame(ShowBase):
         # PvP 점수 HUD 표시 (먼저 10점 승리). 단일플레이에선 숨김 유지.
         self.hud_score.show()
         self._update_score_hud()
-        # 대기방 — 상대 접속(첫 패킷) 전까지 어둡게 + 안내. 카운트다운 시작 시 숨김.
+        # 준비방(로비) — 이름(좌=나 / 우=상대) 표시 + 양쪽 준비완료 대기. 버튼 클릭을
+        # 위해 커서를 보이게 하고 마우스룩/카운트다운은 보류한다(_in_lobby).
         if self._arena_data is not None:
-            self.hud_wait_bg.show()
-            self.hud_wait.show()
+            self._in_lobby = True
+            self._build_lobby_ui()
+            props = WindowProperties()
+            props.setCursorHidden(False)
+            props.setMouseMode(WindowProperties.M_absolute)
+            self.win.requestProperties(props)
 
     def _setup_remote_avatar(self):
         """상대용 ybot Actor 하나 더 생성 — 평범한 3인칭 월드 Actor.
@@ -3674,6 +4186,9 @@ class ZombieGame(ShowBase):
             self._remote_anim = idle
         av.hide()                     # remote_state 도착 전엔 안 보이게
         self.remote_avatar = av
+        # 발로란트식 빨간 테두리 — 상대(적)가 눈에 잘 띄게. av 가 숨으면 같이 숨고
+        # 사망 처리(av.hide)에도 함께 정리된다(자식).
+        self._remote_outline = self._attach_outline(av)
 
         # 상대 손에 무기 부착 — 로컬(right_hand_joint + weapon_anchor + _weapons)을
         # 그대로 복제. av 는 subpart 가 없으니 part='modelRoot' 로 RightHand 본 expose.
@@ -3821,14 +4336,15 @@ class ZombieGame(ShowBase):
                 self._decide_role(rs[10])
             else:
                 return                    # 아직 상대 nonce 없음 → 대기
-        if self._countdown_t is None:
-            # 역할 확정 + 상대 아바타 보이면 양쪽 준비 완료 → 카운트다운 시작.
-            if self.remote_avatar is not None and not self.remote_avatar.isHidden():
+        # 준비방 — 양쪽 준비완료 전까지 카운트다운 보류. 상대 이름/준비 상태 갱신.
+        if self._in_lobby:
+            self._update_lobby()
+            if self._ready and self._remote_ready:
+                self._exit_lobby()        # 준비방 종료 → 커서 잡고 카운트다운
                 self._countdown_t = 5.0
-                self.hud_wait_bg.hide()   # 대기방 종료 — 상대 입장
-                self.hud_wait.hide()
-                print('[arena] 양쪽 준비 — 5초 카운트다운 시작', flush=True)
             return
+        if self._countdown_t is None:
+            return                        # 준비방 종료 후 _exit_lobby 가 5.0 설정
         self._countdown_t -= dt
         if self._countdown_t > 0.0:
             self.hud_countdown.setText(str(int(ceil(self._countdown_t))))
@@ -3934,7 +4450,7 @@ class ZombieGame(ShowBase):
         pool = self._r_sfx_foot
         if not pool:
             return
-        vol = self._remote_dist_volume(7.8, 2.0, 26.0)  # base 7.8 = 직전(2.6)의 3배 증폭
+        vol = self._remote_dist_volume(23.4, 2.0, 26.0)  # base 23.4 = 직전(7.8)의 3배 증폭(가까울 때 크게)
         if vol <= 0.0:
             return                        # 너무 멀면 안 들림 → 재생 생략
         n = len(pool)
@@ -4031,6 +4547,14 @@ class ZombieGame(ShowBase):
         self._play_pool(self.sfx_hit, '_hit_i')
         self._spawn_hit_particle(world_pos)
         self._spawn_damage_number(world_pos, dmg)
+        if self.ai_mode:
+            # AI 대결 — 로컬 HP 를 직접 깎고, 0 이하면 처치 처리(점수/데스캠/리셋).
+            self.ai_hp -= dmg
+            print(f'[ai] AI 명중 zone={zone} dmg={dmg} → hp={self.ai_hp}', flush=True)
+            if self.ai_hp <= 0:
+                self.ai_hp = self.ai_max_hp
+                self._on_remote_player_killed()
+            return
         # 누적 피해 적립 → 다음 송신 패킷으로 상대에게 전달되어 상대 체력이 깎인다.
         self._dmg_dealt = (self._dmg_dealt + dmg) & 0xFFFF
         print(f'[pvp] 상대 명중 zone={zone} dmg={dmg} 누적={self._dmg_dealt}',
@@ -4083,6 +4607,45 @@ class ZombieGame(ShowBase):
         self.hud_countdown.hide()
         print(f'[pvp] 매치 종료 — {"WIN" if won else "LOSE"} '
               f'kills={self._my_score} deaths={self._enemy_score}', flush=True)
+        # 결산 5초 카운트다운 후 메인 화면(시작 메뉴)으로 복귀. 중복 예약 방지.
+        if not getattr(self, '_return_scheduled', False):
+            self._return_scheduled = True
+            self._return_secs = 5
+            self.hud_result_return.setText(f'{self._return_secs}초 후 메인 화면으로...')
+            self.hud_result_return.show()
+            self.taskMgr.doMethodLater(1.0, self._tick_return_menu, 'return_to_menu')
+
+    def _tick_return_menu(self, task):
+        # 1초마다 카운트다운 갱신, 0 이 되면 메인 화면으로 복귀.
+        self._return_secs -= 1
+        if self._return_secs <= 0:
+            self._return_to_main_menu()
+            return Task.done
+        self.hud_result_return.setText(f'{self._return_secs}초 후 메인 화면으로...')
+        return Task.again
+
+    def _return_to_main_menu(self):
+        # 게임 월드(좀비/네트워크/HUD/액터…)를 안전히 되감는 대신, 프로세스를 새로
+        # 띄워 깨끗한 상태의 시작 메뉴로 복귀한다(모드 인자 없이 실행 → 항상 메뉴).
+        # 네트워크 소켓을 먼저 닫고, 새 프로세스는 현재 env(PYTHONUTF8 등)를 상속.
+        import os
+        import subprocess
+        try:
+            self._net_shutdown()
+        except Exception:
+            pass
+        try:
+            kw = {}
+            if sys.platform == 'win32':
+                # 종료되는 현재 프로세스/콘솔에 묶이지 않게 새 프로세스로 완전 분리 —
+                # 부모가 닫혀도 새 메뉴 창이 독립적으로 살아남는다.
+                kw['creationflags'] = (subprocess.DETACHED_PROCESS
+                                       | subprocess.CREATE_NEW_PROCESS_GROUP)
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                             cwd=os.path.dirname(os.path.abspath(__file__)), **kw)
+        except Exception as e:
+            print('[menu] 재시작 실패:', e, flush=True)
+        self.userExit()
 
     def _pvp_die(self):
         """체력 0 — 내 사망 +1(상대 점수 +1). 상대가 10점이면 패배(매치 종료),
@@ -4184,6 +4747,13 @@ class ZombieGame(ShowBase):
             card.show()
             card.setColor(IMMUNE_COLOR[0], IMMUNE_COLOR[1], IMMUNE_COLOR[2],
                           self._shimmer_a)
+        # AI 대결 — AI 도 스폰 복귀 + 체력 회복.
+        if self.ai_mode:
+            self._ai_pos = Vec3(self._ai_spawn)
+            self.ai_hp = self.ai_max_hp
+            self._ai_fire_t = 0.0
+            if self.remote_avatar is not None:
+                self.remote_avatar.setPos(self._ai_pos)
         # 5초 카운트다운 재시작 — _arena_update 가 끝에서 배리어 제거 + FIGHT!.
         self._countdown_t = 5.0
         self.hud_countdown.setFg((1, 0.92, 0.4, 1))
@@ -4253,13 +4823,16 @@ class ZombieGame(ShowBase):
                     buf = buf[NET_STATE_SIZE:]
                     try:
                         (x, y, z, yaw, pitch, widx, reloading,
-                         shot_seq, dmg_total, deaths, nonce) = struct.unpack(
-                            NET_STATE_FMT, frame)
+                         shot_seq, dmg_total, deaths, nonce,
+                         name_b, ready) = struct.unpack(NET_STATE_FMT, frame)
                     except struct.error:
                         continue
-                    # 참조 교체(원자적) — 위치/시점 + 무기 + 재장전/발사 + 피해 + 사망 + nonce.
+                    name = name_b.split(b'\x00', 1)[0].decode('utf-8', 'ignore')
+                    # 참조 교체(원자적) — 위치/시점 + 무기 + 재장전/발사 + 피해 + 사망 +
+                    # nonce + (준비방용) 이름 + 준비완료 플래그.
                     self.remote_state = (x, y, z, yaw, pitch, widx, reloading,
-                                         shot_seq, dmg_total, deaths, nonce)
+                                         shot_seq, dmg_total, deaths, nonce,
+                                         name, ready)
         except OSError:
             pass                      # 끊김 — 마지막 remote_state 유지
         finally:
@@ -4275,6 +4848,7 @@ class ZombieGame(ShowBase):
             return
         self._net_send_t = 0.0
         try:
+            name_b = self.player_name.encode('utf-8')[:NET_NAME_BYTES]
             pkt = struct.pack(NET_STATE_FMT,
                               self.player_pos.x, self.player_pos.y,
                               self.player_pos.z, self.player_yaw,
@@ -4284,7 +4858,9 @@ class ZombieGame(ShowBase):
                               self._net_shot_seq & 0xFF,          # 발사 카운터
                               self._dmg_dealt & 0xFFFF,           # 상대에 입힌 누적 피해
                               self._deaths & 0xFF,                # 내 누적 사망 횟수
-                              self._nonce & 0xFFFFFFFF)           # 스폰 배정용 랜덤
+                              self._nonce & 0xFFFFFFFF,           # 스폰 배정용 랜덤
+                              name_b,                             # 준비방 표시 이름(24바이트)
+                              1 if self._ready else 0)            # 준비완료 플래그
             self._sock.sendall(pkt)
         except OSError as e:
             print(f'[net] 송신 실패 ({e}) — 연결 종료', flush=True)
@@ -4401,6 +4977,9 @@ class ZombieGame(ShowBase):
             self._net_send(dt)
             self._update_remote_avatar(dt)
             self._arena_update(dt)        # 스폰 배리어 카운트다운 + shimmer fade
+        elif self.ai_mode:
+            self._ai_update(dt)           # AI 봇 이동/조준/사격(네트워크 없음)
+            self._arena_update(dt)        # 카운트다운/라운드 흐름 공유
 
         # 애니메이션 블렌딩 weight 수렴
         self._update_blend(dt)
@@ -4461,7 +5040,8 @@ class ZombieGame(ShowBase):
             self.slide_node.setX(self.slide_rest_x + self.slide_recoil)
 
         # 마우스 룩 — 1인칭이면 player_yaw/pitch, editor 면 editor_yaw/pitch.
-        if self.win.hasPointer(0):
+        # 준비방 동안은 커서가 자유(버튼 클릭용)라 마우스룩/포인터 재중심을 건너뛴다.
+        if self.win.hasPointer(0) and not self._in_lobby:
             md = self.win.getPointer(0)
             dx = md.getX() - self._win_cx
             dy = md.getY() - self._win_cy
@@ -4760,8 +5340,11 @@ class ZombieGame(ShowBase):
 
 
 if __name__ == '__main__':
-    # 인자 없음 → 기존 그대로 싱글(100% 보존). '--online' → 멀티(릴레이 접속).
+    # 인자 없음 → 시작 화면(타이틀 + 싱글/멀티/종료 메뉴)부터.
+    # '--online' → 메뉴 건너뛰고 바로 멀티(릴레이 접속).
     # '--p2' → 아레나 스폰 B(0,15) 로 시작(상대는 인자 없이 스폰 A). 한 명만 --p2.
+    # 모드를 직접 지정(--online/--p2)하면 메뉴를 건너뛴다.
     online = '--online' in sys.argv
     spawn_b = '--p2' in sys.argv
-    ZombieGame(online=online, spawn_b=spawn_b).run()
+    menu = not (online or spawn_b)
+    ZombieGame(online=online, spawn_b=spawn_b, menu=menu).run()
