@@ -9,6 +9,8 @@ import socket
 import struct
 import sys
 import threading
+import time
+from collections import deque
 from math import atan2, ceil, cos, degrees, radians, sin
 from pathlib import Path
 
@@ -31,7 +33,7 @@ from panda3d.core import (
 
 from level import (PLAYER_RADIUS, ZOMBIE_RADIUS, WALL_HEIGHT, Wall,
                    IMMUNE_COLOR, LESION_COLOR, build_level, build_arena,
-                   LevelCollider)
+                   build_soccer_field, build_paint_field, LevelCollider)
 from weapon_config import (
     WEAPON_LOCAL_SCALE, WEAPON_LOCAL_POS, WEAPON_LOCAL_HPR, WEAPON_MUZZLE_POS,
     RIFLE_LOCAL_SCALE, RIFLE_LOCAL_POS, RIFLE_LOCAL_HPR, RIFLE_MUZZLE_POS,
@@ -202,7 +204,10 @@ RELAY_PORT = 8080
 # ready(B) = 준비완료 플래그(0/1) — 양쪽 ready 면 게임 시작(준비방 종료).
 # ⚠ 송신·수신 양쪽이 반드시 이 새 포맷이어야 한다. 옛 클라와 섞이면 프레임 정렬이
 #   어긋나 좌표가 깨지므로, 두 클라 모두 새 버전이어야 함.
-NET_STATE_FMT = '<5fBBBHBI24sB'
+# 축구 동기화 추가 필드(뒤에 append): 권위(스폰 A)가 공 위치·점수를 싣고, 양쪽이
+#   '내가 공 찬 이벤트'(kick_seq + 명중오프셋 + 방향 + 파워)를 실어 보낸다.
+#   ball(3f) + score_a,score_b(2B) + kick_seq(1B) + koff(3f) + kdir(3f) + kpow(1f).
+NET_STATE_FMT = '<5fBBBHBI24sB' + '3fBBB7f'
 NET_STATE_SIZE = struct.calcsize(NET_STATE_FMT)
 NET_NAME_BYTES = 24
 # [수정1] 상대 움직임 지연 완화 — 송신 빈도 ↑ + 수신 보간 수렴 ↑. (외삽/예측은 안 씀;
@@ -210,6 +215,20 @@ NET_NAME_BYTES = 24
 NET_SEND_HZ = 45.0          # 송신 스로틀(40~50Hz 권장; 위치 패킷 21바이트라 부담 적음)
 REMOTE_SMOOTH_LERP = 18.0   # 상대 위치 보간 계수 min(1, dt*이값). 클수록 빨리 수렴,
 #                             너무 크면 떨림 — 부드러움 유지되는 선(12 → 18).
+# [수정2] 순간이동 완화 — 스냅샷 보간(엔티티 인터폴레이션). 상대를 INTERP_DELAY 만큼
+# 과거 시점으로 두고, 버퍼에 쌓인 두 스냅샷 사이를 시간 비율로 보간 → 패킷이 몰리거나
+# 비어도(렉/지터) 등속으로 부드럽게 흐른다(최신 위치로 바로 튀지 않음). 대가는 약간의
+# 시각적 지연. 송신 간격(1/45≈22ms)의 2~3배를 잡아 한두 패킷 누락은 흡수.
+REMOTE_INTERP_DELAY = 0.12  # 상대 렌더를 이만큼(초) 과거로. 클수록 부드럽지만 지연↑(0.08~0.18)
+REMOTE_TELEPORT_DIST = 6.0  # 한 패킷새 이만큼(m) 넘게 점프하면 진짜 텔레포트(리스폰/스폰배정)로
+#                             보고 보간 끊고 즉시 스냅. 정상 이동은 22ms 에 <0.2m 라 오인 없음.
+
+# ── 땅따먹기(영역 페인트) ────────────────────────────────────────────────
+# 플레이어 색 — id 1=A(파랑), 2=B(주황). 0=중립(아직 안 칠함). 시안/글리치 테마 안 씀.
+PAINT_COLORS = {1: (0.20, 0.45, 1.0, 1.0), 2: (1.0, 0.50, 0.12, 1.0)}
+# 킬 부위별 칠하는 디스크 반경(m) — 헤드샷이 가장 넓게. (1m 격자라 작게 — 칸 수 과증가 방지)
+PAINT_KILL_RADIUS = {'head': 1.8, 'body': 1.2, 'other': 0.7}
+PAINT_TIME = 180.0          # 한 판 제한시간(초, 3분) — 끝나면 많이 칠한 쪽 승리
 
 # 무기별 스탯 — _equip_weapon 이 적용. ammo_max=탄창, cooldown=발사간격(s),
 # auto=연발(mouse1 hold 연사), head_onekill=헤드샷 즉사.
@@ -1083,9 +1102,242 @@ class Gate:
                                        LESION_COLOR[2], a)
 
 
+class SoccerBall:
+    """총알 축구 공 — 위치/속도/스핀(각속도)을 들고 직접 적분한다. 총알이 공을
+    맞히면 _kick() 으로 추진 임펄스 + (빗맞으면) 스핀이 실려, 마그누스 효과로 휘어
+    나간다(감아차기). 지면/벽 반사 + 공기/구름 마찰. 시각은 흰 구체."""
+
+    RADIUS = 0.55              # 공 반지름(m) — 맞히기 쉽게 약간 크게
+    GRAVITY = 14.0             # 중력(m/s^2)
+    LINEAR_DRAG = 0.35         # 공기 저항(1/s) — 속도 지수 감쇠
+    ROLL_FRICTION = 0.6        # 지면에서 구를 때 마찰(1/s) — 작을수록 멀리 굴러감
+    SPIN_DRAG = 3.4            # 스핀 감쇠(1/s) — 크면 커브가 앞부분만(스파이럴 방지)
+    SPIN_FACTOR = 0.30         # 빗맞을 때 실리는 스핀량(공식: power * 이값 * 오프셋)
+    SPIN_CAP = 6.0             # 스핀 상한(rad/s) — 과한 U턴 커브 방지
+    MAGNUS = 0.20              # 마그누스 계수 — 클수록 더 휜다(감아차기)
+    RESTITUTION = 0.62         # 벽/지면 반발(0=안튐 1=완전탄성)
+    MAX_SPEED = 42.0           # 속도 상한(터무니없는 가속 방지)
+
+    def __init__(self, game, spawn_xy):
+        self.game = game
+        self._spawn = Vec3(spawn_xy[0], spawn_xy[1], self.RADIUS)
+        self.pos = Vec3(self._spawn)
+        self.vel = Vec3(0, 0, 0)
+        self.spin = Vec3(0, 0, 0)        # 각속도(rad/s) — 주로 z(수직)축 → 수평 커브
+        self._orient = Quat()            # 시각 회전 누적(구르기+스핀) — 무늬로 보이게
+        self._orient.set(1, 0, 0, 0)     # 단위 쿼터니언
+        # 시각 — 내장 구체 모델 + 흑백 무늬 텍스처(회전이 보이게). 모델 없으면 빌보드 폴백.
+        self.node = game.render.attachNewNode('soccer_ball')
+        model = None
+        try:
+            model = game.loader.loadModel('models/misc/sphere')
+        except Exception:
+            model = None
+        if model is not None and not model.isEmpty():
+            model.reparentTo(self.node)
+            model.setScale(self.RADIUS)
+            model.setColor(0.97, 0.97, 1.0, 1.0)   # 흰 공
+            self._has_model = True
+        else:
+            cm = CardMaker('ball_bb')
+            cm.setFrame(-self.RADIUS, self.RADIUS, -self.RADIUS, self.RADIUS)
+            bb = self.node.attachNewNode(cm.generate())
+            bb.setBillboardPointEye()
+            bb.setColor(0.97, 0.97, 1.0, 1.0)
+            self._has_model = True   # 패턴 링으로 회전 표시(빌보드여도)
+        # 무늬 — 검은 고리 3개(직교 평면)를 공 표면에 둘러 회전을 또렷이 보이게.
+        # self.node 자식이라 node.setQuat 회전을 그대로 따라간다(텍스처 의존 X).
+        self._build_ball_pattern()
+        self.node.setLightOff()
+        self.node.setPos(self.pos)
+
+    @staticmethod
+    def _make_pentagon(r):
+        """반지름 r 의 정오각형(채움) — XZ 평면, 법선 +Y. 축구공 검은 패치용."""
+        fmt = GeomVertexFormat.getV3()
+        vdata = GeomVertexData('pent', fmt, Geom.UHStatic)
+        vw = GeomVertexWriter(vdata, 'vertex')
+        vw.addData3(0.0, 0.0, 0.0)             # 중심
+        TAU = 6.2831853
+        for i in range(5):
+            a = (i / 5.0) * TAU + TAU / 4.0
+            vw.addData3(r * cos(a), 0.0, r * sin(a))
+        tris = GeomTriangles(Geom.UHStatic)
+        for i in range(5):                      # 삼각형 팬(중심+테두리)
+            tris.addVertices(0, 1 + i, 1 + ((i + 1) % 5))
+        geom = Geom(vdata)
+        geom.addPrimitive(tris)
+        gn = GeomNode('pentagon')
+        gn.addGeom(geom)
+        return NodePath(gn)
+
+    def _build_ball_pattern(self):
+        """진짜 축구공 무늬 — 정20면체 12꼭짓점 방향에 검은 오각형 12개를 흰 구 표면에
+        박는다(클래식 Telstar 패턴 근사). node 자식이라 회전을 그대로 따라간다."""
+        phi = (1.0 + 5.0 ** 0.5) / 2.0
+        verts = []
+        for s1 in (1, -1):
+            for s2 in (1, -1):
+                verts.append((0.0, s1 * 1.0, s2 * phi))
+                verts.append((s1 * 1.0, s2 * phi, 0.0))
+                verts.append((s1 * phi, 0.0, s2 * 1.0))
+        R = self.RADIUS
+        pr = R * 0.42                           # 오각형 크기(반지름)
+        for vx, vy, vz in verts:                # 12개
+            d = Vec3(vx, vy, vz)
+            d.normalize()
+            pent = self._make_pentagon(pr)
+            pent.reparentTo(self.node)
+            pent.setColor(0.05, 0.05, 0.07, 1.0)   # 검정 패치
+            pent.setTwoSided(True)
+            pent.setLightOff()
+            pent.setPos(d * (R * 1.005))           # 표면에 살짝 띄워 박음
+            pent.lookAt(d * (R * 2.0))             # +Y(법선)를 바깥으로 → 표면에 접하게
+
+    def reset(self, xy=None):
+        if xy is not None:
+            self._spawn = Vec3(xy[0], xy[1], self.RADIUS)
+        self.pos = Vec3(self._spawn)
+        self.vel = Vec3(0, 0, 0)
+        self.spin = Vec3(0, 0, 0)
+        self.node.setPos(self.pos)
+
+    def kick(self, hit_offset, direction, power):
+        """총알 명중 — direction(정규화된 총알 진행방향)으로 추진, hit_offset(공중심→
+        명중점)이 중심에서 벗어날수록 스핀이 실린다 → 휘어 나감."""
+        d = Vec3(direction)
+        if d.lengthSquared() < 1e-9:
+            return
+        d.normalize()
+        self.vel += d * power
+        # 빗맞은 정도 = offset 의 진행방향 수직 성분 → 토크(스핀). 위/아래 맞으면 z 회전.
+        off = Vec3(hit_offset)
+        torque = off.cross(d)          # 오른손 법칙 — 빗맞은 면에 따라 방향 결정
+        self.spin += torque * (power * self.SPIN_FACTOR)
+        if self.spin.length() > self.SPIN_CAP:
+            self.spin = self.spin * (self.SPIN_CAP / self.spin.length())
+        if self.vel.length() > self.MAX_SPEED:
+            self.vel = self.vel * (self.MAX_SPEED / self.vel.length())
+
+    def update(self, dt, half_x, half_y, goal_hw, goal_depth):
+        """물리 적분 1스텝. 벽 반사 + 골 입구로 들어가 포켓에 갇힘. 포켓 깊숙이
+        (|y| >= half_y+0.4) 들어가면 득점. 반환: 'A'/'B'/None (득점 팀)."""
+        on_ground = self.pos.z <= self.RADIUS + 1e-3
+        # 마그누스(휨) — F = MAGNUS * (spin × vel). 수평 커브가 주효과.
+        if self.vel.lengthSquared() > 1e-6:
+            self.vel += self.spin.cross(self.vel) * (self.MAGNUS * dt)
+        # 중력
+        self.vel.z -= self.GRAVITY * dt
+        # 마찰 — 지면이면 구름마찰(수평), 공중이면 공기저항.
+        if on_ground:
+            damp = max(0.0, 1.0 - self.ROLL_FRICTION * dt)
+            self.vel.x *= damp
+            self.vel.y *= damp
+        else:
+            damp = max(0.0, 1.0 - self.LINEAR_DRAG * dt)
+            self.vel.x *= damp
+            self.vel.y *= damp
+        self.spin *= max(0.0, 1.0 - self.SPIN_DRAG * dt)
+        # 적분
+        self.pos += self.vel * dt
+        scored = None
+        # 지면
+        if self.pos.z < self.RADIUS:
+            self.pos.z = self.RADIUS
+            if self.vel.z < 0:
+                self.vel.z = -self.vel.z * self.RESTITUTION
+                if abs(self.vel.z) < 0.6:
+                    self.vel.z = 0.0
+        R = self.RADIUS
+        in_mouth = abs(self.pos.x) <= goal_hw
+        near_end = (self.pos.y > half_y - R) or (self.pos.y < -(half_y - R))
+        in_pocket = in_mouth and near_end      # 골 입구 통과해 포켓 안/진입 중
+        # 측벽 x — 포켓 안이면 골대 옆벽(±goal_hw), 아니면 필드 측벽(±half_x).
+        x_bound = goal_hw if in_pocket else half_x
+        if self.pos.x < -x_bound + R:
+            self.pos.x = -x_bound + R
+            self.vel.x = abs(self.vel.x) * self.RESTITUTION
+        elif self.pos.x > x_bound - R:
+            self.pos.x = x_bound - R
+            self.vel.x = -abs(self.vel.x) * self.RESTITUTION
+        # 끝벽 / 골 — 골 입구(|x|<=goal_hw) 안이면 포켓으로 들어가 뒷벽까지, 아니면 끝벽 반사.
+        if in_mouth:
+            score_line = half_y + 0.4          # 이만큼 들어가면 득점
+            back = half_y + goal_depth         # 네트 뒷벽
+            if self.pos.y >= score_line:
+                scored = 'A'                   # 북쪽 골 → A 득점
+            elif self.pos.y <= -score_line:
+                scored = 'B'                   # 남쪽 골 → B 득점
+            # 뒷벽 반사(득점 전 못 빠져나가게; 보통 득점이 먼저 일어남)
+            if self.pos.y > back - R:
+                self.pos.y = back - R
+                self.vel.y = -abs(self.vel.y) * self.RESTITUTION
+            elif self.pos.y < -(back - R):
+                self.pos.y = -(back - R)
+                self.vel.y = abs(self.vel.y) * self.RESTITUTION
+        else:
+            if self.pos.y < -half_y + R:
+                self.pos.y = -half_y + R
+                self.vel.y = abs(self.vel.y) * self.RESTITUTION
+            elif self.pos.y > half_y - R:
+                self.pos.y = half_y - R
+                self.vel.y = -abs(self.vel.y) * self.RESTITUTION
+        self.node.setPos(self.pos)
+        self._spin_visual(dt)
+        return scored
+
+    def _spin_visual(self, dt):
+        """무늬 구체를 실제로 회전 — 굴러가는 회전(속도 기반) + 물리 스핀을 누적해
+        node 의 자세에 적용한다. 텍스처 무늬 덕에 회전이 눈에 보인다."""
+        if not getattr(self, '_has_model', False):
+            return
+        # 각속도 = 구름(수평속도 → 수직축 기준 굴림) + 물리 스핀.
+        horiz = Vec3(self.vel.x, self.vel.y, 0.0)
+        omega = Vec3(self.spin)
+        if horiz.length() > 0.02:
+            roll_axis = Vec3(0, 0, 1).cross(horiz)   # 진행방향에 수직인 수평축
+            if roll_axis.lengthSquared() > 1e-9:
+                roll_axis.normalize()
+                omega += roll_axis * (horiz.length() / self.RADIUS)
+        mag = omega.length()
+        if mag < 1e-5:
+            return
+        axis = omega * (1.0 / mag)
+        dq = Quat()
+        dq.setFromAxisAngleRad(mag * dt, axis)
+        self._orient = dq * self._orient
+        self._orient.normalize()
+        self.node.setQuat(self._orient)
+
+    def ray_hit(self, origin, direction):
+        """ray(origin+ t*dir) vs 공(구) 교차. 맞으면 (t, hit_point) 아니면 None."""
+        oc = origin - self.pos
+        d = Vec3(direction)
+        b = oc.dot(d)
+        c = oc.dot(oc) - self.RADIUS * self.RADIUS
+        disc = b * b - c
+        if disc < 0:
+            return None
+        t = -b - disc ** 0.5
+        if t < 0:
+            t = -b + disc ** 0.5
+        if t < 0:
+            return None
+        return t, origin + d * t
+
+    def destroy(self):
+        if self.node is not None:
+            self.node.removeNode()
+            self.node = None
+
+
 class ZombieGame(ShowBase):
-    def __init__(self, online=False, spawn_b=False, menu=True):
+    def __init__(self, online=False, spawn_b=False, menu=True, soccer=False,
+                 paint=False):
         super().__init__()
+        # 직접실행('--soccer'/'--paint') — 상대 없이 솔로(AI 봇)로 시작. 멀티는 메뉴로.
+        self._paint_solo_launch = paint and not online
+        self._soccer_solo_launch = soccer and not online
         # 아레나 스폰 측 — False=스폰 A(0,-15 북향), True=스폰 B(0,15 남향).
         # 두 클라이언트가 겹치지 않게 한쪽은 '--p2' 로 띄운다(릴레이는 역할 배정 못함).
         self._spawn_b = spawn_b
@@ -1101,8 +1353,18 @@ class ZombieGame(ShowBase):
         # online=True ('--online') 일 때만 소켓 접속 + 상대 아바타 + 좀비/웨이브
         # 정지 + 튜닝키 차단. 싱글(False)은 아래 변수들을 일절 안 쓰므로 동작 동일.
         self.online_mode = online
+        # 축구 모드 — 총알로 공을 차서 골대에 넣는 1:1 멀티(킬은 5초 부활, 먼저 2골 승리).
+        # _start_game(메뉴) 또는 '--soccer'(직접) 가 설정. online_mode 와 함께 켜진다.
+        self.soccer_mode = soccer
+        # 땅따먹기(영역 페인트) 모드 — 솔로(AI 봇) / 멀티. _start_game(메뉴) 또는
+        # '--paint'(직접) 가 설정. 솔로 직접실행이면 ai_mode 도 함께 켠다.
+        self.paint_mode = bool(paint)
+        self._paint = None                # arena_data['paint'] 참조(셀/vdata)
+        self._paint_my_id = 1             # 내 색 id(1=A 파랑/2=B 주황) — _setup_paint 가 확정
+        self._paint_opp_id = 2
         # AI 대결 모드 — 아레나에서 상대 자리에 AI 봇(소총 추격/무빙/사격). _start_game 이 설정.
-        self.ai_mode = False
+        # 솔로 축구/땅따먹기 직접실행이면 봇 상대로 함께 켠다.
+        self.ai_mode = bool(self._paint_solo_launch or self._soccer_solo_launch)
         self.ai_max_hp = 100
         self.ai_hp = self.ai_max_hp
         self._ai_pos = Vec3(0, 0, 0)      # AI 봇 현재 위치(이동/충돌 해소 대상)
@@ -1110,6 +1372,10 @@ class ZombieGame(ShowBase):
         self._ai_yaw = 0.0
         self._ai_fire_t = 0.0             # 사격 쿨다운 누적(초)
         self._ai_foot_t = 0.0             # 발소리 보폭 누적(초)
+        # 봇 부활 무적(축구/땅따먹기 솔로) — 죽으면 스폰 복귀 + 잠깐 무적 + 보호 링.
+        self.AI_INVULN_DUR = 1.0
+        self._ai_invuln_t = 0.0
+        self._ai_invuln_ring = None
         self._ai_strafe_dir = 1           # 좌우 스트레이프 방향(+1/-1)
         self._ai_strafe_t = 0.0           # 스트레이프 방향 전환까지 남은 시간(초)
         # AI 튜닝 — 이동/교전 거리/사격.
@@ -1127,6 +1393,10 @@ class ZombieGame(ShowBase):
         self._remote_name = ''        # 상대 이름(수신)
         self.lobby_root = None        # 준비방 UI 루트(자식 정리용)
         self.remote_state = None      # 수신 스레드가 최신 (x,y,z,yaw,pitch) 저장
+        # 스냅샷 보간 버퍼 — 수신 스레드가 (t_recv, x, y, z, yaw) 누적, 메인 루프가
+        # INTERP_DELAY 과거 시점을 두 스냅샷 사이로 보간(순간이동 완화). 락으로 보호.
+        self._remote_buf = deque(maxlen=64)
+        self._remote_buf_lock = threading.Lock()
         self.remote_avatar = None     # 상대 3인칭 아바타 Actor (online 일 때만 생성)
         self._sock = None
         self._net_alive = False
@@ -1167,6 +1437,34 @@ class ZombieGame(ShowBase):
         self._my_score = 0                # 내가 상대를 처치한 횟수(= 내 점수)
         self._enemy_score = 0             # 내가 죽은 횟수(= 상대 점수, self._deaths 와 동일)
         self._match_over = False          # 매치 종료 플래그(이후 점수/리스폰 정지)
+        # ── 축구 모드 상태 ────────────────────────────────────────────────
+        self.SOCCER_WIN = 2               # 먼저 이 골 수 넣으면 승리
+        # 무기별 공 차는 파워(m/s) — 소총이 권총보다 강하다.
+        self.SOCCER_KICK_RIFLE = 25.0
+        self.SOCCER_KICK_PISTOL = 15.0
+        self._ball = None                 # SoccerBall (soccer_mode 일 때 생성)
+        self._goals_a = 0                 # 북쪽 골(스폰 A 공격) 누적 — A 득점
+        self._goals_b = 0                 # 남쪽 골(스폰 B 공격) 누적 — B 득점
+        self._goal_cele_t = 0.0           # 골 세리머니/킥오프 대기 잔여(초)
+        self._am_a = True                 # 내가 스폰 A 인가(공 권위·득점 매핑). 역할배정 시 갱신
+        # 공 동기화 — 권위(A)가 공/점수 브로드캐스트, 양쪽이 자기 킥을 이벤트로 전송.
+        self._kick_seq = 0                # 내가 공 찬 횟수(전송) — 권위가 증가 감지 시 적용
+        self._kick_off = Vec3(0, 0, 0)    # 마지막 킥 명중 오프셋(전송용)
+        self._kick_dir = Vec3(0, 0, 0)    # 마지막 킥 방향(전송용)
+        self._kick_power = 0.0            # 마지막 킥 파워(전송용)
+        self._remote_kick_seq = None      # 상대가 보낸 마지막 kick_seq(권위가 적용 판정)
+        self._soccer_wait_t = 0.0         # 솔로 시작 대기 누적(상대 없으면 A 로 시작)
+        self.hud_goal_banner = None       # 골 배너(OnscreenText) — _build_soccer_hud
+        # 부활 무적 — 리스폰 후 INVULN_DUR 초 동안 피해 무효 + 보호 링 표시.
+        self.INVULN_DUR = 3.0
+        self._invuln_t = 0.0
+        self._invuln_ring = None
+        # 슬로우모션 — 매치 종료 시 dt 와 모든 애니메이션 재생속도를 SLOWMO_FACTOR 로
+        # 부드럽게 떨어뜨려 영화 같은 슬로우모션 연출. _time_scale 은 매 프레임 target 으로 수렴.
+        self.SLOWMO_FACTOR = 0.18         # 슬로우모션 배속(1.0=정상, 0.18=약 5.5배 느림)
+        self.SLOWMO_RAMP = 0.9            # target 까지 수렴에 걸리는 실시간(초)
+        self._time_scale = 1.0
+        self._time_scale_target = 1.0
         self._remote_tracer = None        # 상대 총알 궤적 노드(online 일 때 생성)
         self._remote_tracer_t = 0.0       # 상대 트레이서 표시 남은 시간(초)
         # PvP 아레나 — 스폰 배리어로 5초 가둠 후 해제(FIGHT). build_arena 데이터.
@@ -1187,6 +1485,7 @@ class ZombieGame(ShowBase):
         self._deathcam_t = 0.0            # >0 이면 데스캠/유예 진행 중(끝나면 라운드 리셋)
         self._dead = False                # 내가 이번 라운드 사망자인가(시점 고정+시체)
         self._corpse = None               # 죽은 사람(나 또는 상대) 시체 Actor
+        self._dropped_weapons = []        # 사망 시 바닥에 떨군 무기 노드(라운드 리셋 시 정리)
         self._death_yaw = 0.0             # 죽은 순간 방향(데스캠 카메라 각도용)
         self._remote_death_anim = None    # (구) 미사용
         self._remote_hidden_for_death = False  # 상대를 시체로 대체하며 av 숨겼는지
@@ -1236,7 +1535,19 @@ class ZombieGame(ShowBase):
         import os
         kit_available = USE_KIT_MAP and os.path.isfile("assets/kit/Wall_1.bam")
         self.kit_root = None
-        if self.online_mode or self.ai_mode:
+        if self.paint_mode:
+            # 땅따먹기 — 개방적 아레나 + 바닥 페인트 격자.
+            self.level_collider, self.level_data = build_paint_field(
+                self.render, draw_wall_cards=True)
+            self._arena_data = self.level_data
+            kit_available = False
+        elif self.soccer_mode:
+            # 총알 축구 — 장애물 없는 열린 잔디 필드 + 골대.
+            self.level_collider, self.level_data = build_soccer_field(
+                self.render, draw_wall_cards=True)
+            self._arena_data = self.level_data
+            kit_available = False
+        elif self.online_mode or self.ai_mode:
             # 1대1 PvP(온라인) / AI 대결 — 좀비 캠페인 레벨 대신 대칭 아레나.
             self.level_collider, self.level_data = build_arena(
                 self.render, draw_wall_cards=True)
@@ -1296,7 +1607,15 @@ class ZombieGame(ShowBase):
         self.on_ground = True
         self.head_height = 1.65
         self.move_speed = 4.0   # 좀비 추격 속도와 동일 (Zombie.move_speed)
-        self.mouse_sens = 0.03    # 기본값 — ESC pause 메뉴 슬라이더로 0.02~0.30 조정
+        # 무기별 이동속도 배율 — 권총은 가벼워 빠름(소총 대비 1.3배). _equip_weapon 갱신.
+        self._weapon_speed_mult = 1.0
+        # 마우스 감도 — 슬라이더 0~1 정규화(기본 0.5=중앙정렬). 지수(기하) 매핑이라
+        # 0.5 가 정확히 MIN·MAX 의 기하평균(=0.03, 기존 기본)이고, 0↔1 폭이 6배씩 벌어져
+        # 0 쪽은 확연히 느리고 1 쪽은 확연히 빠르다. _sens_from_norm 참조.
+        self.SENS_MIN = 0.005     # 슬라이더 0 — 매우 느림
+        self.SENS_MAX = 0.18      # 슬라이더 1 — 매우 빠름 (기하평균 √(0.005·0.18)=0.03)
+        self._sens_norm = 0.5     # 슬라이더 위치(0~1) — 기본 중앙
+        self.mouse_sens = self._sens_from_norm(self._sens_norm)  # = 0.03
         self.jump_speed = 5.0   # 정점 ~1.04m — 낮은 플랫폼(≤1.0)에 점프해 올라설 수 있게
         self.gravity = 12.0
 
@@ -1706,6 +2025,10 @@ class ZombieGame(ShowBase):
             self._setup_online()      # 상대 아바타 생성 + 릴레이 접속(데몬 수신 스레드)
         elif self.ai_mode:
             self._setup_ai()          # AI 봇 생성(아레나·아바타·소총, 네트워크 없음)
+        if self.soccer_mode:
+            self._setup_soccer()      # 공 생성 + 골/점수 HUD
+        if self.paint_mode:
+            self._setup_paint()       # 색 배정 + 페인트 격자 참조
 
         # 메인 루프
         self.taskMgr.add(self._update, 'game_update')
@@ -1743,71 +2066,121 @@ class ZombieGame(ShowBase):
         DirectButton(text='솔로플레이', pos=(0, 0, -0.04),
                      command=self._prompt_solo_mode, **btn_kw)
         DirectButton(text='멀티플레이', pos=(0, 0, -0.22),
-                     command=self._prompt_multi_name, **btn_kw)
+                     command=self._prompt_multi_mode, **btn_kw)
         DirectButton(text='종료', pos=(0, 0, -0.40),
                      command=self.userExit, **btn_kw)
         OnscreenText(
-            text='솔로 = AI 대결 / 웨이브 버티기    멀티 = 1:1 PvP 아레나(릴레이 접속)',
+            text='솔로 = AI 대결 / 웨이브 버티기    멀티 = 1:1 PvP / 축구(릴레이 접속)',
             pos=(0, -0.55), scale=0.030,
             fg=HUD_CYAN_DIM, align=TextNode.ACenter, mayChange=False,
             parent=root)
 
-    def _prompt_multi_name(self):
-        # 멀티 입장 전 — 이름 입력 패널을 메뉴 위에 띄운다. 입장/엔터 → _confirm_multi_name.
+    def _menu_btn_kw(self, parent, fs=(-4.6, 4.6, -0.7, 1.1), text_scale=0.85):
+        # 메뉴 버튼 공통 스타일(상태별 색). 패널마다 재사용.
+        return dict(
+            scale=0.075, parent=parent,
+            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
+                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
+            text_fg=HUD_WHITE, relief=1, frameSize=fs, text_scale=text_scale)
+
+    def _prompt_multi_mode(self):
+        # 멀티 모드 선택 — 1:1 PvP 아레나 / 축구 / 뒤로. 메뉴 위에 패널로 띄운다.
         if self._menu_root is None or self._game_started:
             return
         panel = DirectFrame(
-            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.75, 0.75, -0.32, 0.32),
+            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.78, 0.78, -0.40, 0.40),
             pos=(0, 0, 0.0), parent=self._menu_root)
-        OnscreenText(text='이름을 입력하세요', pos=(0, 0.19), scale=0.06,
+        OnscreenText(text='멀티 모드 선택', pos=(0, 0.30), scale=0.06,
+                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=panel)
+        mb = self._menu_btn_kw(panel)
+        DirectButton(text='1:1 PvP 아레나', pos=(0, 0, 0.19),
+                     command=lambda: (panel.destroy(),
+                                      self._prompt_multi_name()), **mb)
+        DirectButton(text='축구 (공 차기)', pos=(0, 0, 0.05),
+                     command=lambda: (panel.destroy(),
+                                      self._prompt_multi_name(soccer=True)), **mb)
+        DirectButton(text='땅따먹기', pos=(0, 0, -0.09),
+                     command=lambda: (panel.destroy(),
+                                      self._prompt_multi_name(paint=True)), **mb)
+        DirectButton(text='뒤로', pos=(0, 0, -0.25),
+                     command=panel.destroy,
+                     **self._menu_btn_kw(panel, fs=(-2.4, 2.4, -0.7, 1.1)))
+        OnscreenText(text='PvP=먼저 10킬   축구=먼저 2골   땅따먹기=영역 많이 칠하기',
+                     pos=(0, -0.34), scale=0.027, fg=HUD_CYAN_DIM,
+                     align=TextNode.ACenter, mayChange=False, parent=panel)
+
+    def _prompt_multi_name(self, soccer=False, paint=False):
+        # 멀티 입장 전 — 이름 입력 패널을 메뉴 위에 띄운다. 입장/엔터 → _confirm_multi_name.
+        if self._menu_root is None or self._game_started:
+            return
+        self._name_soccer = soccer    # 입장 시 이 모드로 시작
+        self._name_paint = paint
+        panel = DirectFrame(
+            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.75, 0.75, -0.36, 0.36),
+            pos=(0, 0, 0.0), parent=self._menu_root)
+        title = ('축구 — 이름을 입력하세요' if soccer else
+                 '땅따먹기 — 이름을 입력하세요' if paint else '이름을 입력하세요')
+        OnscreenText(text=title, pos=(0, 0.23), scale=0.055,
                      fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=panel)
         self._name_entry = DirectEntry(
-            parent=panel, scale=0.08, pos=(-0.46, 0, 0.0), width=12, numLines=1,
+            parent=panel, scale=0.08, pos=(-0.46, 0, 0.04), width=12, numLines=1,
             focus=1, initialText=self.player_name, overflow=1,
             frameColor=(0.05, 0.14, 0.18, 1.0), text_fg=HUD_WHITE,
             command=lambda *_a: self._confirm_multi_name())
         DirectButton(
-            text='입장', pos=(0, 0, -0.19), scale=0.075, parent=panel,
+            text='입장', pos=(-0.22, 0, -0.20), scale=0.075, parent=panel,
             frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
                         (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
-            text_fg=HUD_WHITE, relief=1, frameSize=(-3.0, 3.0, -0.7, 1.1),
+            text_fg=HUD_WHITE, relief=1, frameSize=(-2.6, 2.6, -0.7, 1.1),
             text_scale=0.9, command=self._confirm_multi_name)
+        DirectButton(
+            text='뒤로', pos=(0.22, 0, -0.20), command=lambda: (
+                panel.destroy(), self._prompt_multi_mode()),
+            **self._menu_btn_kw(panel, fs=(-2.6, 2.6, -0.7, 1.1), text_scale=0.9))
 
     def _confirm_multi_name(self):
-        # 입력한 이름을 확정(빈칸이면 PLAYER) 후 멀티(online=True) 시작.
+        # 입력한 이름을 확정(빈칸이면 PLAYER) 후 멀티(online=True) 시작. 축구면 soccer=True.
         name = (self._name_entry.get() or '').strip() or 'PLAYER'
         self.player_name = name[:8]   # 표시·전송 길이 제한(대략 한글 8/영문 8)
-        self._start_game(True)
+        self._start_game(True, soccer=getattr(self, '_name_soccer', False),
+                         paint=getattr(self, '_name_paint', False))
 
     def _prompt_solo_mode(self):
-        # 솔로 모드 선택 — AI와 대결 / 웨이브 버티기. 메뉴 위에 패널로 띄운다.
+        # 솔로 모드 선택 — AI와 대결 / 웨이브 버티기 / 뒤로. 메뉴 위에 패널로 띄운다.
         if self._menu_root is None or self._game_started:
             return
         panel = DirectFrame(
-            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.75, 0.75, -0.34, 0.34),
+            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.75, 0.75, -0.40, 0.40),
             pos=(0, 0, 0.0), parent=self._menu_root)
-        OnscreenText(text='솔로 모드 선택', pos=(0, 0.23), scale=0.06,
+        OnscreenText(text='솔로 모드 선택', pos=(0, 0.30), scale=0.06,
                      fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=panel)
-        sb = dict(
-            scale=0.075, parent=panel,
-            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
-                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
-            text_fg=HUD_WHITE, relief=1, frameSize=(-4.6, 4.6, -0.7, 1.1), text_scale=0.85)
-        DirectButton(text='AI와 대결', pos=(0, 0, 0.06),
+        sb = self._menu_btn_kw(panel)
+        DirectButton(text='AI와 대결', pos=(0, 0, 0.19),
                      command=self._start_game, extraArgs=[False, True], **sb)
-        DirectButton(text='웨이브 버티기', pos=(0, 0, -0.10),
-                     command=self._start_game, extraArgs=[False, False], **sb)
-        OnscreenText(text='AI와 대결 = 소총 AI 봇과 1:1   웨이브 버티기 = 좀비 생존',
-                     pos=(0, -0.24), scale=0.028, fg=HUD_CYAN_DIM,
+        # 축구 솔로 = AI 봇 상대 + 축구 필드/공(online=False, ai=True, soccer=True).
+        DirectButton(text='축구 (공 차기)', pos=(0, 0, 0.05),
+                     command=self._start_game,
+                     extraArgs=[False, True, True], **sb)
+        # 땅따먹기 솔로 = AI 봇 상대(online=False, ai=True, paint=True).
+        DirectButton(text='땅따먹기', pos=(0, 0, -0.09),
+                     command=self._start_game,
+                     extraArgs=[False, True, False, True], **sb)
+        DirectButton(text='뒤로', pos=(0, 0, -0.25),
+                     command=panel.destroy,
+                     **self._menu_btn_kw(panel, fs=(-2.4, 2.4, -0.7, 1.1)))
+        OnscreenText(text='AI대결=소총 1:1   축구=공 차서 2골   땅따먹기=영역 페인트',
+                     pos=(0, -0.34), scale=0.027, fg=HUD_CYAN_DIM,
                      align=TextNode.ACenter, mayChange=False, parent=panel)
 
-    def _start_game(self, online, ai=False):
+    def _start_game(self, online, ai=False, soccer=False, paint=False):
         # 메뉴에서 모드 확정 → 메뉴 제거 후 실제 게임 월드 빌드(한 번만).
         if self._game_started:
             return
         self._game_started = True
         self.online_mode = online
         self.ai_mode = ai
+        self.soccer_mode = soccer
+        self.paint_mode = paint
         if self._menu_root is not None:
             self._menu_root.destroy()
             self._menu_root = None
@@ -1968,7 +2341,7 @@ class ZombieGame(ShowBase):
     def _make_ground(self):
         # level.py 의 5방 라인업(y=-2~70) + 아레나(y=-18~18)를 모두 여유 있게 덮음.
         cm = CardMaker('ground')
-        cm.setFrame(-32, 32, -20, 76)
+        cm.setFrame(-32, 32, -22, 76)   # 축구 골 포켓(y≈±20.4)까지 덮음
         gnd = self.render.attachNewNode(cm.generate())
         gnd.setHpr(0, -90, 0)        # XY 평면으로 눕히기 — 법선 +Z 위
         gnd.setColor(0.55, 0.55, 0.58, 1)
@@ -1977,7 +2350,7 @@ class ZombieGame(ShowBase):
         # setHpr(0, 90, 0) 으로 P=+90 → 카드 법선이 -Z 로 뒤집힘 → 아래에서 비추는
         # 플래시 빛만 받음. 색은 바닥보다 어둡게 (실내 천장 톤).
         cm_c = CardMaker('ceiling')
-        cm_c.setFrame(-32, 32, -20, 76)
+        cm_c.setFrame(-32, 32, -22, 76)
         ceil = self.render.attachNewNode(cm_c.generate())
         ceil.setHpr(0, 90, 0)
         ceil.setZ(WALL_HEIGHT)
@@ -2074,9 +2447,12 @@ class ZombieGame(ShowBase):
             slide_node, slide_rest_x = None, 0.0
         else:
             slide_node, slide_rest_x = slide, slide.getX()
+        # 무기별 탄약을 개별 보관 — 교체해도 각 총의 남은 탄약이 유지된다(풀충전 X).
+        _amax = WEAPON_STATS.get(name, {}).get('ammo_max', 8)
         self._weapons[name] = {
             'node': node, 'slide_node': slide_node,
             'slide_rest_x': slide_rest_x, 'muzzle': muzzle,
+            'ammo': _amax, 'ammo_max': _amax,
         }
         self._weapon_order.append(name)
         print(f'[weapon] {name} registered (slide={"Y" if slide_node else "N"})',
@@ -2086,6 +2462,12 @@ class ZombieGame(ShowBase):
         """활성 무기 교체 — show/hide + slide_node + muzzle flash 위치 갱신."""
         if name not in self._weapons:
             return
+        # 진행 중 재장전이 있으면 확실히 취소(직접 교체 경로 안전망). 끊긴 무기는 충전 안 됨.
+        self._cancel_reload()
+        # 교체 전, 들고 있던 무기의 현재 탄약을 저장 → 다시 들 때 그대로 복원(풀충전 방지).
+        prev = self.weapon_name
+        if prev is not None and prev in self._weapons:
+            self._weapons[prev]['ammo'] = self.ammo
         for w in self._weapons.values():
             w['node'].hide()
         d = self._weapons[name]
@@ -2102,17 +2484,31 @@ class ZombieGame(ShowBase):
         mf = getattr(self, 'muzzle_flash', None)   # muzzle flash 는 나중에 생성됨
         if mf is not None:
             mf.setPos(*d['muzzle'])
-        # 무기별 스탯 적용 — 탄창 풀충전 + 발사간격 + 연발/헤드원킬 플래그.
+        # 무기별 스탯 적용 — 발사간격 + 연발/헤드원킬 플래그. 탄약은 풀충전이 아니라
+        # 해당 무기에 저장돼 있던 남은 탄약을 복원한다.
         st = WEAPON_STATS.get(name, {})
         self.ammo_max = st.get('ammo_max', 8)
-        self.ammo = self.ammo_max
+        self.ammo = d.get('ammo', self.ammo_max)
         self.shoot_cooldown_dur = st.get('cooldown', 0.18)
         self.shoot_cooldown_t = 0.0
         self._auto_fire = st.get('auto', False)
         self._head_onekill = st.get('head_onekill', False)
+        # 권총은 소총보다 빠르게(1.3배) — 가벼운 무기일수록 기동력.
+        self._weapon_speed_mult = 1.3 if name == 'pistol' else 1.0
         print(f'[weapon] equipped {name} '
-              f'(ammo={self.ammo_max}, auto={self._auto_fire}, '
-              f'head1k={self._head_onekill})', flush=True)
+              f'(ammo={self.ammo}/{self.ammo_max}, auto={self._auto_fire}, '
+              f'head1k={self._head_onekill}, spd={self._weapon_speed_mult})', flush=True)
+
+    def _cancel_reload(self):
+        """진행 중이던 재장전을 즉시 중단 — 무기 교체로 끊겼을 때. 예약된 _back(탄약
+        충전)/슬라이드킥 콜백을 토큰 증가로 무효화하고 단발 모션 상태를 해제한다.
+        → 바꾼 무기에서 재장전 모션이 이어 보이지 않고, 끊긴 무기는 탄약이 차지 않는다
+        (재장전 미완료)."""
+        if not self._reload_oneshot:
+            return
+        self._reload_token += 1            # 예약된 _back/_slide_kick 콜백 무효화(탄약 충전 X)
+        self._reload_oneshot = False
+        self.current_anim = '__reload_done__'   # 다음 프레임 upper/hands 를 loco 로 재평가
 
     def _cycle_weapon(self, delta):
         """마우스 휠 무기 순환 — 즉시 교체하지 않고 스왑 모션 시작.
@@ -2124,6 +2520,9 @@ class ZombieGame(ShowBase):
         target = (self._weapon_idx + delta) % len(self._weapon_order)
         if target == self._weapon_idx:
             return
+        # 재장전 중 교체 시작 — 재장전을 곧장 취소(스왑 모션 도중 _back 이 먼저 발동해
+        # 탄약이 차거나, 바꾼 무기에서 재장전 모션이 이어지는 것을 방지).
+        self._cancel_reload()
         self._swap_pending_idx = target
         self._swap_state = 'down'      # 팔 내리기 시작 → 바닥에서 교체 → 올리기
         self._swap_t = 0.0
@@ -2502,6 +2901,19 @@ class ZombieGame(ShowBase):
                 best_z = None
                 best_barrier = None
 
+        # 축구 공 — 좀비/상대/벽보다 가까우면 공을 맞힌 것(차기). best_t 와 비교.
+        if self.soccer_mode and self._ball is not None:
+            res = self._ball.ray_hit(cam_pos, ray_dir)
+            if res is not None and res[0] < best_t and not self._bullet_blocked(
+                    cam_pos, ray_dir, res[0]):
+                t_hit, hit_pt = res
+                power = (self.SOCCER_KICK_RIFLE if self.weapon_name == 'rifle'
+                         else self.SOCCER_KICK_PISTOL)
+                self._soccer_kick_ball(hit_pt - self._ball.pos, ray_dir, power)
+                self._spawn_hit_particle(hit_pt)
+                self._play_pool(self.sfx_hit, '_hit_i')
+                return            # 공을 맞히면 뒤 판정 무효(공이 막아줌)
+
         if remote_hit_pos is not None:
             self._on_remote_player_hit(best_zone, remote_hit_pos)
             return
@@ -2866,9 +3278,9 @@ class ZombieGame(ShowBase):
             parent=self.pause_frame,
         )
         self.sens_slider = DirectSlider(
-            range=(0.02, 0.30),
-            value=self.mouse_sens,
-            pageSize=0.01,
+            range=(0.0, 1.0),         # 정규화 — 기본 0.5(핸들 중앙정렬)
+            value=self._sens_norm,
+            pageSize=0.05,
             command=self._on_sens_change,
             parent=self.pause_frame,
             pos=(0, 0, 0.06),
@@ -2876,7 +3288,7 @@ class ZombieGame(ShowBase):
             thumb_frameColor=HUD_CYAN,
         )
         self.sens_value_text = OnscreenText(
-            text=f'{self.mouse_sens:.3f}', pos=(0, -0.005), scale=0.038,
+            text=f'{self._sens_norm:.2f}', pos=(0, -0.005), scale=0.038,
             fg=HUD_CYAN, align=TextNode.ACenter, mayChange=True,
             parent=self.pause_frame,
         )
@@ -2957,11 +3369,18 @@ class ZombieGame(ShowBase):
         self._dmg_arc_geom.setDepthWrite(False)
         self._dmg_dir_t = self._dmg_dir_dur
 
+    def _sens_from_norm(self, n):
+        """슬라이더 정규화값(0~1) → 실제 마우스 감도. 지수 매핑이라 0.5=기하평균(=0.03,
+        현재 기본)이고 양끝이 크게 벌어진다(0=느림, 1=빠름)."""
+        n = max(0.0, min(1.0, n))
+        return self.SENS_MIN * (self.SENS_MAX / self.SENS_MIN) ** n
+
     def _on_sens_change(self):
-        # DirectSlider command — 매 변경마다 호출. 현재 값 읽어서 mouse_sens 갱신.
-        v = self.sens_slider['value']
-        self.mouse_sens = v
-        self.sens_value_text.setText(f'{v:.3f}')
+        # DirectSlider command — 매 변경마다 호출. 정규화값(0~1) 읽어 실제 감도로 변환.
+        n = self.sens_slider['value']
+        self._sens_norm = n
+        self.mouse_sens = self._sens_from_norm(n)
+        self.sens_value_text.setText(f'{n:.2f}')
 
     def _build_crosshair(self):
         """중앙 조준점 — reticle.png (시안 단색, 880×880 PNG, 4× 해상도).
@@ -4031,6 +4450,11 @@ class ZombieGame(ShowBase):
         av = self.remote_avatar
         if av is None:
             return
+        # 봇 부활 무적 타이머 — 끝나면 보호 링 숨김.
+        if self._ai_invuln_t > 0.0:
+            self._ai_invuln_t -= dt
+            if self._ai_invuln_t <= 0.0 and self._ai_invuln_ring is not None:
+                self._ai_invuln_ring.hide()
         frozen = (self._barriers_active or self._deathcam_t > 0.0
                   or self._match_over)
         dxp = self.player_pos.x - self._ai_pos.x
@@ -4074,13 +4498,14 @@ class ZombieGame(ShowBase):
         if want and want != self._remote_anim:
             av.loop(want)
             self._remote_anim = want
-        # 손 본 따라 무기 앵커 갱신 + 소총 표시.
+        # 손 본 따라 무기 앵커 갱신 + 소총 표시. (사망 중엔 무기를 바닥에 떨궜으니 건너뜀)
         av.update(force=True)
-        if (self._remote_weapon_anchor is not None and self._remote_hand is not None
-                and not self._remote_hand.isEmpty()):
-            self._remote_weapon_anchor.setPos(self._remote_hand.getPos(self.render))
-            self._remote_weapon_anchor.setHpr(self._remote_hand.getHpr(self.render))
-        self._show_remote_weapon(1)               # 소총(인덱스 1)
+        if not self._remote_hidden_for_death:
+            if (self._remote_weapon_anchor is not None and self._remote_hand is not None
+                    and not self._remote_hand.isEmpty()):
+                self._remote_weapon_anchor.setPos(self._remote_hand.getPos(self.render))
+                self._remote_weapon_anchor.setHpr(self._remote_hand.getHpr(self.render))
+            self._show_remote_weapon(1)               # 소총(인덱스 1)
         # 발소리.
         if moving and not frozen:
             self._ai_foot_t -= dt
@@ -4096,11 +4521,80 @@ class ZombieGame(ShowBase):
                 self._remote_tracer.hide()
         if frozen:
             return
-        # 사격 — 쿨다운마다 사거리 안 + 시야 트이면 발사.
+        # 사격 — 쿨다운마다. 축구면 공↔플레이어 번갈아 사격(공은 봇 골 방향으로 차기).
         self._ai_fire_t -= dt
-        if self._ai_fire_t <= 0.0 and dist < self.AI_SHOOT_RANGE:
-            self._ai_fire_t = self.AI_FIRE_INTERVAL
-            self._ai_try_shoot(dist)
+        if self._ai_fire_t <= 0.0:
+            if self.soccer_mode and self._ball is not None:
+                self._ai_fire_t = 0.8        # 축구는 또박또박(공/플레이어 교대)
+                self._ai_shoot_ball = not getattr(self, '_ai_shoot_ball', False)
+                if self._ai_shoot_ball:
+                    self._ai_kick_ball_toward_goal()
+                elif dist < self.AI_SHOOT_RANGE:
+                    self._ai_try_shoot(dist)
+            elif dist < self.AI_SHOOT_RANGE:
+                self._ai_fire_t = self.AI_FIRE_INTERVAL
+                self._ai_try_shoot(dist)
+            else:
+                self._ai_fire_t = self.AI_FIRE_INTERVAL
+
+    def _ai_kick_ball_toward_goal(self):
+        """축구 AI — 공을 봇의 공격 골(남쪽 y<0) 방향으로 찬다. 시야 막히면 패스. 솔로라
+        로컬(플레이어 A)이 공 권위이므로 공에 직접 임펄스."""
+        b = self._ball
+        if b is None:
+            return
+        if self.level_collider.segment_blocked(
+                self._ai_pos.x, self._ai_pos.y, b.pos.x, b.pos.y):
+            return                            # 공이 벽 뒤 — 패스
+        sc = self._arena_data.get('soccer', {})
+        gy = -sc.get('half_y', 18.0)          # 봇(B)은 남쪽 골 공격
+        dirx, diry = 0.0 - b.pos.x, gy - b.pos.y
+        L = (dirx * dirx + diry * diry) ** 0.5 or 1e-5
+        kick_dir = Vec3(dirx / L, diry / L, 0.04)
+        # 공을 향해 조준(트레이서/소리)
+        bdx, bdy = b.pos.x - self._ai_pos.x, b.pos.y - self._ai_pos.y
+        bdist = (bdx * bdx + bdy * bdy) ** 0.5 or 1e-5
+        self._ai_yaw = degrees(atan2(-bdx, bdy))
+        pitch = degrees(atan2(b.pos.z - 1.4, bdist))
+        self._show_remote_tracer((0, 0, 0, self._ai_yaw, pitch))
+        vol = self._remote_dist_volume(1.3, 5.0, 90.0)
+        if vol > 0.0:
+            self._play_pool_vol(self._r_sfx_m16, '_r_sfx_m16_i', vol)
+        # 중앙 명중(스핀 없이) 골 방향으로 강하게 — 솔로는 로컬이 권위라 직접 적용.
+        b.kick(Vec3(0, 0, 0), kick_dir, self.SOCCER_KICK_RIFLE)
+
+    def _ai_respawn(self):
+        """봇 부활(축구/땅따먹기 솔로) — 원래 스폰으로 복귀 + 잠깐 무적 + 발밑 보호 링.
+        (죽은 자리에서 다시 살아나던 버그 수정.)"""
+        self._ai_pos = Vec3(self._ai_spawn)
+        self.ai_hp = self.ai_max_hp
+        self._ai_fire_t = 0.0
+        self._ai_invuln_t = self.AI_INVULN_DUR
+        av = self.remote_avatar
+        if av is not None:
+            av.setPos(self._ai_pos)
+            self._remote_smooth = Vec3(self._ai_pos)
+        self._show_ai_invuln_ring()
+        print('[ai] 봇 부활 — 스폰 복귀 + 무적', flush=True)
+
+    def _show_ai_invuln_ring(self):
+        """봇 발밑 보호 링 — remote_avatar 에 부착(부활자를 원으로 감쌈)."""
+        av = self.remote_avatar
+        if av is None:
+            return
+        if self._ai_invuln_ring is None:
+            seg = LineSegs('ai_invuln_ring')
+            seg.setThickness(3.0)
+            seg.setColor(1.0, 0.85, 0.25, 0.9)   # 봇 보호 링(노랑)
+            steps = 36
+            R = 1.1
+            for i in range(steps + 1):
+                a = (i / steps) * 6.28318
+                seg.drawTo(R * cos(a), R * sin(a), 0.05)
+            self._ai_invuln_ring = av.attachNewNode(seg.create())
+            self._ai_invuln_ring.setLightOff()
+            self._ai_invuln_ring.setTransparency(True)
+        self._ai_invuln_ring.show()
 
     def _ai_try_shoot(self, dist):
         """AI 한 발 — 벽에 막히면 안 쏨. 트레이서 + 거리별 소총음 + 거리 기반 명중 확률로
@@ -4166,6 +4660,366 @@ class ZombieGame(ShowBase):
             props.setCursorHidden(False)
             props.setMouseMode(WindowProperties.M_absolute)
             self.win.requestProperties(props)
+
+    def _setup_soccer(self):
+        """축구 — _setup_online/_setup_ai 직후 호출. 멀티는 로비 생략 + nonce 역할배정.
+        솔로(ai)는 _setup_ai 가 이미 역할/카운트다운/봇을 세팅했으니 공만 추가한다."""
+        self._am_a = not self._spawn_b   # 솔로=A(플레이어). 멀티는 nonce/타임아웃이 확정
+        if not self.ai_mode:
+            # 멀티 — 로비 생략, _role_decided=False 로 두고 _arena_update 가 nonce 로 확정.
+            if self.lobby_root is not None:
+                self.lobby_root.destroy()
+                self.lobby_root = None
+            self._in_lobby = False
+            self._role_decided = False
+            self._countdown_t = None
+            self._soccer_wait_t = 0.0
+            self.hud_countdown.setFg((1, 0.92, 0.4, 1))
+            props = WindowProperties()
+            props.setCursorHidden(True)
+            props.setMouseMode(WindowProperties.M_confined)
+            self.win.requestProperties(props)
+            self.win.movePointer(0, self._win_cx, self._win_cy)
+            self._first_frame = True
+        # 공 생성(중앙).
+        sc = self._arena_data.get('soccer', {}) if self._arena_data else {}
+        self._ball = SoccerBall(self, sc.get('ball_spawn', (0.0, 0.0)))
+        self._goals_a = 0
+        self._goals_b = 0
+        self._goal_cele_t = 0.0
+        # 봇 사격 교대 시작값 — True 로 두면 첫 토글이 False(=플레이어)라 첫 발은 플레이어.
+        self._ai_shoot_ball = True
+        self._build_soccer_hud()
+        self._update_score_hud()
+        print('[soccer] 축구 시작 — 먼저 2골 승리 (총으로 공을 차세요)', flush=True)
+
+    def _build_soccer_hud(self):
+        """골 배너 — 득점 시 화면 중앙에 크게 잠깐 표시."""
+        if self.hud_goal_banner is None:
+            self.hud_goal_banner = OnscreenText(
+                text='', pos=(0, 0.18), scale=0.22, fg=(0.3, 1.0, 0.5, 1.0),
+                align=TextNode.ACenter, mayChange=True, parent=self.aspect2d)
+            self.hud_goal_banner.setBin('fixed', 55)
+        self.hud_goal_banner.hide()
+
+    def _soccer_kick_ball(self, offset, direction, power):
+        """공 차기 — 권위(A)면 직접 적용, 비권위(B)면 킥 이벤트로 권위에 전송(A 가
+        적용 후 공 위치를 브로드캐스트)."""
+        if self._am_a:
+            self._ball.kick(offset, direction, power)
+        else:
+            self._kick_seq = (self._kick_seq + 1) & 0xFF
+            self._kick_off = Vec3(offset)
+            self._kick_dir = Vec3(direction)
+            self._kick_power = power
+
+    def _soccer_update(self, dt):
+        """축구 1프레임. 권위(A): 상대 킥 적용 + 공 물리 + 골 판정 + 세리머니/킥오프.
+        비권위(B): 권위가 보낸 공 위치를 따라가고, 점수 변화로 골/승리 처리."""
+        if self._ball is None:
+            return
+        # 골 배너 표시 시간 — 끝나면 배너만 숨김. (재시작은 _soccer_round_reset 의
+        # 배리어 5초 카운트다운이 처리하므로 여기서 멈추거나 킥오프하지 않는다.)
+        if self._goal_cele_t > 0.0:
+            self._goal_cele_t -= dt
+            if self._goal_cele_t <= 0.0 and self.hud_goal_banner is not None:
+                self.hud_goal_banner.hide()
+
+        if not self._am_a:
+            # ── 비권위(B) — 권위가 보낸 공 위치 추종(부드럽게) + 점수 동기화. ──
+            rs = self.remote_state
+            if rs is not None and len(rs) >= 26:
+                target = Vec3(rs[13], rs[14], rs[15])
+                new_pos = self._ball.pos + (target - self._ball.pos) * min(
+                    1.0, dt * 16.0)
+                # 추정 속도(위치 변화량) → 회전 시각화에 사용(구르는 무늬가 보이게).
+                self._ball.vel = (new_pos - self._ball.pos) * (1.0 / max(dt, 1e-5))
+                self._ball.pos = new_pos
+                self._ball.node.setPos(self._ball.pos)
+                self._ball._spin_visual(dt)
+                self._soccer_client_scores(rs[16], rs[17])
+            return
+
+        # ── 권위(A) ──────────────────────────────────────────────────────
+        # 상대(B)가 보낸 킥 이벤트 적용(seq 증가 감지).
+        rs = self.remote_state
+        if rs is not None and len(rs) >= 26:
+            kseq = rs[18]
+            if self._remote_kick_seq is None:
+                self._remote_kick_seq = kseq
+            elif kseq != self._remote_kick_seq:
+                self._remote_kick_seq = kseq
+                kdir = Vec3(rs[22], rs[23], rs[24])
+                if kdir.lengthSquared() > 1e-9:
+                    self._ball.kick(Vec3(rs[19], rs[20], rs[21]), kdir, rs[25])
+        # 킥오프 카운트다운(배리어) 중 / 매치 종료 후엔 공 정지.
+        if self._barriers_active or self._match_over:
+            return
+        sc = self._arena_data.get('soccer', {})
+        scored = self._ball.update(dt, sc['half_x'], sc['half_y'],
+                                   sc['goal_hw'], sc['goal_depth'])
+        self._soccer_ball_vs_players()        # 공이 몸을 통과하지 않게(튕겨냄)
+        if scored is not None:
+            self._soccer_goal(scored)
+
+    def _soccer_ball_vs_players(self):
+        """공 vs 플레이어 몸통 충돌(권위만). 공은 '쏠 때만' 움직인다:
+        - 날아오는(빠른) 공 → 몸에 튕김(공 반사, 통과 방지).
+        - 느린/정지 공 → 공은 그대로, 파고든 쪽(나/봇)을 밀어내 막기만(저절로 안 굴러감).
+        몸은 반지름 PLAYER_RADIUS 의 수직 기둥으로 근사. 머리 위로 뜬 공은 통과."""
+        b = self._ball
+        if b is None or b.pos.z > 2.0:
+            return
+        targets = [('me', self.player_pos)]
+        av = self.remote_avatar
+        if (self._remote_smooth is not None and av is not None
+                and not av.isHidden()):
+            targets.append(('bot' if self.ai_mode else 'remote', self._remote_smooth))
+        mind = b.RADIUS + PLAYER_RADIUS
+        ball_fast = (b.vel.x * b.vel.x + b.vel.y * b.vel.y) > 4.0   # >2 m/s = 쏜 공
+        for kind, p in targets:
+            dx = b.pos.x - p.x
+            dy = b.pos.y - p.y
+            d2 = dx * dx + dy * dy
+            if d2 >= mind * mind:
+                continue
+            if d2 > 1e-9:
+                d = d2 ** 0.5
+                nx, ny = dx / d, dy / d
+            else:
+                nx, ny = 1.0, 0.0
+            if ball_fast:
+                # 날아오는 공 → 몸 밖으로 밀고 반사(튕김).
+                b.pos.x = p.x + nx * mind
+                b.pos.y = p.y + ny * mind
+                vn = b.vel.x * nx + b.vel.y * ny
+                if vn < 0.0:
+                    k = (1.0 + b.RESTITUTION) * vn
+                    b.vel.x -= k * nx
+                    b.vel.y -= k * ny
+                b.node.setPos(b.pos)
+            elif kind == 'me':
+                # 정지 공 — 내가 파고들면 나를 공 밖으로(공은 안 움직임).
+                self.player_pos.x = b.pos.x - nx * mind
+                self.player_pos.y = b.pos.y - ny * mind
+            elif kind == 'bot':
+                self._ai_pos.x = b.pos.x - nx * mind
+                self._ai_pos.y = b.pos.y - ny * mind
+                self._remote_smooth = Vec3(self._ai_pos.x, self._ai_pos.y, 0)
+            # 'remote'(멀티 상대)는 자기 클라가 충돌 처리 → 여기선 공 안 움직임
+
+    def _soccer_client_scores(self, sa, sb):
+        """비권위(B) — 권위가 보낸 점수 변화 감지 → 배너/HUD/승리 처리."""
+        if sa == self._goals_a and sb == self._goals_b:
+            return
+        scored_a = sa > self._goals_a
+        self._goals_a, self._goals_b = sa, sb
+        self._update_score_hud()
+        i_scored = (scored_a == self._am_a)
+        self._show_goal_banner(i_scored)
+        if (sa >= self.SOCCER_WIN or sb >= self.SOCCER_WIN) \
+                and not self._match_over:
+            self._goal_cele_t = 0.0
+            self._end_match(i_scored)
+        else:
+            self._goal_cele_t = 2.0
+            self._soccer_round_reset()       # 나도 스폰 복귀 + 5초 카운트다운
+
+    def _show_goal_banner(self, i_scored):
+        """득점/실점 배너 표시 + 득점 효과음(있으면). 권위·클라 공용."""
+        if self.hud_goal_banner is not None:
+            self.hud_goal_banner.setText('골!!!' if i_scored else '실점...')
+            self.hud_goal_banner.setFg((0.3, 1.0, 0.5, 1.0) if i_scored
+                                       else (1.0, 0.5, 0.4, 1.0))
+            self.hud_goal_banner.show()
+        if i_scored and getattr(self, 'sfx_kill_pool', None):
+            try:
+                self.sfx_kill_pool[0].play()
+            except Exception:
+                pass
+
+    def _soccer_round_reset(self):
+        """1점 득실 후 — 공 중앙 + 양쪽(나/봇) 스폰 복귀 + 배리어 재가둠 + 5초 카운트다운
+        후 재시작. (_arena_round_reset 재사용 + 공 리셋.)"""
+        if self._ball is not None:
+            self._ball.reset()
+        self._ai_shoot_ball = True
+        self._arena_round_reset()
+
+    def _soccer_goal(self, team):
+        """골 처리(권위) — 득점 갱신 + 배너. 승리(2골)면 매치 종료, 아니면 1점 득실마다
+        양쪽 스폰 복귀 + 공 중앙 + 5초 카운트다운 후 재시작."""
+        if team == 'A':
+            self._goals_a += 1
+        else:
+            self._goals_b += 1
+        self._update_score_hud()
+        i_scored = ((team == 'A') == self._am_a)
+        self._show_goal_banner(i_scored)
+        print(f'[soccer] GOAL ({team})  A {self._goals_a} : {self._goals_b} B',
+              flush=True)
+        scorer_goals = self._goals_a if team == 'A' else self._goals_b
+        if scorer_goals >= self.SOCCER_WIN:
+            self._goal_cele_t = 0.0
+            self._end_match(i_scored)        # 승리 → 매치 종료
+        else:
+            self._goal_cele_t = 2.0          # 배너 표시 시간(재시작은 카운트다운이 처리)
+            self._soccer_round_reset()       # 양쪽 스폰 복귀 + 5초 카운트다운
+
+    def _soccer_kickoff_reset(self):
+        """킥오프 — 공을 중앙으로, 양 플레이어를 스폰으로 복귀(부활 무적 부여)."""
+        if self._ball is not None:
+            self._ball.reset()
+        self.player_pos = Vec3(self._spawn_pos)
+        self.player_yaw = self._spawn_yaw
+        self.player_vz = 0.0
+        self.on_ground = True
+        self._ai_shoot_ball = True           # 킥오프 후에도 봇 첫 발은 플레이어부터
+        self._grant_invuln()                 # 킥오프 직후 잠깐 무적
+        self.hud_countdown.setText('KICK OFF')
+        self.hud_countdown.setFg((1, 0.92, 0.4, 1))
+        self.hud_countdown.show()
+        self._fight_t = 1.0                  # 1초 뒤 _arena_update 가 숨김
+
+    def _soccer_respawn_self(self):
+        """축구 사망 후 부활 — 나만 스폰 복귀 + HP/탄 회복 + 무적(보호 링). 공/경기 유지."""
+        self.player_pos = Vec3(self._spawn_pos)
+        self.player_yaw = self._spawn_yaw
+        self.player_pitch = 0.0
+        self.player_vz = 0.0
+        self.on_ground = True
+        self.core_integrity = self.core_integrity_max
+        self.ammo = self.ammo_max
+        for w in self._weapons.values():
+            w['ammo'] = w['ammo_max']
+        self._pvp_dead_t = 0.0
+        self._grant_invuln()
+        print('[soccer] 부활 — 3초 무적', flush=True)
+
+    def _grant_invuln(self):
+        """부활/킥오프 무적 — INVULN_DUR 초 피해 무효 + 발밑 보호 링 표시."""
+        self._invuln_t = self.INVULN_DUR
+        if self._invuln_ring is None:
+            # 발밑 청록 링(빌보드 아님 — 바닥에 눕힌 원판). 내 몸(ybot)에 부착.
+            seg = LineSegs('invuln_ring')
+            seg.setThickness(3.0)
+            seg.setColor(0.3, 1.0, 0.9, 0.9)
+            steps = 36
+            R = 1.1
+            for i in range(steps + 1):
+                a = (i / steps) * 6.28318
+                seg.drawTo(R * cos(a), R * sin(a), 0.05)
+            self._invuln_ring = self.ybot.attachNewNode(seg.create())
+            self._invuln_ring.setLightOff()
+            self._invuln_ring.setTransparency(True)
+        self._invuln_ring.show()
+
+    # --- 땅따먹기(영역 페인트) -------------------------------------------------
+
+    def _setup_paint(self):
+        """땅따먹기 — _setup_online/_setup_ai 직후 호출. 색 배정 + 격자 참조 + HUD.
+        솔로(ai)면 내가 A(파랑)·봇이 B(주황). 멀티는 _decide_role(nonce)이 _am_a 확정."""
+        self._paint = self._arena_data.get('paint') if self._arena_data else None
+        self._am_a = not self._spawn_b
+        self._paint_my_id = 1 if self._am_a else 2
+        self._paint_opp_id = 2 if self._am_a else 1
+        self._paint_count = {1: 0, 2: 0}     # 칠한 칸 수(색별) — _paint_disc 가 증감
+        self._paint_time_left = PAINT_TIME
+        self.hud_score.hide()                # 킬 점수 HUD 숨김(땅따먹기는 안 씀)
+        self._build_paint_hud()
+        self._update_paint_hud()
+        print(f'[paint] 땅따먹기 시작 — 내 색={"A(파랑)" if self._am_a else "B(주황)"} '
+              f'(3분, 더 많이 칠한 쪽 승리)', flush=True)
+
+    def _build_paint_hud(self):
+        """상단 HUD — 3분 타이머 + 그 밑에 칠한 칸 수 (A 파랑):(B 주황). 시안/글리치 안 씀."""
+        ca = PAINT_COLORS[1]
+        cb = PAINT_COLORS[2]
+        self.hud_paint_timer = OnscreenText(
+            text='3:00', pos=(0, 0.92), scale=0.085, fg=(1, 1, 1, 0.96),
+            align=TextNode.ACenter, mayChange=True, parent=self.aspect2d)
+        self.hud_paint_a = OnscreenText(
+            text='0', pos=(-0.07, 0.83), scale=0.075, fg=ca,
+            align=TextNode.ARight, mayChange=True, parent=self.aspect2d)
+        self.hud_paint_colon = OnscreenText(
+            text=':', pos=(0, 0.83), scale=0.075, fg=(1, 1, 1, 0.9),
+            align=TextNode.ACenter, mayChange=False, parent=self.aspect2d)
+        self.hud_paint_b = OnscreenText(
+            text='0', pos=(0.07, 0.83), scale=0.075, fg=cb,
+            align=TextNode.ALeft, mayChange=True, parent=self.aspect2d)
+
+    def _update_paint_hud(self):
+        """칸 수 표시 갱신 — (A 칸):(B 칸)."""
+        if getattr(self, 'hud_paint_a', None) is None:
+            return
+        self.hud_paint_a.setText(str(self._paint_count.get(1, 0)))
+        self.hud_paint_b.setText(str(self._paint_count.get(2, 0)))
+
+    def _update_paint_timer_hud(self):
+        t = max(0, int(self._paint_time_left + 0.999))
+        if getattr(self, 'hud_paint_timer', None) is not None:
+            self.hud_paint_timer.setText(f'{t // 60}:{t % 60:02d}')
+
+    def _paint_update(self, dt):
+        """땅따먹기 1프레임 — 시작 카운트다운 끝난 뒤 3분 타이머 감소, 0 이면 종료."""
+        if self._match_over:
+            return
+        if self._barriers_active:
+            return                            # 시작 5초 카운트다운 중엔 타이머 대기
+        self._paint_time_left -= dt
+        if self._paint_time_left <= 0.0:
+            self._paint_time_left = 0.0
+            self._update_paint_timer_hud()
+            self._paint_end_by_time()
+            return
+        self._update_paint_timer_hud()
+
+    def _paint_end_by_time(self):
+        """제한시간 종료 — 칸 수 많은 쪽 승리(동수면 패/무)."""
+        mine = self._paint_count.get(self._paint_my_id, 0)
+        opp = self._paint_count.get(self._paint_opp_id, 0)
+        print(f'[paint] 시간 종료 — 내 칸 {mine} vs 상대 {opp}', flush=True)
+        self._end_match(mine > opp)
+
+    def _paint_disc(self, cx, cy, radius, color_id, cz=0.5):
+        """(cx,cy,cz) 중심 반경 안의 셀(바닥+벽+장애물)을 color_id 색으로 칠한다.
+        3D 거리라 칠한 자리 근처의 낮은 벽면에도 자연스럽게 색이 번진다. 칸 수도 증감."""
+        if self._paint is None:
+            return
+        col = PAINT_COLORS.get(color_id)
+        if col is None:
+            return
+        cw = GeomVertexWriter(self._paint['vdata'], 'color')
+        r2 = radius * radius
+        for cell in self._paint['cells']:
+            dx = cell['cx'] - cx
+            dy = cell['cy'] - cy
+            cz_cell = cell.get('cz', 0.0)
+            dz = cz_cell - cz
+            if dx * dx + dy * dy + dz * dz <= r2:
+                old = cell['owner']
+                if old == color_id:
+                    continue
+                cell['owner'] = color_id
+                cw.setRow(cell['v0'])
+                cw.setData4(*col)
+                cw.setData4(*col)
+                cw.setData4(*col)
+                cw.setData4(*col)
+                # 점수는 바닥(땅) 칸만 1점씩 — 벽/장애물 칸은 칠하되 점수엔 안 센다.
+                if cz_cell < 0.1:
+                    if old in self._paint_count:
+                        self._paint_count[old] -= 1
+                    self._paint_count[color_id] = \
+                        self._paint_count.get(color_id, 0) + 1
+        self._update_paint_hud()
+
+    def _paint_on_kill(self, victim_xy, zone, color_id):
+        """처치 위치 주변을 color_id 색으로 칠함. 부위(zone)별 반경 차등."""
+        radius = PAINT_KILL_RADIUS.get(zone, PAINT_KILL_RADIUS['other'])
+        self._paint_disc(victim_xy[0], victim_xy[1], radius, color_id)
+        print(f'[paint] 칠하기 — 색{color_id} zone={zone} r={radius} '
+              f'@({victim_xy[0]:.1f},{victim_xy[1]:.1f})', flush=True)
 
     def _setup_remote_avatar(self):
         """상대용 ybot Actor 하나 더 생성 — 평범한 3인칭 월드 Actor.
@@ -4304,13 +5158,23 @@ class ZombieGame(ShowBase):
     def _arena_update(self, dt):
         """스폰 배리어 흐름 — 양쪽 준비되면 5초 카운트다운, 끝나면 배리어 제거
         (가둠 해제) + shimmer fade out + FIGHT! 배너. 아레나(online) 전용."""
-        # 데스캠/유예(사망 후 3초) — 끝나면 시점 복구 + 라운드 리셋. 이 동안은 그 외 정지.
+        # 데스캠/유예(사망 후) — 끝나면 시점 복구. PvP/AI 는 라운드 리셋, 축구는 죽은
+        # 사람만 부활(공/경기는 계속). 데스캠 동안은 그 외 정지. 단 축구는 공이 계속
+        # 굴러가야 하므로 여기서 return 하지 않고 아래로 흐른다(_soccer_update 가 구동).
         if self._deathcam_t > 0.0:
             self._deathcam_t -= dt
             if self._deathcam_t <= 0.0:
+                was_victim = self._dead       # 내가 죽은 쪽이었나(킬러는 계속 플레이 중)
                 self._exit_deathcam()
-                self._arena_round_reset()
-            return
+                if self.soccer_mode or self.paint_mode:
+                    if was_victim:
+                        self._soccer_respawn_self()   # 나만 부활(무적) — 라운드 리셋 X
+                    elif self.ai_mode:
+                        self._ai_respawn()            # 봇이 죽었음 → 스폰 복귀 + 무적
+                else:
+                    self._arena_round_reset()
+            if not (self.soccer_mode or self.paint_mode):
+                return
         # shimmer fade out (해제 후 진행)
         if self._shimmer_fading and self._shimmer_cards:
             self._shimmer_a = max(0.0, self._shimmer_a - dt / 0.6)
@@ -4334,6 +5198,14 @@ class ZombieGame(ShowBase):
             rs = self.remote_state
             if rs is not None and len(rs) >= 11 and rs[10] != 0:
                 self._decide_role(rs[10])
+            elif self.soccer_mode:
+                # 축구는 로비 없이 진행 — 상대 nonce 가 일정 시간 안 오면 혼자(A) 시작.
+                self._soccer_wait_t += dt
+                if self._soccer_wait_t > 3.0:
+                    self._am_a = not self._spawn_b
+                    self._role_decided = True
+                    self._countdown_t = 5.0
+                return
             else:
                 return                    # 아직 상대 nonce 없음 → 대기
         # 준비방 — 양쪽 준비완료 전까지 카운트다운 보류. 상대 이름/준비 상태 갱신.
@@ -4366,6 +5238,10 @@ class ZombieGame(ShowBase):
         self.player_vz = 0.0
         self.on_ground = True
         self._role_decided = True
+        self._am_a = am_a                 # 축구 공 권위 + 득점 매핑
+        # 축구는 로비가 없으므로 역할 확정 즉시 킥오프 카운트다운 시작.
+        if self.soccer_mode and self._countdown_t is None:
+            self._countdown_t = 5.0
         print(f'[arena] 스폰 자동배정 — 나={"A" if am_a else "B"} '
               f'({sp[0]},{sp[1]}) nonce {self._nonce} vs {remote_nonce}', flush=True)
 
@@ -4548,10 +5424,15 @@ class ZombieGame(ShowBase):
         self._spawn_hit_particle(world_pos)
         self._spawn_damage_number(world_pos, dmg)
         if self.ai_mode:
+            if self._ai_invuln_t > 0.0:
+                return                       # 봇 부활 무적 — 피해 무효
             # AI 대결 — 로컬 HP 를 직접 깎고, 0 이하면 처치 처리(점수/데스캠/리셋).
             self.ai_hp -= dmg
             print(f'[ai] AI 명중 zone={zone} dmg={dmg} → hp={self.ai_hp}', flush=True)
             if self.ai_hp <= 0:
+                if self.paint_mode:      # 봇 처치 위치를 내 색으로 칠함(부위별 반경)
+                    self._paint_on_kill((self._ai_pos.x, self._ai_pos.y),
+                                        zone, self._paint_my_id)
                 self.ai_hp = self.ai_max_hp
                 self._on_remote_player_killed()
             return
@@ -4564,6 +5445,8 @@ class ZombieGame(ShowBase):
         """상대 총에 맞아 내 체력(core_integrity) 감소. 피격 방향 아크 + 0 되면 사망."""
         if self._match_over or self._barriers_active or self._deathcam_t > 0.0:
             return                        # 매치 종료/카운트다운/데스캠 중엔 피해 없음
+        if self._invuln_t > 0.0:
+            return                        # 부활 무적 — 피해 무효
         self.core_integrity = max(0, self.core_integrity - amount)
         # 피격 방향 — 상대 아바타 위치를 source 로 빨간 아크 표시(좀비 피격과 동일).
         if self._remote_smooth is not None:
@@ -4581,39 +5464,70 @@ class ZombieGame(ShowBase):
         self._my_score += 1
         self._update_score_hud()
         print(f'[pvp] 상대 처치! 점수 {self._my_score}:{self._enemy_score}', flush=True)
-        if self._my_score >= self.WIN_SCORE:
+        if not self.soccer_mode and not self.paint_mode \
+                and self._my_score >= self.WIN_SCORE:
             self._end_match(True)
         else:
-            self._enter_deathcam(victim=False)   # 3초 자유 이동 → 라운드 리셋
+            # 축구/땅따먹기: 킬은 승리 조건이 아님. 상대만 잠깐 쓰러뜨림(경기는 계속).
+            self._enter_deathcam(victim=False)   # 자유 이동 → 라운드 리셋 안 함
 
     def _update_score_hud(self):
         """상단 중앙 점수 텍스트 갱신 (online 일 때만 보임)."""
-        self.hud_score.setText(f'{self._my_score} : {self._enemy_score}')
+        if self.paint_mode:
+            return                        # 땅따먹기는 킬 점수 안 씀(타이머+칸수 HUD 별도)
+        if self.soccer_mode:
+            mine = self._goals_a if self._am_a else self._goals_b
+            opp = self._goals_b if self._am_a else self._goals_a
+            self.hud_score.setText(f'{mine} : {opp}')
+        else:
+            self.hud_score.setText(f'{self._my_score} : {self._enemy_score}')
 
     def _end_match(self, won):
         """매치 종료 — 결과창(승/패 + 킬/데스) 표시 + 이후 정지. 진행 중이면 데스캠도 정리."""
         self._match_over = True
+        # 게임 종료 슬로우모션 — 이 순간부터 모든 이동/총알/모션이 천천히 흐른다.
+        self._time_scale_target = self.SLOWMO_FACTOR
         # 데스캠 중이었다면 시점/시체 정리(결과창 잘 보이게).
         self._deathcam_t = 0.0
         self._exit_deathcam()
+        self.hud_countdown.hide()
+        print(f'[pvp] 매치 종료 — {"WIN" if won else "LOSE"} '
+              f'kills={self._my_score} deaths={self._enemy_score}', flush=True)
+        # 결과창은 곧장 띄우지 않고, 슬로우모션으로 마지막 장면(처치 순간)을 ~1.8초
+        # (실시간) 보여준 뒤에 띄운다 — 어두운 결과 패널이 화면을 덮기 전에 슬로우모션을
+        # 감상할 수 있게. 중복 예약 방지.
+        if not getattr(self, '_return_scheduled', False):
+            self._return_scheduled = True
+            self._pending_match_won = won
+            self.taskMgr.doMethodLater(1.8, self._reveal_match_result,
+                                       'reveal_match_result')
+
+    def _reveal_match_result(self, task):
+        """슬로우모션 잠시 후 결과창(승/패 + 킬/데스)을 띄우고 메인 복귀 카운트다운 시작."""
+        won = getattr(self, '_pending_match_won', False)
         # 킬 = 내가 상대를 죽인 횟수(my_score), 데스 = 내가 죽은 횟수(enemy_score).
         self.hud_match_result.setText('승리!' if won else '패배...')
         self.hud_match_result.setFg((0.30, 1.0, 0.45, 1.0) if won
                                     else (1.0, 0.35, 0.35, 1.0))
-        self.hud_result.setText(f'킬  {self._my_score}      데스  {self._enemy_score}')
+        if self.paint_mode:
+            mine = self._paint_count.get(self._paint_my_id, 0)
+            opp = self._paint_count.get(self._paint_opp_id, 0)
+            self.hud_result.setText(f'내 칸  {mine}      상대 칸  {opp}')
+        elif self.soccer_mode:
+            mine = self._goals_a if self._am_a else self._goals_b
+            opp = self._goals_b if self._am_a else self._goals_a
+            self.hud_result.setText(f'골  {mine}      실점  {opp}')
+        else:
+            self.hud_result.setText(f'킬  {self._my_score}      데스  {self._enemy_score}')
         self.hud_result_bg.show()
         self.hud_match_result.show()
         self.hud_result.show()
-        self.hud_countdown.hide()
-        print(f'[pvp] 매치 종료 — {"WIN" if won else "LOSE"} '
-              f'kills={self._my_score} deaths={self._enemy_score}', flush=True)
-        # 결산 5초 카운트다운 후 메인 화면(시작 메뉴)으로 복귀. 중복 예약 방지.
-        if not getattr(self, '_return_scheduled', False):
-            self._return_scheduled = True
-            self._return_secs = 5
-            self.hud_result_return.setText(f'{self._return_secs}초 후 메인 화면으로...')
-            self.hud_result_return.show()
-            self.taskMgr.doMethodLater(1.0, self._tick_return_menu, 'return_to_menu')
+        # 결산 5초 카운트다운 후 메인 화면(시작 메뉴)으로 복귀.
+        self._return_secs = 5
+        self.hud_result_return.setText(f'{self._return_secs}초 후 메인 화면으로...')
+        self.hud_result_return.show()
+        self.taskMgr.doMethodLater(1.0, self._tick_return_menu, 'return_to_menu')
+        return Task.done
 
     def _tick_return_menu(self, task):
         # 1초마다 카운트다운 갱신, 0 이 되면 메인 화면으로 복귀.
@@ -4655,10 +5569,50 @@ class ZombieGame(ShowBase):
         self._enemy_score = self._deaths   # 상대가 나를 죽인 횟수 = 상대 점수
         self._update_score_hud()
         print(f'[pvp] 사망 — 점수 {self._my_score}:{self._enemy_score}', flush=True)
-        if self._enemy_score >= self.WIN_SCORE:
+        if self.paint_mode:      # 내 죽은 자리를 상대 색으로 칠함(상대가 처치한 것)
+            self._paint_on_kill((self.player_pos.x, self.player_pos.y),
+                                'body', self._paint_opp_id)
+        if not self.soccer_mode and not self.paint_mode \
+                and self._enemy_score >= self.WIN_SCORE:
             self._end_match(False)         # 매치 종료
         else:
-            self._enter_deathcam(victim=True)   # 3초 내 시체 위 3인칭 → 라운드 리셋
+            self._enter_deathcam(victim=True)   # 사망 후 3인칭(축구/땅=5초) → 부활
+
+    def _drop_weapon(self, pos, yaw, name='rifle'):
+        """사망 시 손에 들고 있던 무기를 바닥에 떨군다 — 해당 무기 모델을 로드해 죽은
+        자리 바닥에 옆으로 눕혀 놓는다. _dropped_weapons 에 등록(데스캠 끝나면 정리)."""
+        if name == 'rifle':
+            path, scale, prerot = RIFLE_PATH, RIFLE_LOCAL_SCALE, RIFLE_LOCAL_PREROT
+        else:
+            path, scale, prerot = WEAPON_PATH, WEAPON_LOCAL_SCALE, (0, 0, 0)
+        if path is None or not path.exists():
+            return
+        try:
+            model = self.loader.loadModel(path)
+        except Exception as e:
+            print('[drop] 무기 로드 실패:', e, flush=True)
+            return
+        for _prop in ('7.62x51 mag.001', '76251'):   # AR-10 딸려오는 소품 제거
+            for _np in model.findAllMatches(f'**/*{_prop}*'):
+                _np.removeNode()
+        model.flattenLight()
+        drop = self.render.attachNewNode('dropped_weapon')
+        model.reparentTo(drop)
+        model.setHpr(*prerot)
+        drop.setScale(scale)
+        drop.setTwoSided(True)
+        # 바닥에 옆으로 쓰러뜨려 놓기 — 죽은 방향(yaw) + 옆으로 굴림(R=90).
+        drop.setPos(pos.x, pos.y, 0.05)
+        drop.setHpr(yaw, 0, 90)
+        self._dropped_weapons.append(drop)
+
+    def _clear_dropped_weapons(self):
+        for d in self._dropped_weapons:
+            try:
+                d.removeNode()
+            except Exception:
+                pass
+        self._dropped_weapons = []
 
     def _make_death_corpse(self, pos, h):
         """현재 좀비가 죽을 때와 '똑같이' — 좀비 모델(X Bot) + DeathHeadshot 을 1.5배속
@@ -4683,7 +5637,8 @@ class ZombieGame(ShowBase):
         자유 이동, 상대(죽은 자)는 시체로 쓰러짐. 3초 뒤 _exit_deathcam + 라운드 리셋."""
         if self._match_over:
             return
-        self._deathcam_t = self.DEATHCAM_DUR
+        # 축구는 부활까지 5초(요청), 그 외 PvP/AI 는 3초.
+        self._deathcam_t = 5.0 if self.soccer_mode else self.DEATHCAM_DUR
         if victim:
             self._dead = True
             self._death_yaw = self.player_yaw
@@ -4692,6 +5647,9 @@ class ZombieGame(ShowBase):
             self.weapon_anchor.hide()
             self._corpse = self._make_death_corpse(self.player_pos,
                                                    self.player_yaw + 180)
+            # 들고 있던 총을 바닥에 떨군다(1인칭 총은 숨겼으니 월드에 별도 모델로).
+            self._drop_weapon(self.player_pos, self.player_yaw,
+                              self.weapon_name or 'rifle')
             print('[pvp] 사망 — 3초 데스캠', flush=True)
         else:
             # 죽은 상대 — Y Bot 아바타 숨기고 그 자리에 좀비식 death 시체로 대체.
@@ -4699,6 +5657,11 @@ class ZombieGame(ShowBase):
             if av is not None:
                 self._corpse = self._make_death_corpse(av.getPos(self.render),
                                                        av.getH())
+                # 손에 떠 있던 상대 무기를 숨기고 바닥에 떨군다.
+                if self._remote_weapon_anchor is not None:
+                    self._remote_weapon_anchor.hide()
+                self._drop_weapon(av.getPos(self.render), av.getH() - 180,
+                                  self._remote_weapon_shown or 'rifle')
                 av.hide()
                 self._remote_hidden_for_death = True
             print('[pvp] 처치 — 3초 자유 이동', flush=True)
@@ -4720,6 +5683,10 @@ class ZombieGame(ShowBase):
             self._remote_hidden_for_death = False
             if self.remote_avatar is not None:
                 self.remote_avatar.show()
+            if self._remote_weapon_anchor is not None:
+                self._remote_weapon_anchor.show()   # 손 무기 복구
+        # 바닥에 떨군 무기 제거(다음 라운드 깨끗하게).
+        self._clear_dropped_weapons()
         self._remote_action_t = 0.0
         self._remote_anim = None
 
@@ -4736,6 +5703,8 @@ class ZombieGame(ShowBase):
         self.on_ground = True
         self.core_integrity = self.core_integrity_max
         self.ammo = self.ammo_max
+        for w in self._weapons.values():     # 새 라운드 — 모든 무기 풀충전
+            w['ammo'] = w['ammo_max']
         self._pvp_dead_t = 0.0
         # 스폰 배리어 재가둠(중복 add 방지) + shimmer 다시 보이게.
         if self._spawn_barriers and not self._barriers_active:
@@ -4767,6 +5736,8 @@ class ZombieGame(ShowBase):
         self.on_ground = True
         self.core_integrity = self.core_integrity_max
         self.ammo = self.ammo_max
+        for w in self._weapons.values():     # 리스폰 — 모든 무기 풀충전
+            w['ammo'] = w['ammo_max']
         self._pvp_dead_t = 0.0
         print('[pvp] 리스폰 완료', flush=True)
         return Task.done
@@ -4824,15 +5795,32 @@ class ZombieGame(ShowBase):
                     try:
                         (x, y, z, yaw, pitch, widx, reloading,
                          shot_seq, dmg_total, deaths, nonce,
-                         name_b, ready) = struct.unpack(NET_STATE_FMT, frame)
+                         name_b, ready,
+                         bx, by, bz, sa, sb, kseq,
+                         kox, koy, koz, kdx, kdy, kdz, kpow
+                         ) = struct.unpack(NET_STATE_FMT, frame)
                     except struct.error:
                         continue
                     name = name_b.split(b'\x00', 1)[0].decode('utf-8', 'ignore')
                     # 참조 교체(원자적) — 위치/시점 + 무기 + 재장전/발사 + 피해 + 사망 +
-                    # nonce + (준비방용) 이름 + 준비완료 플래그.
+                    # nonce + (준비방용) 이름 + 준비완료 플래그 + (축구) 공/점수/킥 이벤트.
                     self.remote_state = (x, y, z, yaw, pitch, widx, reloading,
                                          shot_seq, dmg_total, deaths, nonce,
-                                         name, ready)
+                                         name, ready,
+                                         bx, by, bz, sa, sb, kseq,
+                                         kox, koy, koz, kdx, kdy, kdz, kpow)
+                    # 위치 스냅샷을 도착시각과 함께 버퍼에 적재(메인이 시간보간에 사용).
+                    # 직전 스냅샷에서 크게 점프했으면(리스폰 등 텔레포트) 버퍼를 비워
+                    # 보간을 끊고 새 위치부터 다시 시작 → 맵을 가로질러 미끄러지지 않게.
+                    with self._remote_buf_lock:
+                        if self._remote_buf:
+                            pt = self._remote_buf[-1]
+                            if ((x - pt[1]) ** 2 + (y - pt[2]) ** 2
+                                    + (z - pt[3]) ** 2
+                                    > REMOTE_TELEPORT_DIST ** 2):
+                                self._remote_buf.clear()
+                        self._remote_buf.append(
+                            (time.monotonic(), x, y, z, yaw))
         except OSError:
             pass                      # 끊김 — 마지막 remote_state 유지
         finally:
@@ -4849,6 +5837,14 @@ class ZombieGame(ShowBase):
         self._net_send_t = 0.0
         try:
             name_b = self.player_name.encode('utf-8')[:NET_NAME_BYTES]
+            # 축구 — 권위(A)면 공 위치·점수를 싣는다(B 는 0; 무시됨). 킥 이벤트는 양쪽 다 실음.
+            if self.soccer_mode and self._am_a and self._ball is not None:
+                bx, by, bz = self._ball.pos.x, self._ball.pos.y, self._ball.pos.z
+                sa, sb = self._goals_a & 0xFF, self._goals_b & 0xFF
+            else:
+                bx = by = bz = 0.0
+                sa = sb = 0
+            ko, kd = self._kick_off, self._kick_dir
             pkt = struct.pack(NET_STATE_FMT,
                               self.player_pos.x, self.player_pos.y,
                               self.player_pos.z, self.player_yaw,
@@ -4860,11 +5856,23 @@ class ZombieGame(ShowBase):
                               self._deaths & 0xFF,                # 내 누적 사망 횟수
                               self._nonce & 0xFFFFFFFF,           # 스폰 배정용 랜덤
                               name_b,                             # 준비방 표시 이름(24바이트)
-                              1 if self._ready else 0)            # 준비완료 플래그
+                              1 if self._ready else 0,            # 준비완료 플래그
+                              bx, by, bz,                         # (축구) 공 위치(권위만 유효)
+                              sa, sb,                             # (축구) 점수 A,B(권위만 유효)
+                              self._kick_seq & 0xFF,              # (축구) 내 킥 카운터
+                              ko.x, ko.y, ko.z,                   # (축구) 킥 명중 오프셋
+                              kd.x, kd.y, kd.z,                   # (축구) 킥 방향
+                              self._kick_power)                   # (축구) 킥 파워
             self._sock.sendall(pkt)
         except OSError as e:
             print(f'[net] 송신 실패 ({e}) — 연결 종료', flush=True)
             self._net_alive = False
+
+    @staticmethod
+    def _lerp_angle(a, b, t):
+        """각도(deg) 최단호 보간 — 359°→1° 가 358°가 아니라 2° 로 돌게."""
+        d = (b - a + 180.0) % 360.0 - 180.0
+        return a + d * t
 
     def _update_remote_avatar(self, dt):
         """수신한 remote_state 로 상대 아바타를 부드럽게 보간 이동 + 방향 + run/idle.
@@ -4875,17 +5883,45 @@ class ZombieGame(ShowBase):
         rs = self.remote_state        # 스레드가 최신값으로 교체 — 한 번만 읽음
         if rs is None:
             return                    # 아직 첫 패킷 없음 → 숨김 유지(크래시 없음)
-        target = Vec3(rs[0], rs[1], rs[2])
-        if self._remote_smooth is None:
-            self._remote_smooth = Vec3(target)   # 첫 패킷은 즉시 배치(점프 방지)
-            self._remote_prev = Vec3(target)
-            av.show()
+        # 스냅샷 보간 — 상대를 REMOTE_INTERP_DELAY 과거 시점으로 두고, 그 시점을 감싸는
+        # 두 스냅샷 사이를 시간비율로 보간한다. 패킷이 몰리거나(버스트) 비어도(렉) 등속
+        # 으로 흐르게 해 '찔끔 순간이동'을 없앤다. (외삽은 안 함 — 방향전환 시 오버슈트
+        # 튐 방지. 버퍼 고갈 시엔 최신 스냅샷에서 잠깐 멈췄다 재개.)
+        render_t = time.monotonic() - REMOTE_INTERP_DELAY
+        with self._remote_buf_lock:
+            buf = list(self._remote_buf)
+        if not buf:
+            ipos = Vec3(rs[0], rs[1], rs[2]); iyaw = rs[3]   # 버퍼 비면 최신값(드묾)
+        elif render_t <= buf[0][0]:
+            s = buf[0]; ipos = Vec3(s[1], s[2], s[3]); iyaw = s[4]
+        elif render_t >= buf[-1][0]:
+            s = buf[-1]; ipos = Vec3(s[1], s[2], s[3]); iyaw = s[4]  # 고갈 → 멈춤
         else:
-            # 핑 대응 — 현재→목표 지수 보간(계수 REMOTE_SMOOTH_LERP). 외삽 없음.
-            self._remote_smooth += ((target - self._remote_smooth)
+            a = buf[0]; b = buf[-1]
+            for nxt in buf[1:]:        # render_t 를 감싸는 A(<=) / B(>) 탐색
+                if nxt[0] > render_t:
+                    b = nxt; break
+                a = nxt
+            span = b[0] - a[0]
+            al = (render_t - a[0]) / span if span > 1e-6 else 0.0
+            ipos = Vec3(a[1] + (b[1] - a[1]) * al,
+                        a[2] + (b[2] - a[2]) * al,
+                        a[3] + (b[3] - a[3]) * al)
+            iyaw = self._lerp_angle(a[4], b[4], al)
+        if self._remote_smooth is None:
+            self._remote_smooth = Vec3(ipos)   # 첫 등장은 즉시 배치(점프 방지)
+            self._remote_prev = Vec3(ipos)
+            av.show()
+        elif ((ipos - self._remote_smooth).lengthSquared()
+                > REMOTE_TELEPORT_DIST ** 2):
+            self._remote_smooth = Vec3(ipos)   # 텔레포트(리스폰/스폰배정) → 즉시 스냅
+            self._remote_prev = Vec3(ipos)
+        else:
+            # 보간 결과 위로 가벼운 잔여 스무딩 — 버퍼 경계/재개 시 미세한 끊김도 흡수.
+            self._remote_smooth += ((ipos - self._remote_smooth)
                                     * min(1.0, dt * REMOTE_SMOOTH_LERP))
         av.setPos(self._remote_smooth)
-        av.setH(rs[3] + 180)          # yaw 만 — pitch 로 몸 전체를 기울이지 않음
+        av.setH(iyaw + 180)           # yaw 만 — pitch 로 몸 전체를 기울이지 않음
         # 애니: 직전 프레임 대비 이동 속도로 run/idle 판정. 실제 있는 이름만 사용.
         moved = (self._remote_smooth - self._remote_prev).length()
         self._remote_prev = Vec3(self._remote_smooth)
@@ -4932,15 +5968,17 @@ class ZombieGame(ShowBase):
         #  3인칭으로 그냥 손에 총만 들려 있으면 됨.) 손 본 좌표를 현재 프레임으로
         # 동기화하려고 av.update 후 읽는다(로컬 ybot.update(force=True) 와 동일 패턴).
         av.update(force=True)
-        if (self._remote_weapon_anchor is not None
-                and self._remote_hand is not None
-                and not self._remote_hand.isEmpty()):
-            self._remote_weapon_anchor.setPos(
-                self._remote_hand.getPos(self.render))
-            self._remote_weapon_anchor.setHpr(
-                self._remote_hand.getHpr(self.render))
-        # 무기 종류 동기화 — 패킷의 무기 인덱스(rs[5])에 맞는 모델만 보이게.
-        self._show_remote_weapon(rs[5])
+        # 사망 중엔 무기를 바닥에 떨궜으니 손 무기 추적/표시를 건너뛴다(공중 고정 방지).
+        if not self._remote_hidden_for_death:
+            if (self._remote_weapon_anchor is not None
+                    and self._remote_hand is not None
+                    and not self._remote_hand.isEmpty()):
+                self._remote_weapon_anchor.setPos(
+                    self._remote_hand.getPos(self.render))
+                self._remote_weapon_anchor.setHpr(
+                    self._remote_hand.getHpr(self.render))
+            # 무기 종류 동기화 — 패킷의 무기 인덱스(rs[5])에 맞는 모델만 보이게.
+            self._show_remote_weapon(rs[5])
 
         # 상대 총알 궤적 — 잠깐 보였다 시간 지나면 숨김(로컬 tracer 와 동일 방식).
         if self._remote_tracer_t > 0.0:
@@ -4959,6 +5997,30 @@ class ZombieGame(ShowBase):
             except OSError:
                 pass
 
+    def _apply_slowmo_anim_rate(self, rate):
+        """슬로우모션 동안 화면에 보이는 모든 Actor 의 골격 애니메이션 재생속도를 rate
+        로 맞춘다(이동 dt 와 동기화). 매 프레임 호출해도 idempotent — 새로 시작된
+        애니(예: 죽음 모션)도 즉시 같이 느려진다. 액터가 없으면 조용히 건너뜀."""
+        actors = []
+        if getattr(self, 'ybot', None) is not None:
+            actors.append(self.ybot)
+        if getattr(self, 'remote_avatar', None) is not None:
+            actors.append(self.remote_avatar)
+        if getattr(self, '_corpse', None) is not None:
+            actors.append(self._corpse)
+        for z in getattr(self, 'zombies', []):
+            if getattr(z, 'actor', None) is not None:
+                actors.append(z.actor)
+            rep = getattr(z, 'ybot_replacement', None)
+            if rep is not None and getattr(z, 'transformed', False):
+                actors.append(rep)
+        for a in actors:
+            try:
+                for an in a.getAnimNames():
+                    a.setPlayRate(rate, an)
+            except Exception:
+                pass
+
     # --- main loop ----------------------------------------------------------
 
     def _update(self, task):
@@ -4970,6 +6032,21 @@ class ZombieGame(ShowBase):
         # pause 직후 첫 프레임 wall-clock 누적 dt 폭발 cap — 좀비 워프 방지.
         if dt > 0.1:
             dt = 0.1
+        # ── 슬로우모션 ─────────────────────────────────────────────────────
+        # _time_scale 을 실시간(real dt) 기준으로 target 에 부드럽게 수렴시킨 뒤, 게임
+        # 로직에 쓰이는 dt 를 그만큼 줄인다 → 이동/AI/총알 궤적/반동/타이머가 전부 느려짐.
+        # 골격 애니메이션은 Panda 글로벌클럭으로 도니 별도로 재생속도를 같이 낮춰준다.
+        if self._time_scale != self._time_scale_target:
+            step = dt / max(0.001, self.SLOWMO_RAMP)
+            if self._time_scale < self._time_scale_target:
+                self._time_scale = min(self._time_scale_target,
+                                       self._time_scale + step)
+            else:
+                self._time_scale = max(self._time_scale_target,
+                                       self._time_scale - step)
+        if self._time_scale < 0.999:
+            self._apply_slowmo_anim_rate(self._time_scale)
+        dt *= self._time_scale
 
         # ── 온라인: 내 상태 송신(스로틀) + 상대 아바타 보간/애니 ──────────────
         # 싱글이면 online_mode=False 라 통째로 건너뜀(네트워크 코드 안 탐).
@@ -4980,6 +6057,16 @@ class ZombieGame(ShowBase):
         elif self.ai_mode:
             self._ai_update(dt)           # AI 봇 이동/조준/사격(네트워크 없음)
             self._arena_update(dt)        # 카운트다운/라운드 흐름 공유
+        if self.soccer_mode:
+            self._soccer_update(dt)       # 공 물리 + 골/킥오프
+        if self.paint_mode:
+            self._paint_update(dt)        # 3분 타이머 + 종료 판정
+
+        # 부활 무적 타이머 — 끝나면 보호 링 숨김.
+        if self._invuln_t > 0.0:
+            self._invuln_t -= dt
+            if self._invuln_t <= 0.0 and self._invuln_ring is not None:
+                self._invuln_ring.hide()
 
         # 애니메이션 블렌딩 weight 수렴
         self._update_blend(dt)
@@ -5090,7 +6177,8 @@ class ZombieGame(ShowBase):
                     if self.keys['a']: mv -= right_v
                 if mv.length() > 0:
                     mv.normalize()
-                    spd_mult = 1.0 + (self.ads_move_factor - 1.0) * self.aim_t
+                    spd_mult = (1.0 + (self.ads_move_factor - 1.0) * self.aim_t) \
+                        * self._weapon_speed_mult   # 무기별 속도(권총 1.3배)
                     self.player_pos += mv * (self.move_speed * spd_mult * dt)
                     # 벽 충돌 해소 (XY 평면) — 박스 안쪽으로 침투했으면 바깥으로 밀어냄.
                     nx, ny = self.level_collider.resolve(
@@ -5141,8 +6229,9 @@ class ZombieGame(ShowBase):
                 if self._footstep_t <= 0.0:
                     self._play_footstep()
                     # ADS 면 이동이 느려지므로(spd_mult<1) 보폭 간격도 그만큼 늘려
-                    # 발소리 템포를 실제 속도에 맞춘다.
-                    spd_mult = 1.0 + (self.ads_move_factor - 1.0) * self.aim_t
+                    # 발소리 템포를 실제 속도(무기별 배율 포함)에 맞춘다.
+                    spd_mult = (1.0 + (self.ads_move_factor - 1.0) * self.aim_t) \
+                        * self._weapon_speed_mult
                     self._footstep_t = self.footstep_interval / max(0.3, spd_mult)
             else:
                 self._footstep_t = 0.0   # 멈추면 다음 이동 첫 발은 즉시 재생
@@ -5344,7 +6433,12 @@ if __name__ == '__main__':
     # '--online' → 메뉴 건너뛰고 바로 멀티(릴레이 접속).
     # '--p2' → 아레나 스폰 B(0,15) 로 시작(상대는 인자 없이 스폰 A). 한 명만 --p2.
     # 모드를 직접 지정(--online/--p2)하면 메뉴를 건너뛴다.
+    # '--soccer' → 메뉴 건너뛰고 바로 축구(릴레이 접속 + 혼자면 연습). 테스트/직접실행용.
+    # '--paint' → 메뉴 건너뛰고 바로 땅따먹기 솔로(AI 봇). 테스트/직접실행용.
     online = '--online' in sys.argv
+    soccer = '--soccer' in sys.argv
+    paint = '--paint' in sys.argv
     spawn_b = '--p2' in sys.argv
-    menu = not (online or spawn_b)
-    ZombieGame(online=online, spawn_b=spawn_b, menu=menu).run()
+    menu = not (online or spawn_b or soccer or paint)
+    ZombieGame(online=online, spawn_b=spawn_b, menu=menu, soccer=soccer,
+               paint=paint).run()

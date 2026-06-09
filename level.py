@@ -23,11 +23,13 @@ level.py — zombie_game 연구실 레벨 (방 / 벽 / 충돌 / 색 번짐).
 
 from math import atan2, degrees, hypot
 
-from panda3d.core import CardMaker
+from panda3d.core import (CardMaker, Geom, GeomNode, GeomTriangles,
+                          GeomVertexData, GeomVertexFormat, GeomVertexWriter,
+                          LineSegs)
 
 
 # ── 튜닝 노브 ────────────────────────────────────────────────────────────
-WALL_HEIGHT    = 3.0
+WALL_HEIGHT    = 9.0     # 벽/천장 높이(m) — 3.0 → 9.0 으로 천장 3배(개방감↑, 모든 모드 공통)
 WALL_THICKNESS = 0.30
 WALL_COLOR     = (0.72, 0.74, 0.78, 1.0)
 PLAYER_RADIUS  = 0.40
@@ -464,5 +466,340 @@ def build_arena(render, draw_wall_cards=True):
         'rooms': [],
         'gates': [],
         'cage_stain': None,
+    }
+    return LevelCollider(walls), arena_data
+
+
+# 축구 필드 색.
+PITCH_GREEN = (0.10, 0.42, 0.18, 1.0)
+PITCH_LINE  = (0.92, 0.95, 0.95, 1.0)
+
+
+def _flat_quad(parent, x0, x1, y0, y1, color, z=0.02, alpha=1.0, name='quad'):
+    """바닥(XY 평면)에 눕힌 단색 quad. 필드 잔디/라인 등에 사용. z 로 z-fight 회피."""
+    cm = CardMaker(name)
+    cm.setFrame(x0, x1, y0, y1)
+    np = parent.attachNewNode(cm.generate())
+    np.setHpr(0, -90, 0)
+    np.setZ(z)
+    np.setColor(color[0], color[1], color[2], alpha)
+    np.setTwoSided(True)
+    np.setLightOff()
+    if alpha < 1.0:
+        np.setTransparency(True)
+        np.setDepthWrite(False)
+    return np
+
+
+def build_soccer_field(render, draw_wall_cards=True):
+    """총알 축구용 열린 잔디 필드. (LevelCollider, arena_data) 반환.
+
+    레이아웃 (원점 대칭):
+      외벽 24×36 (x[-12,12], y[-18,18]), 4면 막힘 — 공이 벽에 튕긴다.
+      장애물 없음(공이 굴러갈 수 있게). 중앙선 + 센터서클 + 골에어리어 마킹.
+      골: 북쪽 벽(y=+18) / 남쪽 벽(y=-18), 폭 x[-4,4]. 공이 그 안으로 들어가면 골.
+      스폰 A (0,-15) 는 북(+y)을 공격 / 스폰 B (0,15) 는 남(-y)을 공격.
+    """
+    root = render.attachNewNode('soccer')
+    walls = []
+    HALF_X, HALF_Y = 12.0, 18.0
+    GOAL_HW = 4.0          # 골 폭 절반 (x[-4,4])
+    GOAL_DEPTH = 2.4       # 골대가 끝벽 바깥으로 들어가는 깊이(네트 포켓)
+    GOAL_H = 2.6           # 골대 높이
+
+    # 외벽 — 양 끝벽(N/S)은 골 입구(폭 2*GOAL_HW)만큼 뚫는다(문). 좌우(E/W)는 막힘.
+    outer = room_walls(-HALF_X, HALF_X, -HALF_Y, HALF_Y,
+                       doors=[('N', 0, 2 * GOAL_HW), ('S', 0, 2 * GOAL_HW)])
+    walls += outer
+    if draw_wall_cards:
+        for w in outer:
+            w.make_card(root)
+
+    # ── 필드 잔디 + 라인 마킹 ──────────────────────────────────────────────
+    if draw_wall_cards:
+        _flat_quad(root, -HALF_X, HALF_X, -HALF_Y, HALF_Y, PITCH_GREEN, z=0.01,
+                   name='pitch')
+        # 중앙선 (가로) + 센터 스폿/서클(간이: 얇은 사각 링 4변).
+        _flat_quad(root, -HALF_X, HALF_X, -0.12, 0.12, PITCH_LINE, z=0.02,
+                   name='midline')
+        cr = 3.0   # 센터서클 반지름(간이 사각 링)
+        _flat_quad(root, -cr, cr, cr - 0.12, cr, PITCH_LINE, z=0.02, name='cc_n')
+        _flat_quad(root, -cr, cr, -cr, -cr + 0.12, PITCH_LINE, z=0.02, name='cc_s')
+        _flat_quad(root, -cr, -cr + 0.12, -cr, cr, PITCH_LINE, z=0.02, name='cc_w')
+        _flat_quad(root, cr - 0.12, cr, -cr, cr, PITCH_LINE, z=0.02, name='cc_e')
+        # 골 에어리어 박스(양 끝) — 폭 x[-6,6], 깊이 4m.
+        for sy in (1, -1):
+            ay = sy * HALF_Y
+            iy = ay - sy * 4.0
+            _flat_quad(root, -6, 6, min(ay, iy), max(ay, iy), PITCH_GREEN, z=0.015,
+                       name='box')
+            _flat_quad(root, -6, 6, iy - 0.12 * sy, iy + 0.12 * sy, PITCH_LINE,
+                       z=0.02, name='box_line')
+
+    # ── 골대 포켓 — 끝벽 바깥(y 더 큰 쪽)으로 들어간 골대. 안쪽(위/양옆/뒤)은
+    #    불투명 어두운 패널로 맵 바깥(void)을 가리고, 그 앞에 흰 그물선을 그린다. ──
+    def shell_card(name, fr, hpr, pos):
+        # 불투명 어두운 패널 — 골 포켓 안쪽 면. 맵 바깥이 안 보이게 막는다.
+        cm = CardMaker(name)
+        cm.setFrame(*fr)
+        c = root.attachNewNode(cm.generate())
+        c.setHpr(*hpr)
+        c.setPos(*pos)
+        c.setColor(0.05, 0.06, 0.09, 1.0)
+        c.setTwoSided(True)
+        c.setLightOff()
+
+    def net_grid(o, du, dv, nu, nv):
+        # 흰 그물선 격자 — 모서리 o + 두 변(du, dv)로 만든 사각면에 가로·세로 줄.
+        seg = LineSegs('net')
+        seg.setThickness(1.4)
+        seg.setColor(0.92, 0.96, 1.0, 1.0)
+        for i in range(nu + 1):
+            f = i / nu
+            ax, ay, az = o[0] + du[0] * f, o[1] + du[1] * f, o[2] + du[2] * f
+            seg.moveTo(ax, ay, az)
+            seg.drawTo(ax + dv[0], ay + dv[1], az + dv[2])
+        for j in range(nv + 1):
+            f = j / nv
+            ax, ay, az = o[0] + dv[0] * f, o[1] + dv[1] * f, o[2] + dv[2] * f
+            seg.moveTo(ax, ay, az)
+            seg.drawTo(ax + du[0], ay + du[1], az + du[2])
+        np_ = root.attachNewNode(seg.create())
+        np_.setLightOff()
+
+    for sy in (1, -1):
+        mouth_y = sy * HALF_Y
+        back_y = sy * (HALF_Y + GOAL_DEPTH)
+        mid_y = (mouth_y + back_y) * 0.5
+        dy = back_y - mouth_y                  # 포켓 깊이 벡터(부호 포함)
+        # 충돌벽 — 양옆(x=±GOAL_HW) + 뒷벽(y=back_y). 시각은 아래 패널/그물로 그림.
+        walls.append(Wall(-GOAL_HW, mouth_y, -GOAL_HW, back_y))
+        walls.append(Wall(GOAL_HW, mouth_y, GOAL_HW, back_y))
+        walls.append(Wall(-GOAL_HW, back_y, GOAL_HW, back_y))
+        if not draw_wall_cards:
+            continue
+        # 불투명 안쪽 패널 — 뒷면 + 양 측면은 천장(WALL_HEIGHT)까지 올려서, 골 안에서
+        # 점프해 그물 위로 넘겨봐도 맵 바깥이 안 보이게 한다. 윗면은 월드 천장이 덮음.
+        H = WALL_HEIGHT
+        shell_card('gs_back', (-GOAL_HW, GOAL_HW, 0.0, H), (0, 0, 0),
+                   (0, back_y, 0))
+        for sx in (1, -1):
+            shell_card('gs_side', (-GOAL_DEPTH / 2, GOAL_DEPTH / 2, 0.0, H),
+                       (90, 0, 0), (sx * GOAL_HW, mid_y, 0))
+        # 바닥 — 골대 안쪽도 어두운 패널(잔디 살짝 위)로 다른 면과 통일.
+        shell_card('gs_floor', (-GOAL_HW, GOAL_HW, min(mouth_y, back_y),
+                                max(mouth_y, back_y)), (0, -90, 0), (0, 0, 0.02))
+        # 흰 그물선 격자 — 뒷면/양옆/윗면/바닥(패널 살짝 앞에 그려 z-fight 회피).
+        net_grid((-GOAL_HW, back_y - sy * 0.05, 0.0), (2 * GOAL_HW, 0, 0),
+                 (0, 0, GOAL_H), 8, 5)                                  # 뒷면
+        net_grid((-GOAL_HW + 0.05, mouth_y, 0.0), (0, dy, 0),
+                 (0, 0, GOAL_H), 5, 5)                                  # 좌측면
+        net_grid((GOAL_HW - 0.05, mouth_y, 0.0), (0, dy, 0),
+                 (0, 0, GOAL_H), 5, 5)                                  # 우측면
+        net_grid((-GOAL_HW, mouth_y, GOAL_H), (2 * GOAL_HW, 0, 0),
+                 (0, dy, 0), 8, 5)                                      # 윗면(그물)
+        net_grid((-GOAL_HW, mouth_y, 0.05), (2 * GOAL_HW, 0, 0),
+                 (0, dy, 0), 8, 5)                                      # 바닥(그물)
+        # 골대 프레임(입구) — 흰 포스트 2개 + 크로스바.
+        frame = root.attachNewNode('goalframe')
+        for sx in (1, -1):
+            cm = CardMaker('post')
+            cm.setFrame(-0.10, 0.10, 0.0, GOAL_H)
+            p = frame.attachNewNode(cm.generate())
+            p.setPos(sx * GOAL_HW, mouth_y, 0.0)
+            p.setTwoSided(True)
+        cm = CardMaker('bar')
+        cm.setFrame(-GOAL_HW, GOAL_HW, GOAL_H - 0.12, GOAL_H)
+        bar = frame.attachNewNode(cm.generate())
+        bar.setPos(0, mouth_y, 0.0)
+        bar.setTwoSided(True)
+        frame.setColor(0.97, 0.97, 1.0, 1.0)
+        frame.setLightOff()
+        # 골대 위쪽 벽(상인방) — 골 입구는 GOAL_H 까지만 뚫고, 그 위(GOAL_H~천장)는
+        # 끝벽이 그대로 막혀 있게 카드로 채운다(끝벽 색과 동일, 양면).
+        cm = CardMaker('lintel')
+        cm.setFrame(-GOAL_HW, GOAL_HW, GOAL_H, WALL_HEIGHT)
+        lin = root.attachNewNode(cm.generate())
+        lin.setPos(0, mouth_y, 0.0)
+        lin.setColor(*WALL_COLOR)
+        lin.setTwoSided(True)
+
+    # ── 스폰 배리어 (PvP 아레나와 동일 — 킥오프 5초 가둠 후 해제) ────────────
+    spawn_barriers = [
+        Wall(-3, -12, 3, -12), Wall(-3, -18, -3, -12), Wall(3, -18, 3, -12),
+        Wall(-3, 12, 3, 12), Wall(-3, 12, -3, 18), Wall(3, 12, 3, 18),
+    ]
+    shimmer_cards = []
+    if draw_wall_cards:
+        for w in spawn_barriers:
+            shimmer_cards.append(_barrier_shimmer(root, w))
+
+    arena_data = {
+        'spawns': [(0, -15, 0), (0, 15, 180)],   # A=남(북 공격) / B=북(남 공격)
+        'spawn_barriers': spawn_barriers,
+        'shimmer_cards': shimmer_cards,
+        'platforms': [],
+        'rooms': [], 'gates': [], 'cage_stain': None,
+        # 축구 전용 — 공/골 판정에 사용. 공은 골 입구로 들어가 포켓(깊이 goal_depth)에
+        # 갇히고, |y| 가 (half_y + 0.4) 넘으면 득점. y>0 → A, y<0 → B.
+        'soccer': {
+            'half_x': HALF_X, 'half_y': HALF_Y, 'goal_hw': GOAL_HW,
+            'goal_depth': GOAL_DEPTH, 'ball_spawn': (0.0, 0.0),
+        },
+    }
+    return LevelCollider(walls), arena_data
+
+
+# 땅따먹기(영역 페인트) 셀 기본색 — 중립 회색(아직 아무도 안 칠함).
+PAINT_NEUTRAL = (0.30, 0.32, 0.36, 1.0)
+
+
+def _box_walls(x0, x1, y0, y1, h):
+    """직사각 박스의 4면 충돌 Wall(둘레). (시각은 페인트 셀로 따로 그림.)"""
+    return [Wall(x0, y0, x1, y0, height=h), Wall(x0, y1, x1, y1, height=h),
+            Wall(x0, y0, x0, y1, height=h), Wall(x1, y0, x1, y1, height=h)]
+
+
+def build_paint_field(render, draw_wall_cards=True, cell=1.0):
+    """땅따먹기(영역 페인트) 맵. (LevelCollider, arena_data) 반환.
+
+    build_arena 와 같은 좌표계/헬퍼/원점 점대칭. 1:1 PvP 보다 장애물 적게(개방적).
+    바닥 + 외벽 안쪽면 + 장애물 표면을 모두 cell×cell 격자로 쪼개 '칠할 수 있는 면'으로
+    만든다 — 셀마다 정점 4개를 가진 단일 Geom(V3C4, UHDynamic)이라 런타임은 셀의 정점
+    색만 갱신해 가볍게 칠한다. 장애물 풋프린트는 격자에 정렬하고, 그 아래 바닥셀은
+    아예 생성하지 않아 벽 때문에 바닥셀이 잘려 보이지 않게 한다.
+    arena_data['paint'] 에 셀 리스트(정점 시작인덱스 + 월드 3D 중심)와 vdata 를 담는다.
+    """
+    root = render.attachNewNode('paint')
+    walls = []
+    HALF_X, HALF_Y = 12.0, 18.0
+    PAINT_WALL_H = 3.0          # 벽/장애물에서 칠해지는(격자화) 높이
+
+    # 외벽 4면(충돌). 경계가 격자에 정렬됨.
+    walls += room_walls(-HALF_X, HALF_X, -HALF_Y, HALF_Y)
+    # 장애물 박스 — 풋프린트를 정수(격자) 좌표에 맞춤. (x0,x1,y0,y1,height)
+    obstacles = [(-1.0, 1.0, -1.0, 1.0, 3.0)]      # 중앙 블록(자기대칭)
+    for (x0, x1, y0, y1, h) in [(-7.0, -5.0, 4.0, 6.0, 2.0)]:
+        obstacles.append((x0, x1, y0, y1, h))
+        obstacles.append((-x1, -x0, -y1, -y0, h))  # 점대칭 쌍
+    for (x0, x1, y0, y1, h) in obstacles:
+        walls += _box_walls(x0, x1, y0, y1, h)
+    # 불투명 벽 카드(solid) — 페인트 셀(살짝 앞, 틈 있음) 뒤에 깔아 셀 틈으로 바깥이
+    # 뚫려 보이지 않게(틈은 이 벽이 보임). 칠은 앞쪽 셀 정점색으로 따로.
+    if draw_wall_cards:
+        for w in walls:
+            w.make_card(root)
+
+    # ── 페인트 셀(단일 Geom, 정점색). 셀마다 4정점(비공유)으로 독립 칠. ──
+    fmt = GeomVertexFormat.getV3c4()
+    vdata = GeomVertexData('paint_cells', fmt, Geom.UHDynamic)
+    vw = GeomVertexWriter(vdata, 'vertex')
+    cw = GeomVertexWriter(vdata, 'color')
+    tris = GeomTriangles(Geom.UHDynamic)
+    cells = []
+    state = {'vi': 0}
+    INSET = 0.06                # 셀 사이 띄움 비율(격자선처럼)
+
+    def add_quad(p00, p10, p11, p01):
+        # 4 모서리(3D)로 셀 하나 추가. INSET 만큼 중심 쪽으로 줄여 셀 사이 틈을 만든다.
+        cx = (p00[0] + p10[0] + p11[0] + p01[0]) * 0.25
+        cy = (p00[1] + p10[1] + p11[1] + p01[1]) * 0.25
+        cz = (p00[2] + p10[2] + p11[2] + p01[2]) * 0.25
+
+        def ins(p):
+            return (p[0] + (cx - p[0]) * INSET, p[1] + (cy - p[1]) * INSET,
+                    p[2] + (cz - p[2]) * INSET)
+        for p in (ins(p00), ins(p10), ins(p11), ins(p01)):
+            vw.addData3(*p)
+            cw.addData4(*PAINT_NEUTRAL)
+        vi = state['vi']
+        tris.addVertices(vi, vi + 1, vi + 2)
+        tris.addVertices(vi, vi + 2, vi + 3)
+        cells.append({'v0': vi, 'cx': cx, 'cy': cy, 'cz': cz, 'owner': 0})
+        state['vi'] += 4
+
+    def grid_face(ox, oy, oz, du, dv, nu, nv):
+        # origin + du*a + dv*b 격자를 셀로(du,dv = 셀 한 칸 벡터).
+        for a in range(nu):
+            for b in range(nv):
+                bx, by, bz = ox + du[0] * a + dv[0] * b, \
+                    oy + du[1] * a + dv[1] * b, oz + du[2] * a + dv[2] * b
+                p00 = (bx, by, bz)
+                p10 = (bx + du[0], by + du[1], bz + du[2])
+                p11 = (bx + du[0] + dv[0], by + du[1] + dv[1], bz + du[2] + dv[2])
+                p01 = (bx + dv[0], by + dv[1], bz + dv[2])
+                add_quad(p00, p10, p11, p01)
+
+    nx = int(round((2 * HALF_X) / cell))
+    ny = int(round((2 * HALF_Y) / cell))
+    nz = int(round(PAINT_WALL_H / cell))
+    Z = 0.04
+
+    def in_obstacle(px, py):
+        for (x0, x1, y0, y1, h) in obstacles:
+            if x0 <= px <= x1 and y0 <= py <= y1:
+                return True
+        return False
+
+    # 바닥 셀 — 장애물 풋프린트 아래는 생략(잘림 방지).
+    for j in range(ny):
+        for i in range(nx):
+            ccx = -HALF_X + (i + 0.5) * cell
+            ccy = -HALF_Y + (j + 0.5) * cell
+            if in_obstacle(ccx, ccy):
+                continue
+            x0 = -HALF_X + i * cell
+            x1 = x0 + cell
+            y0 = -HALF_Y + j * cell
+            y1 = y0 + cell
+            add_quad((x0, y0, Z), (x1, y0, Z), (x1, y1, Z), (x0, y1, Z))
+
+    # 외벽 안쪽 면 4개(높이 PAINT_WALL_H 까지). 면을 살짝 안으로(0.03) 들여 보이게.
+    e = 0.03
+    grid_face(-HALF_X, HALF_Y - e, 0.0, (cell, 0, 0), (0, 0, cell), nx, nz)   # 북
+    grid_face(-HALF_X, -HALF_Y + e, 0.0, (cell, 0, 0), (0, 0, cell), nx, nz)  # 남
+    grid_face(HALF_X - e, -HALF_Y, 0.0, (0, cell, 0), (0, 0, cell), ny, nz)   # 동
+    grid_face(-HALF_X + e, -HALF_Y, 0.0, (0, cell, 0), (0, 0, cell), ny, nz)  # 서
+
+    # 장애물 — 윗면 + 4 옆면(높이 min(h, PAINT_WALL_H) 까지).
+    for (x0, x1, y0, y1, h) in obstacles:
+        cnx = int(round((x1 - x0) / cell))
+        cny = int(round((y1 - y0) / cell))
+        cnz = int(round(min(h, PAINT_WALL_H) / cell))
+        grid_face(x0, y0, h + 0.02, (cell, 0, 0), (0, cell, 0), cnx, cny)      # 윗면
+        grid_face(x0, y0 - e, 0.0, (cell, 0, 0), (0, 0, cell), cnx, cnz)       # -Y
+        grid_face(x0, y1 + e, 0.0, (cell, 0, 0), (0, 0, cell), cnx, cnz)       # +Y
+        grid_face(x0 - e, y0, 0.0, (0, cell, 0), (0, 0, cell), cny, cnz)       # -X
+        grid_face(x1 + e, y0, 0.0, (0, cell, 0), (0, 0, cell), cny, cnz)       # +X
+
+    geom = Geom(vdata)
+    geom.addPrimitive(tris)
+    gnode = GeomNode('paint_grid')
+    gnode.addGeom(geom)
+    gnp = root.attachNewNode(gnode)
+    gnp.setTwoSided(True)
+    gnp.setLightOff()
+
+    # 스폰 배리어 (PvP 아레나와 동일 — 시작 5초 가둠 후 해제).
+    spawn_barriers = [
+        Wall(-3, -12, 3, -12), Wall(-3, -18, -3, -12), Wall(3, -18, 3, -12),
+        Wall(-3, 12, 3, 12), Wall(-3, 12, -3, 18), Wall(3, 12, 3, 18),
+    ]
+    shimmer_cards = []
+    if draw_wall_cards:
+        for w in spawn_barriers:
+            shimmer_cards.append(_barrier_shimmer(root, w))
+
+    arena_data = {
+        'spawns': [(0, -15, 0), (0, 15, 180)],   # A=남 / B=북
+        'spawn_barriers': spawn_barriers,
+        'shimmer_cards': shimmer_cards,
+        'platforms': [],
+        'rooms': [], 'gates': [], 'cage_stain': None,
+        # 땅따먹기 — 런타임이 셀 색 갱신/점유 집계에 사용(셀 중심은 3D).
+        'paint': {
+            'vdata': vdata, 'cells': cells, 'cell': cell,
+            'half_x': HALF_X, 'half_y': HALF_Y, 'ball_spawn': (0.0, 0.0),
+        },
     }
     return LevelCollider(walls), arena_data
