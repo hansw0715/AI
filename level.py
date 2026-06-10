@@ -654,6 +654,83 @@ def build_soccer_field(render, draw_wall_cards=True):
 PAINT_NEUTRAL = (0.30, 0.32, 0.36, 1.0)
 
 
+def build_jump_field(render, draw_wall_cards=True):
+    """점프맵(레이스) 맵. (LevelCollider, arena_data) 반환.
+
+    길쭉한 아레나에 두 플레이어용 '평행한 똑같은 코스'(레인 A/B)를 같은 방향(+y)으로
+    둔다. 칸막이는 없어(서로 총으로 쏠 수 있게) 두 레인 사이는 뚫린 낙하 공간. 점프로
+    발판을 건너 결승 발판까지 먼저 도달하면 승리. 발판은 build_arena 의 platforms 규약
+    ({x0,x1,y0,y1,top}) 을 그대로 쓴다(런타임 충돌/스텝업 재사용).
+    """
+    root = render.attachNewNode('jump')
+    walls = []
+    HALF_X, Y0, Y1 = 10.0, -20.0, 44.0
+    walls += room_walls(-HALF_X, HALF_X, Y0, Y1)   # 외벽(낙하해도 맵 밖으로 안 나감)
+    if draw_wall_cards:
+        for w in walls:
+            w.make_card(root)
+
+    # 레인 A 코스(x ∈ [-8,-2]) — 발판 다양 + '벽 돌아서 점프' 구간. (x0,x1,y0,y1,top).
+    # 레인 B 는 x=0 대칭(-x1,-x0)으로 자동 생성 → 똑같은 평행 코스.
+    laneA_plat = [
+        (-8.0, -2.0, -18.0, -13.0, 0.3),   # 0 넓은 시작(스폰)
+        (-7.0, -3.0, -10.5, -8.0, 0.7),    # 1 일반
+        (-8.0, -2.0, -5.5, -1.0, 1.0),     # 2 넓은 발판(벽 우회)
+        (-7.0, -3.0, 3.0, 5.5, 0.8),       # 3
+        (-5.0, -2.5, 9.0, 11.0, 1.2),      # 4 좁은 빔(오른쪽)
+        (-8.0, -5.5, 14.0, 16.5, 1.0),     # 5 왼쪽(지그재그)
+        (-8.0, -2.0, 19.5, 23.5, 1.6),     # 6 높은 넓은 블록(벽 우회)
+        (-6.0, -3.0, 26.5, 29.0, 1.1),     # 7 내려옴
+        (-5.5, -4.0, 31.5, 35.0, 1.4),     # 8 좁은 빔(길게)
+        (-8.0, -2.0, 37.5, 43.0, 1.0),     # 9 넓은 결승
+    ]
+    # 벽(돌아가야 하는 장애물) — 발판 위 가로벽. 높이 3 이라 점프로 못 넘고 옆으로 우회.
+    # 발판2(y[-5.5,-1]): 왼쪽 막음 → 오른쪽으로 우회. 발판6(y[19.5,23.5]): 오른쪽 막음 → 왼쪽으로.
+    laneA_walls = [(-8.0, -2.5, -4.5, -2.5, 3.0), (-4.5, 21.5, -2.0, 21.5, 3.0)]
+    # 봇 경로(레인 A 논리 경로) — 발판 중심 + 벽 우회점. (x, y, z). 레인 B 는 대칭(-x).
+    laneA_route = [
+        (-5.0, -15.5, 0.3), (-5.0, -9.0, 0.7),
+        (-5.0, -4.5, 1.0), (-3.2, -2.0, 1.0),       # 발판2: 들어가서 오른쪽으로 우회
+        (-5.0, 4.0, 0.8), (-3.7, 10.0, 1.2), (-6.7, 15.0, 1.0),
+        (-5.0, 20.5, 1.6), (-6.7, 22.5, 1.6),       # 발판6: 들어가서 왼쪽으로 우회
+        (-4.5, 27.5, 1.1), (-4.7, 33.0, 1.4), (-5.0, 40.0, 1.0),
+    ]
+    platforms = []
+    for (x0, x1, y0, y1, top) in laneA_plat:
+        platforms.append({'x0': x0, 'x1': x1, 'y0': y0, 'y1': y1, 'top': top})
+        platforms.append({'x0': -x1, 'x1': -x0, 'y0': y0, 'y1': y1, 'top': top})
+    # 벽 충돌(양 레인) — 가로벽 한 칸.
+    for (ax, ay, bx, by, h) in laneA_walls:
+        walls.append(Wall(ax, ay, bx, by, height=h))
+        walls.append(Wall(-bx, ay, -ax, by, height=h))   # 레인 B 대칭
+    bot_route = [(-x, y, z) for (x, y, z) in laneA_route]  # 봇은 레인 B(대칭)
+    if draw_wall_cards:
+        for p in platforms:
+            t = p['top']
+            col = (0.42 + 0.10 * t, 0.50, 0.62 - 0.06 * t, 1.0)
+            _platform_box(root, p['x0'], p['x1'], p['y0'], p['y1'], p['top'], col)
+        for (ax, ay, bx, by, h) in laneA_walls:        # 벽 카드(양 레인)
+            Wall(ax, ay, bx, by, height=h).make_card(root)
+            Wall(-bx, ay, -ax, by, height=h).make_card(root)
+        _flat_quad(root, -HALF_X, HALF_X, 36.5, 37.5, (1.0, 0.9, 0.2, 1.0), z=0.03,
+                   name='finish_line')
+
+    arena_data = {
+        'spawns': [(-5.0, -16.0, 0), (5.0, -16.0, 0)],
+        'spawn_barriers': [], 'shimmer_cards': [],
+        'platforms': platforms,
+        'rooms': [], 'gates': [], 'cage_stain': None,
+        # 점프맵 — 런타임이 결승/낙하 판정 + 봇 경로에 사용.
+        'jump': {
+            'finish_y': 39.0,        # 이 y 를 넘으면 도착(승리) — 결승 발판 위
+            'start_y': -12.5,        # 이보다 앞(>)에서 바닥(낙하)이면 시작점 복귀
+            'spawn_top': 0.3,        # 시작 발판 높이(스폰 z)
+            'bot_route': bot_route,  # 봇(레인 B) 웨이포인트 — 벽 우회 포함
+        },
+    }
+    return LevelCollider(walls), arena_data
+
+
 def _box_walls(x0, x1, y0, y1, h):
     """직사각 박스의 4면 충돌 Wall(둘레). (시각은 페인트 셀로 따로 그림.)"""
     return [Wall(x0, y0, x1, y0, height=h), Wall(x0, y1, x1, y1, height=h),
