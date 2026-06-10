@@ -1,0 +1,134 @@
+"""소총 전용 스코프(배율 줌) 애드온 — zombie_game.py / weapon_config.py 는 건드리지 않고,
+ZombieGame 인스턴스에 외부에서 기능을 "붙여서" 동작시킨다.
+
+사용법 (새 진입점에서):
+    from zombie_game import ZombieGame
+    from rifle_scope import add_rifle_scope
+
+    game = ZombieGame(...)
+    add_rifle_scope(game)
+    game.run()
+
+동작
+  - 우클릭(ADS, game.aiming)을 소총 장착 중 일정 이상(aim_t > SCOPE_THRESHOLD)
+    유지하면 화면에 원형 비네트 + 십자선 스코프 오버레이를 띄우고 카메라 FOV 를
+    크게 줄여(RIFLE_SCOPE_FOV) 강한 배율 줌 효과를 낸다.
+  - 스코프가 떠 있는 동안에는 1인칭 무기 모델과 기본 크로스헤어를 숨겨 시야를
+    가리지 않게 한다. ADS 를 풀거나 다른 무기로 바꾸면 즉시 원래 상태로 복귀.
+  - 권총 등 다른 무기는 zombie_game.py 의 기존 ADS(FOV 55) 동작 그대로 유지.
+
+구현 방식
+  매 프레임 별도 task(SCOPE_TASK_SORT, base 의 update task 보다 늦게 실행)에서
+  game.aim_t / game.weapon_name 을 읽어 camLens FOV 와 오버레이 표시를 보정한다.
+  base 의 _update 가 매 프레임 fov_ads 기준으로 FOV 를 먼저 설정하므로, 이 task
+  가 그 뒤에 실행되며 소총일 때만 더 깊은 줌 값으로 덮어쓴다.
+"""
+
+from direct.gui.OnscreenImage import OnscreenImage
+from direct.task import Task
+from panda3d.core import PNMImage, Texture
+
+# 소총 ADS(우클릭) 시 도달하는 최종 FOV — 작을수록 배율이 높다.
+# (참고: zombie_game.py 의 fov_hip=100, 기존 fov_ads=55)
+RIFLE_SCOPE_FOV = 20.0
+
+# aim_t(0=hip, 1=완전 ADS) 가 이 값을 넘으면 스코프 오버레이를 표시.
+SCOPE_THRESHOLD = 0.55
+
+# 스코프 비네트 텍스처 높이(px). 폭은 화면 비율에 맞춰 자동 계산되어
+# render2d 풀스크린 카드(-1..1)에 입혀도 원이 타원으로 늘어나지 않는다.
+SCOPE_TEX_H = 300
+
+# 비네트 색(시안 HUD 톤) — RGBA, 0~1.
+SCOPE_RING_COLOR  = (0.25, 0.88, 1.00, 0.90)
+SCOPE_CROSS_COLOR = (0.25, 0.88, 1.00, 0.85)
+
+# base 기본 update task 보다 뒤에 실행 — game._update 가 정한 FOV 를
+# 소총일 때만 덮어쓰기 위함.
+SCOPE_TASK_SORT = 60
+
+
+def _build_scope_overlay(game):
+    """원형 비네트(검은 화면 + 가운데 원형 시야 + 십자선) 텍스처를 절차적으로
+    생성해 풀스크린 OnscreenImage 로 반환. 평소엔 hide() 상태."""
+    h = SCOPE_TEX_H
+    aspect = game.getAspectRatio()
+    w = max(1, int(round(h * aspect)))
+
+    img = PNMImage(w, h, 4)
+    img.alphaFill(0.0)
+    img.fill(0.0, 0.0, 0.0)
+
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    radius = h * 0.46
+    ring = h * 0.012
+    cross_half = h * 0.05
+    cross_gap = h * 0.018
+    cross_w = max(1, int(h * 0.005))
+
+    for y in range(h):
+        dy = y - cy
+        for x in range(w):
+            dx = x - cx
+            d = (dx * dx + dy * dy) ** 0.5
+            if d > radius:
+                img.setXelA(x, y, 0.0, 0.0, 0.0, 1.0)
+            elif d > radius - ring:
+                img.setXelA(x, y, *SCOPE_RING_COLOR)
+            else:
+                on_h = abs(dy) < cross_w and cross_gap < abs(dx) < cross_half
+                on_v = abs(dx) < cross_w and cross_gap < abs(dy) < cross_half
+                if on_h or on_v:
+                    img.setXelA(x, y, *SCOPE_CROSS_COLOR)
+
+    tex = Texture('rifle_scope_overlay')
+    tex.load(img)
+
+    overlay = OnscreenImage(image=tex, pos=(0, 0, 0), scale=(1, 1, 1),
+                             parent=game.render2d)
+    overlay.setTransparency(True)
+    overlay.hide()
+    return overlay
+
+
+def add_rifle_scope(game):
+    """ZombieGame 인스턴스(game)에 소총 스코프 줌 기능을 추가한다.
+    zombie_game.py / weapon_config.py 소스는 변경하지 않는다."""
+    overlay = _build_scope_overlay(game)
+    state = {'scoped': False}
+
+    def _scope_task(task):
+        if game.editor_mode:
+            return Task.cont
+
+        weapon_name = getattr(game, 'weapon_name', None)
+        aim_t = getattr(game, 'aim_t', 0.0)
+        scoped = (weapon_name == 'rifle' and aim_t > SCOPE_THRESHOLD)
+
+        if scoped:
+            # fov_hip → RIFLE_SCOPE_FOV 로 보간 (aim_t 가 1 에 가까울수록 깊게).
+            fov_hip = getattr(game, 'fov_hip', 100.0)
+            t = (aim_t - SCOPE_THRESHOLD) / (1.0 - SCOPE_THRESHOLD)
+            t = max(0.0, min(1.0, t))
+            current_fov = fov_hip + (RIFLE_SCOPE_FOV - fov_hip) * t
+            game.camLens.setFov(current_fov)
+
+        if scoped != state['scoped']:
+            state['scoped'] = scoped
+            if scoped:
+                overlay.show()
+                if getattr(game, 'crosshair', None) is not None:
+                    game.crosshair.hide()
+                if getattr(game, 'weapon', None) is not None:
+                    game.weapon.hide()
+            else:
+                overlay.hide()
+                if getattr(game, 'crosshair', None) is not None:
+                    game.crosshair.show()
+                if getattr(game, 'weapon', None) is not None:
+                    game.weapon.show()
+
+        return Task.cont
+
+    game.taskMgr.add(_scope_task, 'rifle_scope_task', sort=SCOPE_TASK_SORT)
+    return overlay
