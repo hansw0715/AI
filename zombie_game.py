@@ -16,12 +16,14 @@ from pathlib import Path
 
 from direct.actor.Actor import Actor
 from direct.gui.DirectGui import DirectButton, DirectEntry, DirectFrame, DirectSlider
+from direct.gui import DirectGuiGlobals as DGG
 from direct.gui.OnscreenImage import OnscreenImage
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
 from direct.task import Task
 from direct.interval.IntervalGlobal import (
-    Func, LerpColorScaleInterval, LerpScaleInterval, Parallel, Sequence, Wait,
+    Func, LerpColorScaleInterval, LerpPosInterval, LerpScaleInterval,
+    Parallel, Sequence, Wait,
 )
 from panda3d.core import (
     AmbientLight, CardMaker, ClockObject, ColorBlendAttrib, CullFaceAttrib,
@@ -123,6 +125,110 @@ OUTLINE_PALETTE = [
 ]
 # 설정 파일(JSON) — 고른 테두리 색을 저장해 게임 재시작(메인 복귀) 후에도 유지.
 SETTINGS_PATH = SCRIPT_DIR / 'settings.json'
+
+
+# ── 발로란트풍 택티컬 UI 키트 (게임 ui제작.zip / tactical.css 디자인 이식) ──────
+# 웹 디자인 토큰을 Panda3D 좌표/색으로 옮긴 것. "한 키트 · 한 액센트 · 날카로운
+# 노치 형태 · 단호한 클립인 모션." 메뉴/타이틀/일시정지가 이 키트에서 파생된다.
+def _hexc(s, a=1.0):
+    """'#RRGGBB' → Panda3D (r,g,b,a) 0~1 튜플."""
+    s = s.lstrip('#')
+    return (int(s[0:2], 16) / 255.0, int(s[2:4], 16) / 255.0,
+            int(s[4:6], 16) / 255.0, a)
+
+# 컬러 토큰 (tactical.css :root 값 그대로). 액센트는 시그널 레드 딱 하나.
+TAC_BG_DEEP    = _hexc('#0E0F12')      # 가장 깊은 배경
+TAC_BG_SURF    = _hexc('#181A20')      # 패널/서피스
+TAC_SURF_TOP   = _hexc('#21242D')      # 호버/선택 윗단
+TAC_LINE       = _hexc('#2E323C')      # 라인/디바이더
+TAC_TEXT_1     = _hexc('#ECEDEF')      # 1차 텍스트
+TAC_TEXT_2     = _hexc('#878D99')      # 2차(라벨/캡션)
+TAC_TEXT_3     = _hexc('#5B616D')      # 3차(흐림)
+TAC_ACCENT     = _hexc('#E5403B')      # 시그널 레드 — 유일한 액센트
+TAC_ACCENT_DIM = _hexc('#8F2C2A')
+TAC_STEEL      = _hexc('#6B7480')      # 콜드 스틸(중립/상대) — 절대 빛나지 않음
+
+# 디자인(tactical.css)이 쓰는 폰트 3종 — Google Fonts. 없으면 Bahnschrift 로 폴백.
+#   hero    = Anton   : 초대형 타이틀(PROJECT NULL) — .hero
+#   display = Oswald  : 메뉴명/숫자(탄약·체력·점수·번호) — .num / .name
+#   label   = Archivo : 라벨/캡션/힌트/태그 — .label / .label-sm
+TAC_FONT_DIR = SCRIPT_DIR / 'assets' / 'fonts'
+TAC_FONT_HERO_PATH    = TAC_FONT_DIR / 'Anton.ttf'
+TAC_FONT_DISPLAY_PATH = TAC_FONT_DIR / 'Oswald.ttf'
+TAC_FONT_LABEL_PATH   = TAC_FONT_DIR / 'Archivo.ttf'
+TAC_FONT_FALLBACK     = Path('C:/Windows/Fonts/bahnschrift.ttf')
+
+
+def _notch_pts(l, r, b, t, notch, corners):
+    """한쪽(또는 여러) 모서리를 45° 잘라낸(chamfer) 직사각형의 정점들을 시계방향으로.
+    corners 는 {'tl','tr','br','bl'} 부분집합. 발로란트 형태 언어의 핵심."""
+    n = notch
+    pts = []
+    pts += [(l, t - n), (l + n, t)] if 'tl' in corners else [(l, t)]
+    pts += [(r - n, t), (r, t - n)] if 'tr' in corners else [(r, t)]
+    pts += [(r, b + n), (r - n, b)] if 'br' in corners else [(r, b)]
+    pts += [(l + n, b), (l, b + n)] if 'bl' in corners else [(l, b)]
+    return pts
+
+
+def _tac_fill(parent, l, r, b, t, color, notch=0.0, corners=()):
+    """노치 직사각형을 단색으로 채운 Geom NodePath. (볼록 다각형 → 삼각형 부채꼴)"""
+    pts = _notch_pts(l, r, b, t, notch, corners)
+    vdata = GeomVertexData('tac_fill', GeomVertexFormat.getV3(), Geom.UHStatic)
+    vdata.setNumRows(len(pts))
+    vw = GeomVertexWriter(vdata, 'vertex')
+    for (x, z) in pts:
+        vw.addData3(x, 0, z)
+    tris = GeomTriangles(Geom.UHStatic)
+    for i in range(1, len(pts) - 1):
+        tris.addVertices(0, i, i + 1)
+    geom = Geom(vdata)
+    geom.addPrimitive(tris)
+    node = GeomNode('tac_fill')
+    node.addGeom(geom)
+    np = parent.attachNewNode(node)
+    np.setColor(*color)
+    np.setTwoSided(True)
+    np.setTransparency(True)
+    np.setLightOff()
+    return np
+
+
+def _tac_tri_right(parent, cx, cz, s, color):
+    """오른쪽을 가리키는 작은 채워진 삼각형(버튼 화살표). ▸ 글리프가 폰트에 없어 대체."""
+    vdata = GeomVertexData('tri', GeomVertexFormat.getV3(), Geom.UHStatic)
+    vw = GeomVertexWriter(vdata, 'vertex')
+    vw.addData3(cx - s, 0, cz + s)
+    vw.addData3(cx + s, 0, cz)
+    vw.addData3(cx - s, 0, cz - s)
+    tris = GeomTriangles(Geom.UHStatic)
+    tris.addVertices(0, 1, 2)
+    geom = Geom(vdata)
+    geom.addPrimitive(tris)
+    node = GeomNode('tri')
+    node.addGeom(geom)
+    np = parent.attachNewNode(node)
+    np.setColor(*color)
+    np.setTwoSided(True)
+    np.setTransparency(True)
+    np.setLightOff()
+    return np
+
+
+def _tac_outline(parent, l, r, b, t, color, notch=0.0, corners=(), thickness=1.6):
+    """노치 직사각형의 1px 라인 프레임."""
+    pts = _notch_pts(l, r, b, t, notch, corners)
+    ls = LineSegs('tac_outline')
+    ls.setThickness(thickness)
+    ls.setColor(*color)
+    ls.moveTo(pts[0][0], 0, pts[0][1])
+    for (x, z) in pts[1:]:
+        ls.drawTo(x, 0, z)
+    ls.drawTo(pts[0][0], 0, pts[0][1])
+    np = parent.attachNewNode(ls.create())
+    np.setLightOff()
+    np.setTransparency(True)
+    return np
 
 
 def _load_settings():
@@ -1523,6 +1629,17 @@ class ZombieGame(ShowBase):
         self._is_fullscreen = False   # F11 토글 — 진짜 전체화면(작업표시줄 가림)
         self.setBackgroundColor(0.015, 0.020, 0.030)   # 어두운 검푸른 야간 하늘
 
+        # ── 설정/오디오/릴레이 상태 — 메뉴(SETTINGS/로비)에서 _build_world 전에도
+        # 쓰이므로 여기서 먼저 초기화한다. (게임 시작 시 _build_world 가 덮지 않음) ──
+        self.SENS_MIN = 0.005     # 슬라이더 0 — 매우 느림
+        self.SENS_MAX = 0.18      # 슬라이더 1 — 매우 빠름 (기하평균=0.03)
+        self._sens_norm = 0.5     # 슬라이더 위치(0~1) — 기본 중앙
+        self.mouse_sens = self._sens_from_norm(self._sens_norm)  # = 0.03
+        self._vol_master = 1.0    # 오디오 볼륨(0~1) — 일시정지/설정 공통
+        self._vol_sfx = 1.0
+        self._relay_host = None   # 로비에서 입력한 릴레이 주소(없으면 모듈 기본)
+        self._relay_port = None
+
         # ── 시작 화면 ───────────────────────────────────────────────────────
         # 타이틀 + 싱글/멀티/종료 메뉴. 월드 빌드(_build_world)는 메뉴 선택 이후로
         # 미룬다 — online_mode 가 레벨(아레나 vs 캠페인)·좀비·네트워크를 좌우하므로
@@ -1636,13 +1753,7 @@ class ZombieGame(ShowBase):
         self.move_speed = 4.0   # 좀비 추격 속도와 동일 (Zombie.move_speed)
         # 무기별 이동속도 배율 — 권총은 가벼워 빠름(소총 대비 1.3배). _equip_weapon 갱신.
         self._weapon_speed_mult = 1.0
-        # 마우스 감도 — 슬라이더 0~1 정규화(기본 0.5=중앙정렬). 지수(기하) 매핑이라
-        # 0.5 가 정확히 MIN·MAX 의 기하평균(=0.03, 기존 기본)이고, 0↔1 폭이 6배씩 벌어져
-        # 0 쪽은 확연히 느리고 1 쪽은 확연히 빠르다. _sens_from_norm 참조.
-        self.SENS_MIN = 0.005     # 슬라이더 0 — 매우 느림
-        self.SENS_MAX = 0.18      # 슬라이더 1 — 매우 빠름 (기하평균 √(0.005·0.18)=0.03)
-        self._sens_norm = 0.5     # 슬라이더 위치(0~1) — 기본 중앙
-        self.mouse_sens = self._sens_from_norm(self._sens_norm)  # = 0.03
+        # (감도/오디오/릴레이 상태는 __init__ 에서 이미 초기화 — 여기서 덮지 않음)
         self.jump_speed = 5.0   # 정점 ~1.04m — 낮은 플랫폼(≤1.0)에 점프해 올라설 수 있게
         self.gravity = 12.0
 
@@ -2065,81 +2176,497 @@ class ZombieGame(ShowBase):
         # 진단: Idle 한 프레임 돌고 나서 본 이름/좌표 한 번 출력
         self.taskMgr.doMethodLater(0.3, self._dump_joints, 'dump_joints')
 
+    def _tac_fonts(self):
+        # 콘덴스드 폰트 1회 로드(캐시). 파일 없으면 Bahnschrift 로 폴백. 한글 글리프는
+        # 없으므로 택티컬 UI 카피는 영어로 통일(디자인 명세대로). 한글 입력 필드는
+        # 기본 폰트를 그대로 둔다.
+        if getattr(self, '_tac_fonts_done', False):
+            return
+        self._tac_fonts_done = True       # 1회만 시도(실패해도 재시도 스팸 방지)
+
+        def _load(primary):
+            path = primary if primary.exists() else TAC_FONT_FALLBACK
+            try:
+                # loadFont 은 Panda VFS 경로 문자열을 받는다. Windows 'C:\...' 는
+                # from_os_specific 로 Panda 식('/c/...')으로 변환해 넘겨야 찾는다.
+                vfs = Filename.from_os_specific(str(path)).getFullpath()
+                f = self.loader.loadFont(vfs)
+                f.setPixelsPerUnit(120)
+                return f
+            except Exception as e:
+                print('[tac-ui] 폰트 로드 실패:', path, e, flush=True)
+                return None
+
+        self._tac_hero_font = _load(TAC_FONT_HERO_PATH)
+        self._tac_display_font = _load(TAC_FONT_DISPLAY_PATH)
+        self._tac_label_font = _load(TAC_FONT_LABEL_PATH)
+
+    def _tac_button(self, parent, text, pos, w, h, command,
+                    text_scale=0.052, variant='base', arrow=False):
+        # 디자인 .btn — 평평한 노치 서피스 + 1px 라인 + 좌측 텍스트(+우측 화살표).
+        #   base   : 다크 서피스, 호버 시 윗단색 + 좌측 레드 슬래시 wipe
+        #   accent : 레드 채움 + 어두운 텍스트(슬래시 없음), 호버 시 더 밝은 레드
+        #   ghost  : 투명 + 라인만, 호버 시 윗단색 + 텍스트 점등 + 레드 슬래시
+        self._tac_fonts()
+        l, r, b, t = -w / 2.0, w / 2.0, -h / 2.0, h / 2.0
+        nn = h * 0.34
+        bright = _hexc('#F24D48')
+        btn = DirectButton(
+            parent=parent, pos=pos, relief=None, pressEffect=0,
+            frameSize=(l, r, b, t), command=command, text='')
+        if variant == 'accent':
+            base_c, hover_c, line_c, txt_c = TAC_ACCENT, bright, TAC_ACCENT, TAC_BG_DEEP
+        elif variant == 'ghost':
+            base_c, hover_c, line_c, txt_c = TAC_BG_DEEP, TAC_SURF_TOP, TAC_LINE, TAC_TEXT_2
+        else:
+            base_c, hover_c, line_c, txt_c = TAC_BG_SURF, TAC_SURF_TOP, TAC_LINE, TAC_TEXT_1
+        surf = _tac_fill(btn, l, r, b, t, base_c, notch=nn, corners=('tl', 'br'))
+        if variant == 'ghost':
+            surf.setColorScale(1, 1, 1, 0.0)        # 평소 투명
+        _tac_outline(btn, l, r, b, t, line_c, notch=nn,
+                     corners=('tl', 'br'), thickness=1.4)
+        bar = None
+        if variant != 'accent':                     # accent 는 슬래시 없음(HTML 동일)
+            # 좌측 끝에 고정된 노드 + 폭 가진 지오메트리 → sX 0→1 로 좌→우 자람.
+            # 윗부분을 버튼 좌상단 노치에 맞춰 비스듬히 잘라(conform) 버튼 밖으로
+            # 삐져나오지 않게 한다.
+            bw = 0.016
+            bar = btn.attachNewNode('slash')
+            bar.setPos(l + 0.004, 0, 0)
+            _tac_fill(bar, 0.0, bw, b + 0.012, t - nn + bw, TAC_ACCENT,
+                      notch=bw, corners=('tl',))
+            bar.setSx(0.001)
+            bar.setTransparency(1)
+        lbl = OnscreenText(
+            parent=btn, text=text, pos=(l + 0.05, -text_scale * 0.34),
+            scale=text_scale, fg=txt_c, align=TextNode.ALeft,
+            font=self._tac_label_font, mayChange=True)
+        arrow_np = None
+        if arrow:
+            acol = TAC_BG_DEEP if variant == 'accent' else TAC_TEXT_3
+            arrow_np = _tac_tri_right(btn, r - 0.05, 0.0, text_scale * 0.34, acol)
+
+        def _enter(_=None):
+            if variant == 'ghost':
+                surf.setColorScale(1, 1, 1, 1.0)
+                lbl.setFg(TAC_TEXT_1)
+            surf.setColor(*hover_c)
+            if bar is not None:                      # 레드 슬래시 좌→우 wipe
+                bar.setSx(0.001)
+                LerpScaleInterval(bar, 0.13, Vec3(1, 1, 1), Vec3(0.001, 1, 1),
+                                  blendType='easeOut').start()
+            if arrow_np is not None:                 # 화살표 우측으로 살짝 + 액센트
+                LerpPosInterval(arrow_np, 0.12, (0.006, 0, 0), (0, 0, 0),
+                                blendType='easeOut').start()
+                if variant != 'accent':
+                    arrow_np.setColor(*TAC_ACCENT)
+
+        def _exit(_=None):
+            surf.setColor(*base_c)
+            if variant == 'ghost':
+                surf.setColorScale(1, 1, 1, 0.0)
+                lbl.setFg(TAC_TEXT_2)
+            if bar is not None:                      # 우→좌 되감김
+                LerpScaleInterval(bar, 0.10, Vec3(0.001, 1, 1), Vec3(1, 1, 1),
+                                  blendType='easeOut').start()
+            if arrow_np is not None:
+                LerpPosInterval(arrow_np, 0.10, (0, 0, 0), (0.006, 0, 0),
+                                blendType='easeOut').start()
+                if variant != 'accent':
+                    arrow_np.setColor(*TAC_TEXT_3)
+
+        btn.bind(DGG.WITHIN, _enter)
+        btn.bind(DGG.WITHOUT, _exit)
+        # 누름 시 1px 시프트 (HTML .btn:active translate(1px,1px))
+        op = pos
+        btn.bind(DGG.B1PRESS,
+                 lambda _=None: btn.setPos(op[0] + 0.003, op[1], op[2] - 0.003))
+        btn.bind(DGG.B1RELEASE,
+                 lambda _=None: btn.setPos(op[0], op[1], op[2]))
+        return btn
+
     def _build_start_menu(self):
-        # 풀스크린 어두운 패널 + 타이틀 + 메뉴 버튼(싱글/멀티/종료). HUD 와 동일한
-        # 시안 임상 톤. 버튼 선택 → _start_game(online) / userExit. aspect2d 부착이라
-        # 가로비가 자동 보정된다(좌표 x∈[-비율,비율], z∈[-1,1]).
+        # 디자인(screens.jsx TitleScreen) 그대로: 캡션(레드 틱 + CONTAINMENT PROTOCOL)
+        # + 두 줄 초대형 타이틀(PROJECT 흰 / NULL 레드, Anton) + 태그라인 + 번호 리스트
+        # 메뉴(01 SOLO PLAY … 구분선·레드 슬래시 호버·우측 힌트) + 푸터. 좌측 9vw 정렬.
+        self._tac_fonts()
+        ar = self.getAspectRatio()
+        lx = -ar * 0.82                 # 좌측 패딩 ≈ 9vw
         root = DirectFrame(
-            frameColor=(0.008, 0.020, 0.030, 1.0),
-            frameSize=(-2.0, 2.0, -1.0, 1.0),
+            frameColor=TAC_BG_DEEP, frameSize=(-2.0, 2.0, -1.0, 1.0),
             pos=(0, 0, 0), parent=self.aspect2d,
         )
         self._menu_root = root
-        # 상·하단 시안 라인
-        DirectFrame(frameColor=HUD_CYAN, frameSize=(-0.9, 0.9, -0.004, 0.004),
-                    pos=(0, 0, 0.52), parent=root)
-        DirectFrame(frameColor=HUD_CYAN, frameSize=(-0.9, 0.9, -0.004, 0.004),
-                    pos=(0, 0, -0.62), parent=root)
-        OnscreenText(text='GAME', pos=(0, 0.28), scale=0.20,
-                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False,
-                     parent=root)
-        btn_kw = dict(
-            scale=0.08, parent=root,
-            # 상태별 색(정상 / 클릭 / 롤오버 / 비활성) — 마우스 올리면 밝아짐.
-            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
-                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
-            text_fg=HUD_WHITE, relief=1,
-            frameSize=(-4.2, 4.2, -0.7, 1.1),
-            text_scale=0.85,
-        )
-        DirectButton(text='솔로플레이', pos=(0, 0, -0.04),
-                     command=self._prompt_solo_mode, **btn_kw)
-        DirectButton(text='멀티플레이', pos=(0, 0, -0.22),
-                     command=self._prompt_multi_mode, **btn_kw)
-        DirectButton(text='종료', pos=(0, 0, -0.40),
-                     command=self.userExit, **btn_kw)
+
+        # ── 상단 우측 태그 칩: BUILD 2693044 / ● ONLINE ───────────────────────
+        rx_tag = ar * 0.82
+        OnscreenText(text='BUILD 2693044', pos=(rx_tag - 0.18, 0.86), scale=0.026,
+                     fg=TAC_TEXT_2, align=TextNode.ARight, mayChange=False,
+                     parent=root, font=self._tac_label_font)
+        _tac_fill(root, rx_tag - 0.155, rx_tag - 0.14, 0.852, 0.872, TAC_ACCENT)
+        OnscreenText(text='ONLINE', pos=(rx_tag, 0.86), scale=0.026,
+                     fg=TAC_ACCENT, align=TextNode.ARight, mayChange=False,
+                     parent=root, font=self._tac_label_font)
+
+        # ── 캡션: 레드 틱 + CONTAINMENT PROTOCOL ──────────────────────────────
+        _tac_fill(root, lx, lx + 0.10, 0.516, 0.524, TAC_ACCENT)
+        OnscreenText(text='CONTAINMENT  PROTOCOL', pos=(lx + 0.135, 0.508),
+                     scale=0.030, fg=TAC_TEXT_2, align=TextNode.ALeft,
+                     mayChange=False, parent=root, font=self._tac_label_font)
+
+        # ── 두 줄 초대형 타이틀 (Anton) — PROJECT(흰) / NULL(레드) ────────────
+        OnscreenText(text='PROJECT', pos=(lx - 0.012, 0.30), scale=0.235,
+                     fg=TAC_TEXT_1, align=TextNode.ALeft, mayChange=False,
+                     parent=root, font=self._tac_hero_font)
+        OnscreenText(text='NULL', pos=(lx - 0.012, 0.07), scale=0.235,
+                     fg=TAC_ACCENT, align=TextNode.ALeft, mayChange=False,
+                     parent=root, font=self._tac_hero_font)
         OnscreenText(
-            text='솔로 = AI 대결 / 웨이브 버티기    멀티 = 1:1 PvP / 축구(릴레이 접속)',
-            pos=(0, -0.55), scale=0.030,
-            fg=HUD_CYAN_DIM, align=TextNode.ACenter, mayChange=False,
-            parent=root)
+            text='ISOLATE THE BREACH  ·  PURIFY THE FACILITY  ·  TRUST NO SIGNAL',
+            pos=(lx, -0.04), scale=0.028, fg=TAC_TEXT_2, align=TextNode.ALeft,
+            mayChange=False, parent=root, font=self._tac_label_font)
 
-    def _menu_btn_kw(self, parent, fs=(-4.6, 4.6, -0.7, 1.1), text_scale=0.85):
-        # 메뉴 버튼 공통 스타일(상태별 색). 패널마다 재사용.
-        return dict(
-            scale=0.075, parent=parent,
-            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
-                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
-            text_fg=HUD_WHITE, relief=1, frameSize=fs, text_scale=text_scale)
+        # ── 번호 리스트 메뉴 (상·하·행간 구분선 + 레드 슬래시 호버) ──────────
+        items = [('SOLO PLAY',   'SINGLE — AI / MODES',   self._prompt_solo_mode),
+                 ('MULTIPLAYER', '2 PLAYERS — RELAY',     self._prompt_multi_mode),
+                 ('SETTINGS',    'CONFIG',                self._prompt_settings),
+                 ('QUIT',        'EXIT',                  self.userExit)]
+        mrx = lx + 1.34                 # 메뉴 폭 ≈ 540px
+        rowh = 0.118
+        top = -0.16                     # nav 상단 구분선 z
+        _tac_fill(root, lx, mrx, top - 0.0016, top + 0.0016, TAC_LINE)
+        self._menu_btns = []
+        self._menu_row_btns = []        # 행 버튼(오버레이 중 비활성화 대상)
+        for i, (name, hint, cmd) in enumerate(items):
+            zc = top - rowh * (i + 0.5)
+            row = self._tac_menu_row(root, i + 1, name, hint, zc, lx, mrx, cmd)
+            self._menu_btns.append(row)
+            # 행 하단 구분선
+            _tac_fill(root, lx, mrx, zc - rowh / 2 - 0.0016,
+                      zc - rowh / 2 + 0.0016, TAC_LINE)
+            # 스태거 클립인
+            Sequence(Wait(0.05 * i),
+                     LerpPosInterval(row, 0.18, (0, 0, 0),
+                                     (-0.04, 0, 0), blendType='easeOut')).start()
 
-    def _prompt_multi_mode(self):
-        # 멀티 모드 선택 — 1:1 PvP 아레나 / 축구 / 뒤로. 메뉴 위에 패널로 띄운다.
+        # ── 푸터: © SECTOR-7 … + 우측 틱 ──────────────────────────────────────
+        OnscreenText(text='© SECTOR-7 SIMULATION DIVISION', pos=(lx, -0.92),
+                     scale=0.025, fg=TAC_TEXT_3, align=TextNode.ALeft,
+                     mayChange=False, parent=root, font=self._tac_label_font)
+        ticks = LineSegs('foot_ticks')
+        ticks.setThickness(1.4)
+        for k in range(13):
+            tx = rx_tag - 0.012 * (12 - k)
+            hh = 0.018 if k % 3 == 0 else 0.011
+            col = TAC_STEEL if k % 3 == 0 else TAC_LINE
+            ticks.setColor(*col)
+            ticks.moveTo(tx, 0, -0.928)
+            ticks.drawTo(tx, 0, -0.928 + hh)
+        tnp = root.attachNewNode(ticks.create())
+        tnp.setTransparency(True)
+        tnp.setLightOff()
+
+    def _tac_menu_row(self, parent, idx, name, hint, zc, lx, rx, command):
+        # 번호 리스트 메뉴 행 — 평소: 번호(흐림)+이름(2차색). 호버: 서피스 윗단색 +
+        # 좌측 레드 슬래시 + 이름 1차색 + 살짝 우측 패딩 + 우측 힌트 노출.
+        self._tac_fonts()
+        h = 0.118
+        b, t = zc - h / 2, zc + h / 2
+        row = parent.attachNewNode(f'menu_row_{idx}')
+        btn = DirectButton(
+            parent=row, pos=(0, 0, 0), relief=None, pressEffect=0,
+            frameSize=(lx, rx, b, t), command=command, text='')
+        hover = _tac_fill(btn, lx, rx, b, t, TAC_SURF_TOP)
+        hover.setTransparency(1)
+        hover.setColorScale(1, 1, 1, 0.0)     # 평소 투명 — 호버 시 페이드인/아웃
+        # 좌측 레드 슬래시 — 좌측 고정 노드 + sX 0→1 로 좌→우 자람.
+        slash = btn.attachNewNode('rowslash')
+        slash.setPos(lx, 0, 0)
+        _tac_fill(slash, 0.0, 0.008, b + 0.014, t - 0.014, TAC_ACCENT)
+        slash.setSx(0.001)
+        slash.setTransparency(1)
+        OnscreenText(parent=btn, text=f'0{idx}', pos=(lx + 0.05, zc - 0.016),
+                     scale=0.034, fg=TAC_TEXT_3, align=TextNode.ALeft,
+                     font=self._tac_display_font, mayChange=False)
+        nm = OnscreenText(parent=btn, text=name.upper(),
+                          pos=(lx + 0.135, zc - 0.026), scale=0.062,
+                          fg=TAC_TEXT_2, align=TextNode.ALeft,
+                          font=self._tac_display_font, mayChange=True)
+        ht = OnscreenText(parent=btn, text=hint, pos=(rx - 0.03, zc - 0.011),
+                          scale=0.024, fg=TAC_TEXT_3, align=TextNode.ARight,
+                          font=self._tac_label_font, mayChange=False)
+        ht.setTransparency(1)
+        ht.setColorScale(1, 1, 1, 0.0)        # 평소 투명, 호버 시 페이드인
+        nz = zc - 0.026                        # 이름 baseline z
+
+        def _en(_=None):
+            LerpColorScaleInterval(hover, 0.10, (1, 1, 1, 1), (1, 1, 1, 0),
+                                   blendType='easeOut').start()   # 회색 베이스 페이드인
+            slash.setSx(0.001)
+            LerpScaleInterval(slash, 0.13, Vec3(1, 1, 1), Vec3(0.001, 1, 1),
+                              blendType='easeOut').start()
+            nm.setFg(TAC_TEXT_1)
+            nm.setX(lx + 0.16)        # 살짝 우측 패딩(즉시 — OnscreenText LerpPos 부작용 회피)
+            LerpColorScaleInterval(ht, 0.12, (1, 1, 1, 1), (1, 1, 1, 0)).start()
+
+        def _ex(_=None):
+            LerpColorScaleInterval(hover, 0.20, (1, 1, 1, 0), (1, 1, 1, 1),
+                                   blendType='easeOut').start()   # 회색 베이스 페이드아웃
+            LerpScaleInterval(slash, 0.10, Vec3(0.001, 1, 1), Vec3(1, 1, 1),
+                              blendType='easeOut').start()
+            nm.setFg(TAC_TEXT_2)
+            nm.setX(lx + 0.135)
+            LerpColorScaleInterval(ht, 0.10, (1, 1, 1, 0), (1, 1, 1, 1)).start()
+
+        btn.bind(DGG.WITHIN, _en)
+        btn.bind(DGG.WITHOUT, _ex)
+        self._menu_row_btns.append(btn)   # 오버레이 열릴 때 일괄 비활성화용
+        return row
+
+    def _set_menu_clickable(self, on):
+        # 풀스크린 오버레이(설정/로비)가 열린 동안 타이틀 메뉴 행 클릭을 막아
+        # 뒤로 클릭이 통과해 옛 패널이 뜨는 것을 방지. on=False → DISABLED.
+        for b in getattr(self, '_menu_row_btns', []):
+            try:
+                b['state'] = DGG.NORMAL if on else DGG.DISABLED
+            except Exception:
+                pass
+
+    def _close_menu_overlay(self, scr):
+        scr.destroy()
+        self._set_menu_clickable(True)
+        # 메인 메뉴로 복귀 — 타이틀 메뉴도 좌→우 슬라이드+페이드로 다시 등장.
+        if getattr(self, '_menu_root', None) is not None:
+            self._overlay_reveal(self._menu_root)
+
+    def _overlay_reveal(self, scr):
+        # 화면 전환 — 왼쪽에서 슬라이드 + 페이드로 '촤라락' 등장. 배경 프레임이 화면보다
+        # 큼(-2~2)이라 슬라이드해도 가장자리 빈틈이 없다.
+        scr.setTransparency(1)
+        scr.setColorScale(1, 1, 1, 0)
+        scr.setX(-0.13)
+        Parallel(
+            LerpPosInterval(scr, 0.30, (0, 0, 0), (-0.13, 0, 0),
+                            blendType='easeOut'),
+            LerpColorScaleInterval(scr, 0.22, (1, 1, 1, 1), (1, 1, 1, 0),
+                                   blendType='easeOut'),
+        ).start()
+
+    def _prompt_settings(self):
+        # 메인 메뉴 SETTINGS — 디자인 SettingsScreen 그대로(전체화면 2열):
+        # 좌측 INPUT/AUDIO(+ENEMY OUTLINE) 슬라이더, 우측 CONTROLS 표, 우하단 DONE.
         if self._menu_root is None or self._game_started:
             return
-        panel = DirectFrame(
-            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.78, 0.78, -0.48, 0.48),
-            pos=(0, 0, 0.0), parent=self._menu_root)
-        OnscreenText(text='멀티 모드 선택', pos=(0, 0.38), scale=0.06,
-                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=panel)
-        mb = self._menu_btn_kw(panel)
-        DirectButton(text='1:1 PvP 아레나', pos=(0, 0, 0.25),
-                     command=lambda: (panel.destroy(),
-                                      self._prompt_multi_name()), **mb)
-        DirectButton(text='축구 (공 차기)', pos=(0, 0, 0.13),
-                     command=lambda: (panel.destroy(),
-                                      self._prompt_multi_name(soccer=True)), **mb)
-        DirectButton(text='땅따먹기', pos=(0, 0, 0.01),
-                     command=lambda: (panel.destroy(),
-                                      self._prompt_multi_name(paint=True)), **mb)
-        DirectButton(text='점프맵 (레이스)', pos=(0, 0, -0.11),
-                     command=lambda: (panel.destroy(),
-                                      self._prompt_multi_name(jump=True)), **mb)
-        DirectButton(text='뒤로', pos=(0, 0, -0.27),
-                     command=panel.destroy,
-                     **self._menu_btn_kw(panel, fs=(-2.4, 2.4, -0.7, 1.1)))
-        OnscreenText(text='PvP=10킬  축구=5골  땅따먹기=칠하기  점프맵=결승 먼저',
-                     pos=(0, -0.42), scale=0.026, fg=HUD_CYAN_DIM,
-                     align=TextNode.ACenter, mayChange=False, parent=panel)
+        self._tac_fonts()
+        ar = self.getAspectRatio()
+        lx, rx = -ar * 0.85, ar * 0.85
+        scr = DirectFrame(frameColor=TAC_BG_DEEP, frameSize=(-2.0, 2.0, -1.0, 1.0),
+                          pos=(0, 0, 0), parent=self._menu_root)
+        self._set_menu_clickable(False)   # 뒤 타이틀 메뉴 클릭 통과 차단
+        self._overlay_reveal(scr)         # 등장 페이드인
+        # 헤더 (kicker + title + sub)
+        _tac_fill(scr, lx, lx + 0.06, 0.622, 0.632, TAC_ACCENT)
+        OnscreenText(text='CONFIGURATION', pos=(lx + 0.09, 0.614), scale=0.026,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
+                     parent=scr, font=self._tac_label_font)
+        OnscreenText(text='SETTINGS', pos=(lx, 0.50), scale=0.105,
+                     fg=TAC_TEXT_1, align=TextNode.ALeft, mayChange=False,
+                     parent=scr, font=self._tac_display_font)
+        OnscreenText(text='INPUT · AUDIO · CONTROLS', pos=(lx + 0.62, 0.515),
+                     scale=0.024, fg=TAC_TEXT_3, align=TextNode.ALeft,
+                     mayChange=False, parent=scr, font=self._tac_label_font)
+        midL, colR = -0.08, 0.10
+        # ── 좌측: INPUT / AUDIO / TARGETING ──
+        self._tac_panel_head(scr, 'INPUT', lx, midL, 0.36)
+        self._build_setting_slider(scr, 'sens', 'MOUSE SENSITIVITY',
+                                   'SLOW — FAST', 0.27, lx, midL)
+        self._tac_panel_head(scr, 'AUDIO', lx, midL, 0.13)
+        self._build_setting_slider(scr, 'master', 'MASTER', '0 — 100', 0.04, lx, midL)
+        self._build_setting_slider(scr, 'sfx', 'EFFECTS', '0 — 100', -0.08, lx, midL)
+        self._tac_panel_head(scr, 'TARGETING', lx, midL, -0.24)
+        OnscreenText(text='ENEMY OUTLINE', pos=(lx, -0.32), scale=0.026,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
+                     parent=scr, font=self._tac_label_font)
+        self._build_outline_swatches(scr, -0.42, sw=0.10, cx=lx + 0.05, left=True)
+        # ── 우측: CONTROLS 표 ──
+        self._tac_panel_head(scr, 'CONTROLS', colR, rx, 0.36)
+        controls = [('W / S', 'MOVE'), ('A / D', 'STRAFE'), ('SPACE', 'JUMP'),
+                    ('CTRL', 'CROUCH'), ('LMB', 'FIRE'), ('R', 'RELOAD'),
+                    ('F', 'INTERACT'), ('ESC', 'PAUSE')]
+        rowh, top = 0.078, 0.28
+        _tac_outline(scr, colR, rx, top - rowh * len(controls), top, TAC_LINE,
+                     thickness=1.2)
+        for i, (k, v) in enumerate(controls):
+            zc = top - rowh * (i + 0.5)
+            if i % 2 == 0:
+                _tac_fill(scr, colR, rx, zc - rowh / 2, zc + rowh / 2, TAC_BG_SURF)
+            if i < len(controls) - 1:
+                _tac_fill(scr, colR, rx, zc - rowh / 2 - 0.0007,
+                          zc - rowh / 2 + 0.0007, TAC_LINE)
+            OnscreenText(text=k, pos=(colR + 0.03, zc - 0.014), scale=0.034,
+                         fg=TAC_TEXT_1, align=TextNode.ALeft, mayChange=False,
+                         parent=scr, font=self._tac_display_font)
+            OnscreenText(text=v, pos=(rx - 0.03, zc - 0.011), scale=0.024,
+                         fg=TAC_TEXT_2, align=TextNode.ARight, mayChange=False,
+                         parent=scr, font=self._tac_label_font)
+        self._tac_button(scr, 'DONE', (rx - 0.22, 0, -0.44), 0.4, 0.10,
+                         lambda: self._close_menu_overlay(scr),
+                         variant='accent', arrow=True)
+
+    def _menu_btn_kw(self, parent, fs=(-4.6, 4.6, -0.7, 1.1), text_scale=0.85):
+        # 서브패널 버튼 공통 스타일 — 발로란트 다크 팔레트(평면 + 호버 시 윗단 색).
+        return dict(
+            scale=0.075, parent=parent,
+            frameColor=(TAC_BG_SURF, TAC_SURF_TOP, TAC_SURF_TOP, TAC_BG_SURF),
+            text_fg=TAC_TEXT_1, relief=DGG.FLAT, frameSize=fs,
+            text_scale=text_scale)
+
+    def _prompt_multi_mode(self):
+        # 멀티플레이 로비 — 디자인 LobbyScreen 그대로(전체화면 2열): 좌측 RELAY
+        # ENDPOINT(서버주소/콜사인/HOST·JOIN/모드/배너), 우측 OPERATORS(슬롯 2 +
+        # READY + BACK/START). 정확히 2인 1방.
+        if self._menu_root is None or self._game_started:
+            return
+        self._tac_fonts()
+        self._lobby_ready = False
+        self._lobby_mode = 'pvp'
+        ar = self.getAspectRatio()
+        lx, rx = -ar * 0.85, ar * 0.85
+        scr = DirectFrame(frameColor=TAC_BG_DEEP, frameSize=(-2.0, 2.0, -1.0, 1.0),
+                          pos=(0, 0, 0), parent=self._menu_root)
+        self._lobby_scr = scr
+        self._set_menu_clickable(False)   # 뒤 타이틀 메뉴 클릭 통과 차단
+        self._overlay_reveal(scr)         # 등장 페이드인
+        # 헤더
+        _tac_fill(scr, lx, lx + 0.06, 0.622, 0.632, TAC_ACCENT)
+        OnscreenText(text='MULTIPLAYER', pos=(lx + 0.09, 0.614), scale=0.026,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
+                     parent=scr, font=self._tac_label_font)
+        OnscreenText(text='ESTABLISH LINK', pos=(lx, 0.50), scale=0.105,
+                     fg=TAC_TEXT_1, align=TextNode.ALeft, mayChange=False,
+                     parent=scr, font=self._tac_display_font)
+        OnscreenText(text='TCP RELAY · 1 ROOM · 2 SLOTS', pos=(lx + 1.02, 0.515),
+                     scale=0.024, fg=TAC_TEXT_3, align=TextNode.ALeft,
+                     mayChange=False, parent=scr, font=self._tac_label_font)
+        midL, colR = -0.06, 0.12
+        # ── 좌측: RELAY ENDPOINT ──
+        self._tac_panel_head(scr, 'RELAY ENDPOINT', lx, midL, 0.36)
+        # 서버 주소 — 고정 릴레이라 읽기전용으로 표시만(편집 불가).
+        OnscreenText(text='SERVER ADDRESS', pos=(lx, 0.295), scale=0.024,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
+                     parent=scr, font=self._tac_label_font)
+        _tac_fill(scr, lx, midL, 0.17, 0.27, TAC_BG_DEEP, notch=0.02,
+                  corners=('tl',))
+        _tac_outline(scr, lx, midL, 0.17, 0.27, TAC_LINE, notch=0.02,
+                     corners=('tl',), thickness=1.2)
+        OnscreenText(text=f'{RELAY_HOST}:{RELAY_PORT}', pos=(lx + 0.03, 0.205),
+                     scale=0.038, fg=TAC_TEXT_3, align=TextNode.ALeft,
+                     mayChange=False, parent=scr, font=self._tac_display_font)
+        OnscreenText(text='FIXED', pos=(midL - 0.03, 0.212), scale=0.020,
+                     fg=TAC_TEXT_3, align=TextNode.ARight, mayChange=False,
+                     parent=scr, font=self._tac_label_font)
+        # 콜사인 — 편집 가능(이름)
+        self._lobby_name_entry = self._tac_field(
+            scr, 'CALLSIGN', lx, midL, 0.04, self.player_name)
+        OnscreenText(text='MODE', pos=(lx, -0.10), scale=0.024, fg=TAC_TEXT_2,
+                     align=TextNode.ALeft, mayChange=False, parent=scr,
+                     font=self._tac_label_font)
+        self._lobby_modes_node = scr.attachNewNode('lobby_modes')
+        self._rebuild_lobby_modes()
+        self._tac_banner(scr, lx, -0.32, 'STANDBY · RELAY READY',
+                         w=midL - lx, state='idle')
+        # ── 우측: OPERATORS ──
+        self._tac_panel_head(scr, 'OPERATORS', colR, rx, 0.36,
+                             right='2 / 2 REQUIRED')
+        mid = colR + (rx - colR) / 2.0
+        self._tac_player_slot(scr, colR, mid - 0.02, 0.04, 0.30, True, 'P1',
+                              (self.player_name or 'YOU').upper(), 'CONNECTED')
+        self._tac_player_slot(scr, mid + 0.02, rx, 0.04, 0.30, False, 'P2',
+                              'OPEN SLOT', 'AWAITING…')
+        self._lobby_ready_node = scr.attachNewNode('lobby_ready')
+        self._rebuild_lobby_ready()
+        self._tac_button(scr, 'BACK', (colR + 0.19, 0, -0.44), 0.36, 0.09,
+                         lambda: self._close_menu_overlay(scr), variant='ghost')
+        self._tac_button(scr, 'START', (rx - 0.22, 0, -0.44), 0.4, 0.09,
+                         self._lobby_start, variant='accent', arrow=True)
+
+    def _tac_mode_chip(self, parent, x0, x1, z, label, on, command):
+        # 모드 선택 칩 — 선택: 레드 테두리/글자/하단 언더라인. 호버: 서피스 윗단색 +
+        # 하단 레드 언더라인이 좌→우로 자람(다른 버튼과 같은 모션 문법).
+        self._tac_fonts()
+        zt, zb = z + 0.032, z - 0.032
+        btn = DirectButton(parent=parent, pos=(0, 0, 0), relief=None,
+                           pressEffect=0, frameSize=(x0, x1, zb, zt), text='',
+                           command=command)
+        surf = _tac_fill(btn, x0, x1, zb, zt,
+                         TAC_SURF_TOP if on else TAC_BG_SURF, notch=0.02,
+                         corners=('tl',))
+        _tac_outline(btn, x0, x1, zb, zt, TAC_ACCENT if on else TAC_LINE,
+                     notch=0.02, corners=('tl',), thickness=1.2)
+        under = btn.attachNewNode('chip_under')          # 하단 레드 언더라인
+        under.setPos(x0 + 0.006, 0, 0)
+        _tac_fill(under, 0.0, (x1 - x0) - 0.012, zb + 0.002, zb + 0.006, TAC_ACCENT)
+        under.setSx(1.0 if on else 0.001)
+        under.setTransparency(1)
+        if not on:
+            under.hide()                  # 미선택 시 완전 숨김(sX 잔여 점 방지)
+        lbl = OnscreenText(parent=btn, text=label, pos=((x0 + x1) / 2, z - 0.011),
+                           scale=0.024, fg=(TAC_ACCENT if on else TAC_TEXT_2),
+                           align=TextNode.ACenter, font=self._tac_label_font,
+                           mayChange=True)
+
+        def _en(_=None):
+            if on:
+                return
+            surf.setColor(*TAC_SURF_TOP)
+            lbl.setFg(TAC_TEXT_1)
+            under.setSx(0.001)
+            under.show()
+            LerpScaleInterval(under, 0.12, Vec3(1, 1, 1), Vec3(0.001, 1, 1),
+                              blendType='easeOut').start()
+
+        def _ex(_=None):
+            if on:
+                return
+            surf.setColor(*TAC_BG_SURF)
+            lbl.setFg(TAC_TEXT_2)
+            # 좌로 줄어든 뒤 완전히 숨겨 잔여 점이 안 남게.
+            Sequence(LerpScaleInterval(under, 0.10, Vec3(0.001, 1, 1),
+                                       Vec3(1, 1, 1), blendType='easeOut'),
+                     Func(under.hide)).start()
+
+        btn.bind(DGG.WITHIN, _en)
+        btn.bind(DGG.WITHOUT, _ex)
+        return btn
+
+    def _rebuild_lobby_modes(self):
+        # 모드 칩(PVP/SOCCER/PAINT/JUMP) — 선택/호버 애니메이션은 _tac_mode_chip.
+        node = self._lobby_modes_node
+        for c in list(node.getChildren()):
+            c.removeNode()
+        ar = self.getAspectRatio()
+        lx = -ar * 0.85
+        modes = [('pvp', 'PVP'), ('soccer', 'SOCCER'),
+                 ('paint', 'PAINT'), ('jump', 'JUMP')]
+        w, gap, z = 0.235, 0.022, -0.165
+        for i, (key, lbl) in enumerate(modes):
+            x0 = lx + i * (w + gap)
+            x1 = x0 + w
+            self._tac_mode_chip(node, x0, x1, z, lbl, self._lobby_mode == key,
+                                (lambda k=key: self._lobby_set_mode(k)))
+
+    def _rebuild_lobby_ready(self):
+        node = self._lobby_ready_node
+        for c in list(node.getChildren()):
+            c.removeNode()
+        colR = 0.12
+        self._tac_toggle(node, colR, -0.07, self._lobby_ready, 'READY',
+                         self._on_lobby_ready)
+        self._lobby_ready_status = OnscreenText(
+            parent=node, text=('ALL OPERATORS READY' if self._lobby_ready
+                               else 'AWAITING READY'),
+            pos=(colR + 0.36, -0.081), scale=0.022, fg=TAC_TEXT_3,
+            align=TextNode.ALeft, font=self._tac_label_font, mayChange=True)
 
     def _prompt_multi_name(self, soccer=False, paint=False, jump=False):
         # 멀티 입장 전 — 이름 입력 패널을 메뉴 위에 띄운다. 입장/엔터 → _confirm_multi_name.
@@ -2149,23 +2676,24 @@ class ZombieGame(ShowBase):
         self._name_paint = paint
         self._name_jump = jump
         panel = DirectFrame(
-            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.75, 0.75, -0.36, 0.36),
+            frameColor=(0.055, 0.059, 0.071, 0.98),
+            frameSize=(-0.75, 0.75, -0.36, 0.36),
             pos=(0, 0, 0.0), parent=self._menu_root)
+        _tac_fill(panel, -0.75, 0.75, 0.335, 0.36, TAC_ACCENT)   # 상단 레드 액센트
         title = ('축구 — 이름을 입력하세요' if soccer else
                  '땅따먹기 — 이름을 입력하세요' if paint else
                  '점프맵 — 이름을 입력하세요' if jump else '이름을 입력하세요')
         OnscreenText(text=title, pos=(0, 0.23), scale=0.055,
-                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=panel)
+                     fg=TAC_TEXT_1, align=TextNode.ACenter, mayChange=False, parent=panel)
         self._name_entry = DirectEntry(
             parent=panel, scale=0.08, pos=(-0.46, 0, 0.04), width=12, numLines=1,
             focus=1, initialText=self.player_name, overflow=1,
-            frameColor=(0.05, 0.14, 0.18, 1.0), text_fg=HUD_WHITE,
+            frameColor=TAC_BG_SURF, text_fg=TAC_TEXT_1,
             command=lambda *_a: self._confirm_multi_name())
         DirectButton(
             text='입장', pos=(-0.22, 0, -0.20), scale=0.075, parent=panel,
-            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
-                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
-            text_fg=HUD_WHITE, relief=1, frameSize=(-2.6, 2.6, -0.7, 1.1),
+            frameColor=(TAC_ACCENT, TAC_ACCENT, _hexc('#F2615C'), TAC_ACCENT_DIM),
+            text_fg=TAC_TEXT_1, relief=DGG.FLAT, frameSize=(-2.6, 2.6, -0.7, 1.1),
             text_scale=0.9, command=self._confirm_multi_name)
         DirectButton(
             text='뒤로', pos=(0.22, 0, -0.20), command=lambda: (
@@ -2181,35 +2709,89 @@ class ZombieGame(ShowBase):
                          jump=getattr(self, '_name_jump', False))
 
     def _prompt_solo_mode(self):
-        # 솔로 모드 선택 — AI와 대결 / 웨이브 버티기 / 뒤로. 메뉴 위에 패널로 띄운다.
+        # 솔로 — 멀티 로비와 같은 택티컬 UI. 단 상대(P2) 슬롯 없이 내 슬롯을 가로로 길게.
+        # 모드 칩 + 콜사인 + START(바로 시작) / BACK.
         if self._menu_root is None or self._game_started:
             return
-        panel = DirectFrame(
-            frameColor=(0.01, 0.03, 0.05, 0.98), frameSize=(-0.75, 0.75, -0.48, 0.48),
-            pos=(0, 0, 0.0), parent=self._menu_root)
-        OnscreenText(text='솔로 모드 선택', pos=(0, 0.38), scale=0.06,
-                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=panel)
-        sb = self._menu_btn_kw(panel)
-        DirectButton(text='AI와 대결', pos=(0, 0, 0.25),
-                     command=self._start_game, extraArgs=[False, True], **sb)
-        # 축구 솔로 = AI 봇 상대 + 축구 필드/공(online=False, ai=True, soccer=True).
-        DirectButton(text='축구 (공 차기)', pos=(0, 0, 0.13),
-                     command=self._start_game,
-                     extraArgs=[False, True, True], **sb)
-        # 땅따먹기 솔로 = AI 봇 상대(online=False, ai=True, paint=True).
-        DirectButton(text='땅따먹기', pos=(0, 0, 0.01),
-                     command=self._start_game,
-                     extraArgs=[False, True, False, True], **sb)
-        # 점프맵 솔로 = AI 봇이 평행 레인에서 사격(online=False, ai=True, jump=True).
-        DirectButton(text='점프맵 (레이스)', pos=(0, 0, -0.11),
-                     command=self._start_game,
-                     extraArgs=[False, True, False, False, True], **sb)
-        DirectButton(text='뒤로', pos=(0, 0, -0.27),
-                     command=panel.destroy,
-                     **self._menu_btn_kw(panel, fs=(-2.4, 2.4, -0.7, 1.1)))
-        OnscreenText(text='AI대결=소총1:1  축구=5골  땅따먹기=페인트  점프맵=완주',
-                     pos=(0, -0.42), scale=0.026, fg=HUD_CYAN_DIM,
-                     align=TextNode.ACenter, mayChange=False, parent=panel)
+        self._tac_fonts()
+        self._solo_mode = 'ai'
+        ar = self.getAspectRatio()
+        lx, rx = -ar * 0.85, ar * 0.85
+        scr = DirectFrame(frameColor=TAC_BG_DEEP, frameSize=(-2.0, 2.0, -1.0, 1.0),
+                          pos=(0, 0, 0), parent=self._menu_root)
+        self._set_menu_clickable(False)
+        self._overlay_reveal(scr)         # 등장 페이드인
+        # 헤더
+        _tac_fill(scr, lx, lx + 0.06, 0.622, 0.632, TAC_ACCENT)
+        OnscreenText(text='SOLO', pos=(lx + 0.09, 0.614), scale=0.026,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
+                     parent=scr, font=self._tac_label_font)
+        OnscreenText(text='DEPLOY', pos=(lx, 0.50), scale=0.105, fg=TAC_TEXT_1,
+                     align=TextNode.ALeft, mayChange=False, parent=scr,
+                     font=self._tac_display_font)
+        OnscreenText(text='AI OPPONENT · OFFLINE', pos=(lx + 0.52, 0.515),
+                     scale=0.024, fg=TAC_TEXT_3, align=TextNode.ALeft,
+                     mayChange=False, parent=scr, font=self._tac_label_font)
+        # 모드 칩
+        self._tac_panel_head(scr, 'MODE', lx, rx, 0.36)
+        self._solo_modes_node = scr.attachNewNode('solo_modes')
+        self._rebuild_solo_modes()
+        # 콜사인
+        self._solo_name_entry = self._tac_field(
+            scr, 'CALLSIGN', lx, lx + 0.7, 0.11, self.player_name)
+        # ── 내 슬롯(가로로 길게, 상대 슬롯 없음) ──
+        self._tac_panel_head(scr, 'OPERATOR', lx, rx, -0.02)
+        sb, st = -0.30, -0.10
+        _tac_fill(scr, lx, rx, sb, st, TAC_BG_SURF, notch=0.04, corners=('tl',))
+        _tac_outline(scr, lx, rx, sb, st, TAC_ACCENT_DIM, notch=0.04,
+                     corners=('tl',), thickness=1.4)
+        OnscreenText(parent=scr, text='P1', pos=(rx - 0.03, st - 0.05),
+                     scale=0.026, fg=TAC_TEXT_3, align=TextNode.ARight,
+                     font=self._tac_display_font, mayChange=False)
+        _tac_fill(scr, lx + 0.03, lx + 0.048, st - 0.058, st - 0.04, TAC_ACCENT)
+        OnscreenText(parent=scr, text='YOU', pos=(lx + 0.066, st - 0.056),
+                     scale=0.022, fg=TAC_ACCENT, align=TextNode.ALeft,
+                     font=self._tac_label_font, mayChange=False)
+        OnscreenText(parent=scr, text=(self.player_name or 'OPERATOR'),
+                     pos=(lx + 0.03, (sb + st) / 2 - 0.02), scale=0.055,
+                     fg=TAC_TEXT_1, align=TextNode.ALeft, mayChange=False)
+        OnscreenText(parent=scr, text='READY TO DEPLOY', pos=(rx - 0.03, sb + 0.05),
+                     scale=0.024, fg=TAC_TEXT_2, align=TextNode.ARight,
+                     font=self._tac_label_font, mayChange=False)
+        # BACK / START
+        self._tac_button(scr, 'BACK', (lx + 0.19, 0, -0.46), 0.36, 0.10,
+                         lambda: self._close_menu_overlay(scr), variant='ghost')
+        self._tac_button(scr, 'START', (rx - 0.22, 0, -0.46), 0.4, 0.10,
+                         self._solo_start, variant='accent', arrow=True)
+
+    def _rebuild_solo_modes(self):
+        node = self._solo_modes_node
+        for c in list(node.getChildren()):
+            c.removeNode()
+        ar = self.getAspectRatio()
+        lx = -ar * 0.85
+        modes = [('ai', 'AI DUEL'), ('soccer', 'SOCCER'),
+                 ('paint', 'PAINT'), ('jump', 'JUMP')]
+        w, gap, z = 0.28, 0.022, 0.27
+        for i, (key, lbl) in enumerate(modes):
+            x0 = lx + i * (w + gap)
+            x1 = x0 + w
+            self._tac_mode_chip(node, x0, x1, z, lbl, self._solo_mode == key,
+                                (lambda k=key: self._solo_set_mode(k)))
+
+    def _solo_set_mode(self, mode):
+        self._solo_mode = mode
+        self._rebuild_solo_modes()
+
+    def _solo_start(self):
+        # 솔로 즉시 시작 — AI 봇 상대(online=False, ai=True). 모드 칩으로 분기.
+        if self._menu_root is None or self._game_started:
+            return
+        name = (self._solo_name_entry.get() or '').strip() or 'PLAYER'
+        self.player_name = name[:8]
+        m = getattr(self, '_solo_mode', 'ai')
+        self._start_game(False, True, soccer=(m == 'soccer'),
+                         paint=(m == 'paint'), jump=(m == 'jump'))
 
     def _start_game(self, online, ai=False, soccer=False, paint=False,
                     jump=False):
@@ -3291,81 +3873,123 @@ class ZombieGame(ShowBase):
     # --- pause menu ---------------------------------------------------------
 
     def _build_pause_menu(self):
-        # 어두운 패널 + 시안 임상 톤. 부제로 게임 정체성("면역 시스템 일시정지")을 깐다.
+        # 디자인(screens.jsx PauseScreen) 그대로 — 풀스크린 어두운 오버레이 + 중앙
+        # 컬럼: 캡션(양쪽 레드 틱 + SIMULATION HALTED) + PAUSED(Anton) + 노치 패널
+        # (마우스 감도 슬라이더) + 적 테두리 패널 + RESUME(레드)/QUIT TO MENU(고스트).
+        # 등장 시 각 그룹이 페이드+9px 슬라이드로 스태거 진입(_animate_pause_in).
+        self._tac_fonts()
+        # 풀스크린 컨테이너(투명) + 어두운 오버레이(페이드 대상)
         self.pause_frame = DirectFrame(
-            frameColor=(0.012, 0.035, 0.050, 0.88),
-            frameSize=(-0.55, 0.55, -0.62, 0.45),
-            pos=(0, 0, 0),
-            parent=self.aspect2d,
-        )
-        # 상단 시안 라인
-        DirectFrame(
-            frameColor=HUD_CYAN, frameSize=(-0.55, 0.55, -0.004, 0.004),
-            pos=(0, 0, 0.44), parent=self.pause_frame,
-        )
-        OnscreenText(
-            text='일시정지', pos=(0, 0.30), scale=0.11,
-            fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False,
-            parent=self.pause_frame,
-        )
-        OnscreenText(
-            text='SENTINEL // 면역 프로토콜 보류됨', pos=(0, 0.235), scale=0.034,
-            fg=HUD_CYAN_DIM, align=TextNode.ACenter, mayChange=False,
-            parent=self.pause_frame,
-        )
-        OnscreenText(
-            text='마우스 감도', pos=(0, 0.13), scale=0.042,
-            fg=HUD_CYAN, align=TextNode.ACenter, mayChange=False,
-            parent=self.pause_frame,
-        )
-        self.sens_slider = DirectSlider(
-            range=(0.0, 1.0),         # 정규화 — 기본 0.5(핸들 중앙정렬)
-            value=self._sens_norm,
-            pageSize=0.05,
-            command=self._on_sens_change,
-            parent=self.pause_frame,
-            pos=(0, 0, 0.06),
-            scale=0.35,
-            thumb_frameColor=HUD_CYAN,
-        )
-        self.sens_value_text = OnscreenText(
-            text=f'{self._sens_norm:.2f}', pos=(0, -0.005), scale=0.038,
-            fg=HUD_CYAN, align=TextNode.ACenter, mayChange=True,
-            parent=self.pause_frame,
-        )
-        # ── 적 테두리 색 선택 — 게임 중 ESC 로 바꾸면 적 테두리가 즉시 반영된다. ──
-        OnscreenText(
-            text='적 테두리 색', pos=(0, -0.11), scale=0.042,
-            fg=HUD_CYAN, align=TextNode.ACenter, mayChange=False,
-            parent=self.pause_frame,
-        )
-        # 선택 하이라이트(스와치 뒤 흰 사각) — 먼저 깔고, 위치는 _refresh 가 잡는다.
-        self._swatch_hl = DirectFrame(
-            frameColor=(1, 1, 1, 1), frameSize=(-1.4, 1.4, -1.4, 1.4),
-            scale=0.045, pos=(0, 0, -0.21), parent=self.pause_frame)
-        self._swatch_positions = []
-        n = len(OUTLINE_PALETTE)
-        for i, (name, col) in enumerate(OUTLINE_PALETTE):
-            x = (i - (n - 1) / 2.0) * 0.13
-            DirectButton(
-                text='', pos=(x, 0, -0.21), scale=0.045, parent=self.pause_frame,
-                frameColor=col, relief=1, frameSize=(-1.1, 1.1, -1.1, 1.1),
-                command=self._set_outline_color, extraArgs=[col])
-            self._swatch_positions.append((col, x))
-        self._refresh_outline_swatches()
+            frameColor=(0, 0, 0, 0), frameSize=(-2.0, 2.0, -1.0, 1.0),
+            pos=(0, 0, 0), parent=self.aspect2d)
+        self._pause_bg = DirectFrame(
+            frameColor=(0.031, 0.035, 0.043, 0.78), frameSize=(-2.0, 2.0, -1.0, 1.0),
+            parent=self.pause_frame)
+        self._pause_bg.setTransparency(1)
 
-        btn_kw = dict(
-            scale=0.07, parent=self.pause_frame,
-            frameColor=(0.05, 0.14, 0.18, 1.0),
-            text_fg=HUD_WHITE, relief=1,
-            frameSize=(-3.6, 3.6, -0.7, 1.1),
-            text_scale=0.9,
-        )
-        DirectButton(text='계속하기', pos=(0, 0, -0.36),
-                     command=self._toggle_pause, **btn_kw)
-        DirectButton(text='종료', pos=(0, 0, -0.52),
-                     command=self.userExit, **btn_kw)
+        # 애니메이션 그룹 4개 (캡션+타이틀 / 감도 패널 / 테두리 패널 / 버튼)
+        gT = self.pause_frame.attachNewNode('pz_title')
+        gS = self.pause_frame.attachNewNode('pz_sens')
+        gO = self.pause_frame.attachNewNode('pz_outline')
+        gB = self.pause_frame.attachNewNode('pz_btns')
+        for g in (gT, gS, gO, gB):
+            g.setTransparency(1)
+        self._pause_groups = [gT, gS, gO, gB]
+
+        # ── 캡션: 레드 틱 + SIMULATION HALTED + 레드 틱, 그 아래 PAUSED ──────────
+        _tac_fill(gT, -0.205, -0.145, 0.626, 0.634, TAC_ACCENT)
+        _tac_fill(gT, 0.145, 0.205, 0.626, 0.634, TAC_ACCENT)
+        OnscreenText(text='SIMULATION HALTED', pos=(0, 0.618), scale=0.026,
+                     fg=TAC_TEXT_2, align=TextNode.ACenter, mayChange=False,
+                     parent=gT, font=self._tac_label_font)
+        OnscreenText(text='PAUSED', pos=(0, 0.475), scale=0.135,
+                     fg=TAC_TEXT_1, align=TextNode.ACenter, mayChange=False,
+                     parent=gT, font=self._tac_hero_font)
+
+        # ── 입력 + 오디오 노치 패널 (감도 / 마스터 / 효과음 — 설정과 동일 항목) ──
+        _tac_fill(gS, -0.46, 0.46, 0.06, 0.43, TAC_BG_SURF, notch=0.03,
+                  corners=('tl', 'br'))
+        _tac_outline(gS, -0.46, 0.46, 0.06, 0.43, TAC_LINE, notch=0.03,
+                     corners=('tl', 'br'), thickness=1.4)
+        self._build_setting_slider(gS, 'sens', 'MOUSE SENSITIVITY', 'SLOW — FAST',
+                                   0.37, -0.42, 0.42)
+        self._build_setting_slider(gS, 'master', 'MASTER VOLUME', None,
+                                   0.25, -0.42, 0.42)
+        self._build_setting_slider(gS, 'sfx', 'SFX VOLUME', None,
+                                   0.13, -0.42, 0.42)
+
+        # ── 적 테두리 색 노치 패널 (게임 고유 기능 — 같은 디자인 언어로) ────────
+        _tac_fill(gO, -0.46, 0.46, -0.18, -0.02, TAC_BG_SURF, notch=0.03,
+                  corners=('tl', 'br'))
+        _tac_outline(gO, -0.46, 0.46, -0.18, -0.02, TAC_LINE, notch=0.03,
+                     corners=('tl', 'br'), thickness=1.4)
+        OnscreenText(text='ENEMY OUTLINE', pos=(-0.42, -0.065), scale=0.027,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
+                     parent=gO, font=self._tac_label_font)
+        self._build_outline_swatches(gO, -0.13)
+
+        # ── 버튼: RESUME(accent) / QUIT TO MENU(ghost → 메인 메뉴 복귀) ────────
+        self._tac_button(gB, 'RESUME', (0, 0, -0.29), 0.92, 0.105,
+                         self._toggle_pause, variant='accent', arrow=True)
+        self._tac_button(gB, 'QUIT TO MENU', (0, 0, -0.415), 0.92, 0.105,
+                         self._return_to_main_menu, variant='ghost')
         self.pause_frame.hide()
+
+    def _animate_pause_in(self):
+        # 디자인 Reveal — 각 그룹이 투명+9px 아래에서 페이드인+위로 슬라이드, 스태거.
+        # 일시정지 중엔 글로벌 클럭이 MSlave 라 인터벌이 멈추므로, 실제 시계(time)로
+        # 도는 태스크가 매 프레임 직접 진행시킨다.
+        self.pause_frame.setColorScale(1, 1, 1, 1)
+        self._pause_bg.setColorScale(1, 1, 1, 0)
+        for g in getattr(self, '_pause_groups', []):
+            g.setColorScale(1, 1, 1, 0)
+            g.setPos(0, 0, -0.05)
+        self._pause_anim_t0 = time.time()
+        self.taskMgr.remove('pause_anim_in')
+        self.taskMgr.add(self._pause_anim_task, 'pause_anim_in')
+
+    def _pause_anim_task(self, task):
+        if not self.paused:
+            return Task.done
+        el = time.time() - self._pause_anim_t0
+        self._pause_bg.setColorScale(1, 1, 1, min(1.0, el / 0.16))
+        done = el >= 0.16
+        for i, g in enumerate(self._pause_groups):
+            d = 0.03 + 0.06 * i
+            p = max(0.0, min(1.0, (el - d) / 0.24))
+            e = 1.0 - (1.0 - p) ** 3        # easeOutCubic
+            g.setColorScale(1, 1, 1, e)
+            g.setZ((e - 1.0) * 0.05)        # -0.05 → 0
+            if p < 1.0:
+                done = False
+        return Task.done if done else Task.cont
+
+    def _animate_pause_out(self):
+        # 닫기 — 열기의 역재생(페이드아웃 + 아래로 슬라이드, 역스태거). 끝나면 hide.
+        self._pause_out_t0 = time.time()
+        self.taskMgr.remove('pause_anim_in')
+        self.taskMgr.remove('pause_anim_out')
+        self.taskMgr.add(self._pause_anim_out_task, 'pause_anim_out')
+
+    def _pause_anim_out_task(self, task):
+        if self.paused:                    # 닫는 중 다시 열림 → 열기 애니에 양보
+            return Task.done
+        el = time.time() - self._pause_out_t0
+        n = len(self._pause_groups)
+        done = True
+        for i, g in enumerate(self._pause_groups):
+            d = 0.03 + 0.055 * (n - 1 - i)  # 역스태거(아래 그룹부터 먼저 빠짐)
+            p = max(0.0, min(1.0, (el - d) / 0.20))
+            e = p ** 3                      # easeInCubic (역방향)
+            g.setColorScale(1, 1, 1, 1.0 - e)
+            g.setZ(-e * 0.05)               # 0 → -0.05
+            if p < 1.0:
+                done = False
+        self._pause_bg.setColorScale(1, 1, 1, max(0.0, 1.0 - el / 0.22))
+        if done:
+            self.pause_frame.hide()
+            return Task.done
+        return Task.cont
 
     def take_core_damage(self, amount, source_pos=None):
         """좀비 공격 → 코어 무결성(체력) 깎기. 0 이 되면 게임오버 훅(현재 미구현).
@@ -3424,29 +4048,363 @@ class ZombieGame(ShowBase):
         self._sens_norm = n
         self.mouse_sens = self._sens_from_norm(n)
         self.sens_value_text.setText(f'{n:.2f}')
+        if getattr(self, 'sens_fill', None) is not None:
+            self.sens_fill['frameSize'] = (-1.0, -1.0 + 2.0 * n, -0.16, 0.16)
+
+    # ── 공통 설정 위젯 — 일시정지/설정이 동일한 항목·콜백을 공유(레이아웃만 다름) ──
+    def _apply_volume(self):
+        # 매니저 전역 볼륨에 master·sfx 반영(개별 사운드 거리감쇠 위에 곱해짐).
+        v = max(0.0, min(1.0, self._vol_master)) * max(0.0, min(1.0, self._vol_sfx))
+        try:
+            for mgr in self.sfxManagerList:
+                mgr.setVolume(v)
+        except Exception:
+            pass
+        try:
+            self.musicManager.setVolume(max(0.0, min(1.0, self._vol_master)))
+        except Exception:
+            pass
+
+    def _fmt_setting(self, key, v):
+        return f'{v:.2f}' if key == 'sens' else f'{int(round(v * 100))}'
+
+    def _on_setting_change(self, key):
+        # 공통 슬라이더 콜백. 생성 시 1회 조기 발화는 슬라이더 attr 미등록이라 무시됨.
+        sl = getattr(self, f'_set_slider_{key}', None)
+        if sl is None:
+            return
+        v = sl['value']
+        if key == 'sens':
+            self._sens_norm = v
+            self.mouse_sens = self._sens_from_norm(v)
+        elif key == 'master':
+            self._vol_master = v
+            self._apply_volume()
+        elif key == 'sfx':
+            self._vol_sfx = v
+            self._apply_volume()
+        vt = getattr(self, f'_set_text_{key}', None)
+        if vt is not None:
+            vt.setText(self._fmt_setting(key, v))
+        geom = getattr(self, f'_set_geom_{key}', None)
+        if geom is not None:
+            track_l, tw, z, th = geom
+            fill = getattr(self, f'_set_fill_{key}', None)
+            if fill is not None:
+                fill.setSx(max(0.0001, v))            # 채움 폭 = 값
+            handle = getattr(self, f'_set_handle_{key}', None)
+            if handle is not None:
+                handle.setX(track_l + tw * v)         # 핸들 위치
+
+    def _setting_value(self, key):
+        return {'sens': self._sens_norm, 'master': self._vol_master,
+                'sfx': self._vol_sfx}[key]
+
+    def _build_setting_slider(self, parent, key, label, hint, z, lx, rx):
+        # HTML .slider 그대로: 얇은 트랙(다크+라인) + 틱 11개 + 레드 채움 + 작은
+        # 노치 흰 핸들 + 우측 값. 드래그는 보이지 않는 DirectSlider 가 처리하고,
+        # 트랙/틱/채움/핸들은 직접 그려 콜백(_on_setting_change)에서 동기화한다.
+        self._tac_fonts()
+        value0 = self._setting_value(key)
+        OnscreenText(parent=parent, text=label, pos=(lx, z + 0.05), scale=0.026,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft,
+                     font=self._tac_label_font, mayChange=False)
+        if hint:
+            OnscreenText(parent=parent, text=hint, pos=(rx, z + 0.05), scale=0.023,
+                         fg=TAC_TEXT_3, align=TextNode.ARight,
+                         font=self._tac_label_font, mayChange=False)
+        val_w = 0.12
+        track_l, track_r = lx, rx - val_w
+        tw = track_r - track_l
+        th = 0.010                                  # 트랙 반높이(≈6px)
+        # 트랙(얇은 다크 + 1px 라인) — 전부 지오메트리, 생성순서로 레이어링.
+        _tac_fill(parent, track_l, track_r, z - th, z + th, TAC_BG_SURF)
+        _tac_outline(parent, track_l, track_r, z - th, z + th, TAC_LINE,
+                     thickness=1.2)
+        # 틱 11개(양끝 포함)
+        for i in range(11):
+            tx = track_l + tw * i / 10.0
+            _tac_fill(parent, tx - 0.0005, tx + 0.0005, z - 0.006, z + 0.006,
+                      TAC_LINE)
+        # 레드 채움 — 좌측 고정 노드 + sX 로 폭 = 값(좌→값).
+        fill = parent.attachNewNode(f'sfill_{key}')
+        fill.setPos(track_l, 0, 0)
+        _tac_fill(fill, 0.0, tw, z - th, z + th, TAC_ACCENT)
+        fill.setSx(max(0.0001, value0))
+        # 핸들 — 작은 노치 흰 사각(트랙보다 약간 큼). 노드를 값 위치로 이동.
+        hw, hh = 0.009, 0.022
+        handle = parent.attachNewNode(f'handle_{key}')
+        hfill = _tac_fill(handle, -hw, hw, z - hh, z + hh, TAC_TEXT_1,
+                          notch=hw * 0.8, corners=('tl',))
+        handle.setX(track_l + tw * value0)
+        vt = OnscreenText(parent=parent, text=self._fmt_setting(key, value0),
+                          pos=(rx, z - 0.013), scale=0.034, fg=TAC_TEXT_1,
+                          align=TextNode.ARight, font=self._tac_display_font,
+                          mayChange=True)
+        # 드래그용 보이지 않는 DirectSlider(트랙 영역 위 클릭/드래그 캡처).
+        s_cx = (track_l + track_r) / 2.0
+        s_scale = max(0.05, tw / 2.0)
+        gh = 0.05 / s_scale                          # 잡기 영역 반높이(로컬)
+        sl = DirectSlider(
+            range=(0.0, 1.0), value=value0, pageSize=0.05,
+            command=self._on_setting_change, extraArgs=[key],
+            parent=parent, pos=(s_cx, 0, z), scale=s_scale,
+            relief=DGG.FLAT, frameColor=(0, 0, 0, 0),
+            frameSize=(-1, 1, -gh, gh),
+            thumb_relief=DGG.FLAT, thumb_frameColor=(0, 0, 0, 0),
+            thumb_frameSize=(-0.02 / s_scale, 0.02 / s_scale, -gh, gh))
+        setattr(self, f'_set_slider_{key}', sl)
+        setattr(self, f'_set_text_{key}', vt)
+        setattr(self, f'_set_fill_{key}', fill)
+        setattr(self, f'_set_handle_{key}', handle)
+        setattr(self, f'_set_hfill_{key}', hfill)
+        setattr(self, f'_set_geom_{key}', (track_l, tw, z, th))
+        sl['value'] = value0       # 값 동기(텍스트·채움·핸들 갱신)
+        # 트랙/핸들 호버 시 핸들 흰→레드 (HTML .slider .track:hover .handle)
+        sl.bind(DGG.WITHIN, lambda _=None: hfill.setColor(*TAC_ACCENT))
+        sl.bind(DGG.WITHOUT, lambda _=None: hfill.setColor(*TAC_TEXT_1))
+        return sl
+
+    def _build_outline_swatches(self, parent, z, sw=0.115, cx=0.0, left=False):
+        # 적 테두리 색 스와치 행 — 선택 표시는 '흰 외곽선'(채움 X, 옆칸과 안 겹침),
+        # 호버하면 스와치가 살짝 커진다(0.042→0.050).
+        self._swatch_positions = []
+        n = len(OUTLINE_PALETTE)
+        for i, (name, col) in enumerate(OUTLINE_PALETTE):
+            x = (cx + i * sw) if left else (cx + (i - (n - 1) / 2.0) * sw)
+            b = DirectButton(
+                text='', pos=(x, 0, z), scale=0.042, parent=parent,
+                frameColor=col, relief=DGG.FLAT, frameSize=(-1.1, 1.1, -1.1, 1.1),
+                command=self._set_outline_color, extraArgs=[col])
+
+            def _en(_=None, bb=b):
+                LerpScaleInterval(bb, 0.10, Vec3(0.050, 0.050, 0.050),
+                                  blendType='easeOut').start()
+
+            def _ex(_=None, bb=b):
+                LerpScaleInterval(bb, 0.10, Vec3(0.042, 0.042, 0.042),
+                                  blendType='easeOut').start()
+
+            b.bind(DGG.WITHIN, _en)
+            b.bind(DGG.WITHOUT, _ex)
+            self._swatch_positions.append((col, x))
+        # 선택 표시 — 흰 1px 외곽선 프레임(채움 없음). _refresh 가 선택 스와치로 이동.
+        m = 0.055
+        self._swatch_hl = parent.attachNewNode('swatch_hl')
+        _tac_outline(self._swatch_hl, -m, m, z - m, z + m, TAC_TEXT_1, thickness=2.2)
+        self._swatch_hl.setTransparency(1)
+        self._refresh_outline_swatches()
+
+    # ── 디자인 키트 컴포넌트 (Settings/Lobby 화면 공통) ───────────────────────
+    def _tac_panel_head(self, parent, text, lx, rx, z, right=None):
+        # 라벨 + 우측으로 뻗는 얇은 라인 + 하단 보더. (.panel-head)
+        self._tac_fonts()
+        OnscreenText(parent=parent, text=text, pos=(lx, z), scale=0.028,
+                     fg=TAC_TEXT_1, align=TextNode.ALeft,
+                     font=self._tac_label_font, mayChange=False)
+        lstart = lx + 0.016 * len(text) + 0.03
+        lend = (rx - 0.22) if right else rx
+        _tac_fill(parent, lstart, lend, z + 0.005, z + 0.0065, TAC_LINE)
+        _tac_fill(parent, lx, rx, z - 0.035, z - 0.0337, TAC_LINE)  # 하단 보더
+        if right:
+            OnscreenText(parent=parent, text=right, pos=(rx, z), scale=0.023,
+                         fg=TAC_TEXT_3, align=TextNode.ARight,
+                         font=self._tac_label_font, mayChange=False)
+
+    def _tac_field(self, parent, label, lx, rx, z, initial, on_enter=None):
+        # 라벨 + 노치 입력칸(DirectEntry) + 하단 액센트 라인. (.field)
+        self._tac_fonts()
+        OnscreenText(parent=parent, text=label, pos=(lx, z + 0.07), scale=0.024,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft,
+                     font=self._tac_label_font, mayChange=False)
+        h = 0.052
+        _tac_fill(parent, lx, rx, z - h, z + h, TAC_BG_SURF, notch=0.02,
+                  corners=('tl',))
+        _tac_outline(parent, lx, rx, z - h, z + h, TAC_LINE, notch=0.02,
+                     corners=('tl',), thickness=1.2)
+        _tac_fill(parent, lx, rx, z - h - 0.004, z - h, TAC_ACCENT_DIM)
+        width_chars = max(6, int((rx - lx - 0.06) / 0.026))
+        entry = DirectEntry(
+            parent=parent, scale=0.05, pos=(lx + 0.03, 0, z - 0.018),
+            width=width_chars, numLines=1, initialText=initial, overflow=1,
+            frameColor=(0, 0, 0, 0), text_fg=TAC_TEXT_1,
+            command=(on_enter or (lambda *_a: None)))
+        return entry
+
+    def _tac_banner(self, parent, lx, z, text, w=0.5, state='idle'):
+        # 노치 박스 + 점 + 텍스트. (.banner)
+        rx = lx + w
+        h = 0.044
+        _tac_fill(parent, lx, rx, z - h, z + h, TAC_BG_SURF, notch=0.02,
+                  corners=('tl',))
+        _tac_outline(parent, lx, rx, z - h, z + h, TAC_LINE, notch=0.02,
+                     corners=('tl',), thickness=1.2)
+        dot = (TAC_ACCENT if state == 'live' else
+               _hexc('#CFD3DA') if state == 'ok' else TAC_STEEL)
+        _tac_fill(parent, lx + 0.03, lx + 0.05, z - 0.01, z + 0.01, dot)
+        OnscreenText(parent=parent, text=text, pos=(lx + 0.075, z - 0.011),
+                     scale=0.025, fg=(TAC_TEXT_1 if state == 'ok' else TAC_TEXT_2),
+                     align=TextNode.ALeft, font=self._tac_label_font,
+                     mayChange=False)
+
+    def _tac_player_slot(self, parent, lx, rx, zb, zt, me, tag, name, state):
+        # 노치 카드 — 코너 태그, 점+YOU/REMOTE, 이름, 상태. (.slot)
+        self._tac_fonts()
+        line = TAC_ACCENT_DIM if me else TAC_LINE
+        _tac_fill(parent, lx, rx, zb, zt, TAC_BG_SURF, notch=0.04, corners=('tl',))
+        _tac_outline(parent, lx, rx, zb, zt, line, notch=0.04, corners=('tl',),
+                     thickness=1.4)
+        OnscreenText(parent=parent, text=tag, pos=(rx - 0.03, zt - 0.05),
+                     scale=0.026, fg=TAC_TEXT_3, align=TextNode.ARight,
+                     font=self._tac_display_font, mayChange=False)
+        _tac_fill(parent, lx + 0.03, lx + 0.048, zt - 0.062, zt - 0.044,
+                  TAC_ACCENT if me else TAC_STEEL)
+        OnscreenText(parent=parent, text=('YOU' if me else 'REMOTE'),
+                     pos=(lx + 0.066, zt - 0.064), scale=0.022,
+                     fg=(TAC_ACCENT if me else TAC_STEEL), align=TextNode.ALeft,
+                     font=self._tac_label_font, mayChange=False)
+        OnscreenText(parent=parent, text=name, pos=(lx + 0.03, (zt + zb) / 2 - 0.02),
+                     scale=0.05, fg=(TAC_TEXT_3 if state == 'OPEN SLOT' else TAC_TEXT_1),
+                     align=TextNode.ALeft, font=self._tac_display_font,
+                     mayChange=False)
+        OnscreenText(parent=parent, text=state, pos=(lx + 0.03, zb + 0.04),
+                     scale=0.022, fg=TAC_TEXT_2, align=TextNode.ALeft,
+                     font=self._tac_label_font, mayChange=False)
+
+    def _tac_toggle(self, parent, x, z, on, label, command):
+        # 사각 스위치 + knob + 라벨. 클릭 시 knob 이 좌↔우로 슬라이드 + 색 전환
+        # (HTML .toggle .knob: left .14s expo, steel↔accent). 자체 상태 보유.
+        sw_w, sw_h, knob_w = 0.07, 0.026, 0.02
+        travel = sw_w - knob_w - 0.012        # knob 좌↔우 이동 거리
+        state = {'on': bool(on)}
+        btn = DirectButton(
+            parent=parent, pos=(0, 0, 0), relief=None, pressEffect=0,
+            frameSize=(x, x + sw_w + 0.22, z - 0.04, z + 0.04), text='')
+        _tac_fill(btn, x, x + sw_w, z - sw_h, z + sw_h, TAC_BG_SURF)
+        _tac_outline(btn, x, x + sw_w, z - sw_h, z + sw_h, TAC_LINE, thickness=1.2)
+        knob = btn.attachNewNode('knob')
+        kfill = _tac_fill(knob, x + 0.006, x + 0.006 + knob_w,
+                          z - 0.018, z + 0.018, TAC_STEEL)
+        OnscreenText(parent=btn, text=label, pos=(x + sw_w + 0.03, z - 0.011),
+                     scale=0.024, fg=TAC_TEXT_1, align=TextNode.ALeft,
+                     font=self._tac_label_font, mayChange=False)
+
+        def _apply(animate):
+            o = state['on']
+            tx = travel if o else 0.0
+            kfill.setColor(*(TAC_ACCENT if o else TAC_STEEL))
+            if animate:
+                LerpPosInterval(knob, 0.14, (tx, 0, 0), (knob.getX(), 0, 0),
+                                blendType='easeOut').start()
+            else:
+                knob.setX(tx)
+
+        _apply(False)
+
+        def _click(_=None):
+            state['on'] = not state['on']
+            _apply(True)
+            if command:
+                command(state['on'])
+
+        btn['command'] = _click
+        return btn
+
+    # ── 멀티플레이 로비 상태/액션 ─────────────────────────────────────────────
+    def _lobby_set_mode(self, mode):
+        self._lobby_mode = mode
+        self._rebuild_lobby_modes()
+
+    def _on_lobby_ready(self, val):
+        # 토글이 자체적으로 knob 슬라이드 애니메이션 → 여기선 상태/문구만 갱신(재빌드 X).
+        self._lobby_ready = val
+        if getattr(self, '_lobby_ready_status', None) is not None:
+            self._lobby_ready_status.setText('ALL OPERATORS READY' if val
+                                             else 'AWAITING READY')
+
+    def _lobby_start(self):
+        # 콜사인 확정 후 온라인 시작(선택 모드). 서버는 고정 릴레이(읽기전용).
+        if self._menu_root is None or self._game_started:
+            return
+        name = (self._lobby_name_entry.get() or '').strip() or 'PLAYER'
+        self.player_name = name[:8]
+        m = getattr(self, '_lobby_mode', 'pvp')
+        self._start_game(True, soccer=(m == 'soccer'), paint=(m == 'paint'),
+                         jump=(m == 'jump'))
 
     def _build_crosshair(self):
-        """중앙 조준점 — reticle.png (시안 단색, 880×880 PNG, 4× 해상도).
-        히트마커는 명중 순간 잠깐 점멸. 둘 다 setColorScale 로 시안↔빨강 틴트."""
-        ret_tex = self.loader.loadTexture(
-            Filename.from_os_specific(str(UI_DIR / 'reticle.png')))
-        self.crosshair = OnscreenImage(
-            image=ret_tex, pos=(0, 0, 0),
-            scale=(0.030 * HUD_SCALE, 1, 0.030 * HUD_SCALE),
-            parent=self.aspect2d)
+        """발로란트식 크로스헤어 — 중앙 점 + 상하좌우 4선. 정지 시 좁고 이동/연사 시
+        바깥으로 벌어짐(spread). 명중 순간 빨간 X 히트마커. 흰색 기본·적중 시 레드."""
+        S = HUD_SCALE
+        self.crosshair = self.aspect2d.attachNewNode('crosshair')
         self.crosshair.setTransparency(True)
-        self.crosshair.setColorScale(*HUD_TINT_CYAN)
-        # 히트마커 — 평소 hide, 명중 순간 0.18s 표시.
-        hit_tex = self.loader.loadTexture(
-            Filename.from_os_specific(str(UI_DIR / 'hitmarker.png')))
-        self.hitmarker = OnscreenImage(
-            image=hit_tex, pos=(0, 0, 0),
-            scale=(0.025 * HUD_SCALE, 1, 0.025 * HUD_SCALE),
-            parent=self.aspect2d)
+        self.crosshair.setLightOff()
+        self.crosshair.setBin('fixed', 80)
+        self.crosshair.setDepthTest(False)
+        self.crosshair.setDepthWrite(False)
+        self._ch_len = 0.020 * S          # 선 길이
+        self._ch_gap0 = 0.011 * S         # 기본 간격(정지)
+        self._ch_lines = {}
+        # 각 방향마다 컨테이너 노드 하나 → 그 안에 어두운 외곽선(굵게) + 흰 선(얇게).
+        # 외곽선 덕에 밝은 벽/어두운 바닥 어디서나 또렷이 보인다(발로란트식).
+        for key, (dx, dz) in {'t': (0, 1), 'b': (0, -1),
+                              'l': (-1, 0), 'r': (1, 0)}.items():
+            cont = self.crosshair.attachNewNode('ch_' + key)
+            for thick, col in ((4.2, (0, 0, 0, 0.9)), (2.2, TAC_TEXT_1)):
+                ls = LineSegs()
+                ls.setThickness(thick)
+                ls.setColor(*col)
+                ls.moveTo(0, 0, 0)
+                ls.drawTo(dx * self._ch_len, 0, dz * self._ch_len)
+                np = cont.attachNewNode(ls.create())
+                if thick < 3:
+                    self._ch_lines[key] = (cont, np, dx, dz)   # 흰 선 = 색 갱신 대상
+        d = 0.0016 * S                    # 중앙 점 (어두운 외곽 + 흰 점)
+        _tac_fill(self.crosshair, -d * 2.1, d * 2.1, -d * 2.1, d * 2.1,
+                  (0, 0, 0, 0.9))
+        self.ch_dot = _tac_fill(self.crosshair, -d, d, -d, d, TAC_TEXT_1)
+        # 히트마커 — 빨간 X, 평소 hide, 명중 순간 잠깐 표시.
+        self.hitmarker = self.aspect2d.attachNewNode('hitmarker')
         self.hitmarker.setTransparency(True)
+        self.hitmarker.setLightOff()
+        self.hitmarker.setBin('fixed', 81)
+        self.hitmarker.setDepthTest(False)
+        self.hitmarker.setDepthWrite(False)
+        hm = LineSegs()
+        hm.setThickness(2.6)
+        hm.setColor(*TAC_ACCENT)
+        g0, g1 = 0.012 * S, 0.027 * S
+        for (sx, sz) in [(1, 1), (-1, -1), (1, -1), (-1, 1)]:
+            hm.moveTo(sx * g0, 0, sz * g0)
+            hm.drawTo(sx * g1, 0, sz * g1)
+        self.hitmarker.attachNewNode(hm.create())
         self.hitmarker.hide()
         self._hitmarker_t = 0.0
         self._ch_alert = False        # 적 조준 중이면 빨강
+        self._ch_spread = 0.0         # 기본 간격 위에 더해지는 추가 벌어짐
+        self._ch_kick = 0.0           # 발사 시 순간 킥(감쇠)
+        self._ch_lastpos = Vec3(getattr(self, 'player_pos', Vec3(0, 0, 0)))
+
+    def _update_crosshair(self, dt):
+        # spread = 이동/연사 시 추가 벌어짐(부드럽게 수렴). gap = 기본 + spread.
+        S = HUD_SCALE
+        pos = getattr(self, 'player_pos', None)
+        moving = False
+        if pos is not None:
+            moving = (pos - self._ch_lastpos).lengthSquared() > (0.02 ** 2)
+            self._ch_lastpos = Vec3(pos)
+        if getattr(self, '_hands_oneshot', False):
+            self._ch_kick = 0.030 * S
+        self._ch_kick = max(0.0, self._ch_kick - dt * 0.10)
+        target = (0.013 * S if moving else 0.0) + self._ch_kick
+        self._ch_spread += (target - self._ch_spread) * min(1.0, dt * 14.0)
+        gap = self._ch_gap0 + self._ch_spread
+        hot = self._ch_alert or self._hitmarker_t > 0
+        col = TAC_ACCENT if hot else TAC_TEXT_1
+        for (cont, white, dx, dz) in self._ch_lines.values():
+            cont.setPos(dx * gap, 0, dz * gap)
+            white.setColor(*col)
+        self.ch_dot.setColor(*col)
 
     # 콤보 게이지 바 — 화면 하단 중앙. 좌측 고정, 남은 시간만큼 우측 가장자리가
     # 차오르고, 시간이 흐르면 우측 가장자리가 왼쪽으로 줄며 소진된다.
@@ -3862,8 +4820,45 @@ class ZombieGame(ShowBase):
         return task.cont
 
     def _show_kill_banner(self):
-        """처치 시 호출 — 진행 중이던 Sequence 멈추고 처음부터 재생(겹침 방지)."""
-        self._kb_seq.start()   # start() 가 t=0 으로 리셋하며 재생
+        """처치 시 호출 — 발로란트식 킬피드 행을 우상단에 추가. (구 해골 슬램 폐기)"""
+        self._push_killfeed('ELIMINATED', mine=True)
+
+    def _push_killfeed(self, text='ELIMINATED', mine=True):
+        # 한 줄 행(좌측 레드/스틸 바 + 우측정렬 텍스트)을 쌓고, 최신이 위로.
+        self._tac_fonts()
+        if not hasattr(self, '_kf_parent'):
+            return
+        row = self._kf_parent.attachNewNode('kf_row')
+        OnscreenText(parent=row, text=text, pos=(-0.05, -0.011), scale=0.040,
+                     fg=TAC_TEXT_1, align=TextNode.ARight,
+                     font=self._tac_label_font, mayChange=False)
+        _tac_fill(row, -0.038, -0.024, -0.020, 0.020,
+                  TAC_ACCENT if mine else TAC_STEEL)
+        self._kf_rows.insert(0, [row, 0.0])
+        if len(self._kf_rows) > 5:
+            self._kf_rows.pop()[0].removeNode()
+        self._relayout_killfeed()
+
+    def _relayout_killfeed(self):
+        for i, entry in enumerate(self._kf_rows):
+            entry[0].setPos(0, 0, -0.12 - i * 0.060)
+
+    def _update_killfeed(self, dt):
+        # 행 수명 3.6s, 마지막 0.6s 페이드아웃.
+        if not getattr(self, '_kf_rows', None):
+            return
+        changed = False
+        for entry in list(self._kf_rows):
+            entry[1] += dt
+            if entry[1] > 3.6:
+                entry[0].removeNode()
+                self._kf_rows.remove(entry)
+                changed = True
+            else:
+                a = 1.0 if entry[1] < 3.0 else max(0.0, (3.6 - entry[1]) / 0.6)
+                entry[0].setColorScale(1, 1, 1, a)
+        if changed:
+            self._relayout_killfeed()
 
     # --- HUD (임상 안티바이러스 톤 + 글리치) ---------------------------------
 
@@ -3888,6 +4883,7 @@ class ZombieGame(ShowBase):
         외형은 정화 HUD PNG (assets/ui/) 로 그리고, 그 위에 텍스트·동적 채움을 얹음."""
         # 코너 기준 HUD 는 코너마다 스케일 컨테이너를 하나 끼워 거기에 HUD_SCALE 를
         # 건다. 개별 요소의 pos/scale 은 그대로 두고도 정렬 보존된 채 비례 확대된다.
+        self._tac_fonts()       # 택티컬 콘덴스드 폰트 먼저 로드(이하 전부 사용)
         L = self.a2dTopLeft.attachNewNode('hud_tl');     L.setScale(HUD_SCALE)
         R = self.a2dTopRight.attachNewNode('hud_tr');    R.setScale(HUD_SCALE)
         BL = self.a2dBottomLeft.attachNewNode('hud_bl');  BL.setScale(HUD_SCALE)
@@ -3920,36 +4916,50 @@ class ZombieGame(ShowBase):
             text='구역 확보 0%', pos=(-0.05, -0.255), scale=0.036,
             fg=HUD_CYAN, align=TextNode.ARight, mayChange=True, parent=R)
 
+        # ── 점수 택티컬 프레임(상단중앙) — 다크 노치 패널 + 양쪽 레드 틱(메뉴 톤).
+        #    hud_score 와 함께 show/hide. 점수 텍스트보다 먼저 만들어 뒤에 깔린다.
+        self.hud_score_frame = self.aspect2d.attachNewNode('score_frame')
+        _tac_fill(self.hud_score_frame, -0.165, 0.165, 0.785, 0.905,
+                  (0.055, 0.060, 0.072, 0.55), notch=0.025, corners=('tl', 'br'))
+        _tac_outline(self.hud_score_frame, -0.165, 0.165, 0.785, 0.905, TAC_LINE,
+                     notch=0.025, corners=('tl', 'br'), thickness=1.3)
+        _tac_fill(self.hud_score_frame, -0.205, -0.17, 0.838, 0.852, TAC_ACCENT)
+        _tac_fill(self.hud_score_frame, 0.17, 0.205, 0.838, 0.852, TAC_ACCENT)
+        self.hud_score_frame.hide()
         # ── PvP 점수(online 전용) — 상단 중앙 "내점수 : 상대점수", 먼저 10점이면 승리.
         self.hud_score = OnscreenText(
-            text='0 : 0', pos=(0, 0.86), scale=0.085,
-            fg=(1, 1, 1, 0.96), align=TextNode.ACenter, mayChange=True,
-            parent=self.aspect2d)
+            text='0 : 0', pos=(0, 0.84), scale=0.10,
+            fg=TAC_TEXT_1, align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d, font=self._tac_display_font)
         self.hud_score.hide()             # online 일 때만 _setup_online 에서 show
         # 승/패 결과 배너 — 매치 종료 시 화면 중앙에 크게.
         self.hud_match_result = OnscreenText(
-            text='', pos=(0, 0.12), scale=0.18,
-            fg=(1, 1, 1, 1), align=TextNode.ACenter, mayChange=True,
-            parent=self.aspect2d)
+            text='', pos=(0, 0.12), scale=0.20,
+            fg=TAC_TEXT_1, align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d, font=self._tac_display_font)
         self.hud_match_result.hide()
         # 라운드 시작 카운트다운 — 화면 중앙 "5..1 / FIGHT!" (스폰 배리어 해제 타이밍).
         self.hud_countdown = OnscreenText(
-            text='', pos=(0, 0.30), scale=0.20,
-            fg=(1, 0.92, 0.4, 1), align=TextNode.ACenter, mayChange=True,
-            parent=self.aspect2d)
+            text='', pos=(0, 0.30), scale=0.22,
+            fg=TAC_ACCENT, align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d, font=self._tac_display_font)
         self.hud_countdown.hide()
+
+        # ── 킬피드 (우상단) — 발로란트식 한 줄 행이 쌓였다 사라짐. ──────────────
+        self._kf_parent = self.a2dTopRight.attachNewNode('killfeed')
+        self._kf_rows = []
 
         # 결과/대기 배경은 가장 마지막에 만들어 다른 HUD 보다 뒤(bin)에 깔리게 하고,
         # 그 위 텍스트는 더 앞 bin 으로 → 어두운 패널 위에 글자가 보인다.
         self.hud_match_result.setBin('fixed', 60)
         # ── 대기방 — 상대 접속 전 어둡게 + 안내문(online 시작 직후). ───────────
         self.hud_wait_bg = DirectFrame(
-            frameColor=(0.02, 0.03, 0.05, 0.80), frameSize=(-2, 2, -2, 2),
+            frameColor=(0.055, 0.059, 0.071, 0.86), frameSize=(-2, 2, -2, 2),
             parent=self.aspect2d)
         self.hud_wait_bg.setBin('fixed', 50)
         self.hud_wait = OnscreenText(
             text='대기방\n\n다른 플레이어를 기다리는 중...', pos=(0, 0.12),
-            scale=0.085, fg=(0.85, 0.92, 1.0, 1), align=TextNode.ACenter,
+            scale=0.085, fg=TAC_TEXT_1, align=TextNode.ACenter,
             mayChange=True, parent=self.aspect2d)
         self.hud_wait.setBin('fixed', 60)
         self.hud_wait_bg.hide()
@@ -3957,19 +4967,19 @@ class ZombieGame(ShowBase):
 
         # ── 결과창 — 매치 종료 시 승/패 + 킬/데스. (어두운 패널 + 텍스트) ──────
         self.hud_result_bg = DirectFrame(
-            frameColor=(0.02, 0.03, 0.05, 0.85), frameSize=(-2, 2, -2, 2),
+            frameColor=(0.055, 0.059, 0.071, 0.90), frameSize=(-2, 2, -2, 2),
             parent=self.aspect2d)
         self.hud_result_bg.setBin('fixed', 50)
         self.hud_result = OnscreenText(
             text='', pos=(0, -0.12), scale=0.12,
-            fg=(0.9, 0.95, 1.0, 1), align=TextNode.ACenter, mayChange=True,
+            fg=TAC_TEXT_1, align=TextNode.ACenter, mayChange=True,
             parent=self.aspect2d)
         self.hud_result.setBin('fixed', 60)
         # 결산 화면 하단 — "N초 후 메인 화면으로" 카운트다운 안내.
         self.hud_result_return = OnscreenText(
             text='', pos=(0, -0.30), scale=0.045,
-            fg=HUD_CYAN_DIM, align=TextNode.ACenter, mayChange=True,
-            parent=self.aspect2d)
+            fg=TAC_TEXT_2, align=TextNode.ACenter, mayChange=True,
+            parent=self.aspect2d, font=getattr(self, '_tac_label_font', None))
         self.hud_result_return.setBin('fixed', 60)
         self.hud_result_bg.hide()
         self.hud_result.hide()
@@ -4032,30 +5042,62 @@ class ZombieGame(ShowBase):
         php_x, php_z = 0.10, 0.13
         self._php_w, self._php_h = php_w, php_h
         self._php_x, self._php_z = php_x, php_z
+        # 체력 택티컬 플레이트 — 다크 노치 패널 + 좌측 레드 바 + 라인 (메뉴 디자인 톤)
+        self._health_plate = self.a2dBottomLeft.attachNewNode('health_plate')
+        _tac_fill(self._health_plate, 0.035, 0.665, 0.085, 0.235,
+                  (0.055, 0.060, 0.072, 0.50), notch=0.03, corners=('tl', 'br'))
+        _tac_outline(self._health_plate, 0.035, 0.665, 0.085, 0.235, TAC_LINE,
+                     notch=0.03, corners=('tl', 'br'), thickness=1.3)
+        _tac_fill(self._health_plate, 0.035, 0.051, 0.10, 0.22, TAC_ACCENT)
         self.php_track = DirectFrame(
-            frameColor=(0.10, 0.03, 0.03, 0.72),
-            frameSize=(0, php_w, -php_h, php_h),
+            frameColor=(0.094, 0.102, 0.125, 0.88),     # #181A20 톤 트랙
+            frameSize=(-0.006, php_w + 0.006, -php_h - 0.006, php_h + 0.006),
             pos=(php_x, 0, php_z), parent=self.a2dBottomLeft)
         self.php_track.setBin('fixed', 20)
         self.php_fill = DirectFrame(
-            frameColor=(0.25, 0.85, 0.30, 0.95),
+            frameColor=(0.92, 0.93, 0.94, 0.96),        # 기본 흰색(감소 시 레드로)
             frameSize=(0, php_w, -php_h, php_h),
             pos=(php_x, 0, php_z), parent=self.a2dBottomLeft)
         self.php_fill.setBin('fixed', 21)
+        # 바 위쪽 행: VITALS 라벨(좌) + 숫자(우). 디자인 .health .hrow.
+        self.hud_vitals_lbl = OnscreenText(
+            text='V I T A L S', pos=(php_x, php_z + 0.050), scale=0.030,
+            fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
+            parent=self.a2dBottomLeft,
+            font=getattr(self, '_tac_label_font', None))
+        self.hud_vitals_lbl.setBin('fixed', 22)
         self.php_num = OnscreenText(
-            text='100', pos=(php_x + php_w + 0.04, php_z - 0.018), scale=0.052,
-            fg=(1, 1, 1, 0.95), align=TextNode.ALeft, mayChange=True,
-            parent=self.a2dBottomLeft)
+            text='100', pos=(php_x + php_w, php_z + 0.044), scale=0.072,
+            fg=TAC_TEXT_1, align=TextNode.ARight, mayChange=True,
+            parent=self.a2dBottomLeft, font=getattr(self, '_tac_display_font', None))
         self.php_num.setBin('fixed', 22)
 
         # 우하단 — 탄약 카운터. 라벨("정화 카트리지")·카트리지 아이콘 UI 제거하고
         # "현재/최대" 숫자(예: 3/8, 7/25)만 표시. 재장전 중엔 위에 "reloading...".
+        # 탄약 택티컬 플레이트 — 다크 노치 패널 + 우측 레드 바 + 라인 (메뉴 디자인 톤)
+        self._ammo_plate = BR.attachNewNode('ammo_plate')
+        _tac_fill(self._ammo_plate, -0.40, -0.005, 0.045, 0.40,
+                  (0.055, 0.060, 0.072, 0.50), notch=0.05, corners=('tl', 'br'))
+        _tac_outline(self._ammo_plate, -0.40, -0.005, 0.045, 0.40, TAC_LINE,
+                     notch=0.05, corners=('tl', 'br'), thickness=1.3)
+        _tac_fill(self._ammo_plate, -0.022, -0.005, 0.07, 0.30, TAC_ACCENT)
+        # 디자인 .ammo — 무기 라벨(위) + 큰 현재탄(Oswald) + 작은 최대탄(흐림).
+        self.hud_weapon_lbl = OnscreenText(
+            text='P I S T O L', pos=(-0.05, 0.285), scale=0.038,
+            fg=TAC_TEXT_2, align=TextNode.ARight, mayChange=True, parent=BR,
+            font=self._tac_label_font)
+        self.hud_ammo_max = OnscreenText(
+            text='/ 8', pos=(-0.05, 0.10), scale=0.058,
+            fg=TAC_TEXT_3, align=TextNode.ARight, mayChange=True, parent=BR,
+            font=self._tac_display_font)
         self.hud_ammo_num = OnscreenText(
-            text='8/8', pos=(-0.05, 0.215), scale=0.110,
-            fg=HUD_WHITE_TRANS, align=TextNode.ARight, mayChange=True, parent=BR)
+            text='08', pos=(-0.16, 0.10), scale=0.150,
+            fg=TAC_TEXT_1, align=TextNode.ARight, mayChange=True, parent=BR,
+            font=self._tac_display_font)
         self.hud_reload_text = OnscreenText(
-            text='reloading...', pos=(-0.05, 0.390), scale=0.045,
-            fg=HUD_WHITE_TRANS, align=TextNode.ARight, mayChange=False, parent=BR)
+            text='RELOADING', pos=(-0.05, 0.345), scale=0.040,
+            fg=TAC_ACCENT, align=TextNode.ARight, mayChange=False, parent=BR,
+            font=self._tac_label_font)
         self.hud_reload_text.hide()
 
         # 중앙 상단 — 적 타겟 정보 그룹 (enemy.png 1600×1040 ≈ 1.54:1, 평소 hidden).
@@ -4169,10 +5211,23 @@ class ZombieGame(ShowBase):
     def _update_hud(self, dt):
         glitching = self._glitch_t > 0
 
-        # 탄약 — "현재/최대" 숫자만 (카트리지 아이콘 UI 제거). 빈 탄창은 더 옅게.
-        self.hud_ammo_num.setText(f'{self.ammo}/{self.ammo_max}')
-        self.hud_ammo_num.setFg(HUD_WHITE_TRANS_DIM if self.ammo == 0
-                                else HUD_WHITE_TRANS)
+        # 탄약 — 큰 현재탄 + 작은 최대탄. 0발이면 EMPTY (R) 레드 점멸. 무기명 갱신.
+        if self.ammo == 0:
+            ft = ClockObject.getGlobalClock().getFrameTime()
+            self.hud_ammo_num.setText('EMPTY')
+            self.hud_ammo_num.setFg(TAC_ACCENT if int(ft * 3) % 2 == 0
+                                    else TAC_ACCENT_DIM)
+            self.hud_ammo_max.setText('(R)')
+            self.hud_ammo_max.setFg(TAC_ACCENT_DIM)
+        else:
+            low = self.ammo <= max(1, self.ammo_max // 4)
+            self.hud_ammo_num.setText(f'{self.ammo:02d}')
+            self.hud_ammo_num.setFg(TAC_ACCENT if low else TAC_TEXT_1)
+            self.hud_ammo_max.setText(f'/ {self.ammo_max}')
+            self.hud_ammo_max.setFg(TAC_TEXT_3)
+        self.hud_weapon_lbl.setText(
+            'R I F L E' if (self.weapon_name or 'pistol') == 'rifle'
+            else 'P I S T O L')
         # 재장전 중 "reloading..." 표시.
         if self._reload_oneshot:
             self.hud_reload_text.show()
@@ -4198,11 +5253,12 @@ class ZombieGame(ShowBase):
         self.hud_integ_ext['frameSize']   = (bx1, ext_right, -zhi, zhi)
         self.hud_integ_num.setText(f'{int(round(self.core_integrity))}%')
 
-        # 플레이어 체력바 — 너비 = 체력 비율, 색 = 초록(만땅)→빨강(위험).
+        # 플레이어 체력바 — 너비 = 체력 비율, 색 = 흰색(만땅)→레드(위험).
         self.php_fill['frameSize'] = (0, self._php_w * r, -self._php_h, self._php_h)
-        self.php_fill['frameColor'] = (0.90 - 0.65 * r, 0.20 + 0.65 * r,
-                                       0.22 + 0.06 * r, 0.95)
+        self.php_fill['frameColor'] = (0.90, 0.25 + 0.68 * r,
+                                       0.22 + 0.72 * r, 0.96)
         self.php_num.setText(str(int(round(self.core_integrity))))
+        self.php_num.setFg(TAC_ACCENT if r < 0.3 else TAC_TEXT_1)
 
         # 웨이브 모드 HUD — 총 처치 수 + 현재 웨이브/남은 적
         alive = sum(1 for z in self.zombies if z.hp > 0)
@@ -4221,6 +5277,10 @@ class ZombieGame(ShowBase):
             self._hitmarker_t -= dt
             if self._hitmarker_t <= 0:
                 self.hitmarker.hide()
+        # 발로란트식 크로스헤어 spread/색 갱신.
+        self._update_crosshair(dt)
+        # 킬피드 행 수명/페이드.
+        self._update_killfeed(dt)
         # 데미지 플래시(하얀 네모) 애니메이션.
         self._update_dmg_flash(dt)
 
@@ -4324,13 +5384,14 @@ class ZombieGame(ShowBase):
             # (참고: setDt(0) 는 Panda3D 가 assert 로 거부함 — MSlave 면 setDt 불필요.)
             clock.setMode(ClockObject.MSlave)
             self.pause_frame.show()
+            self._animate_pause_in()        # 페이드+슬라이드 스태거 등장
             props.setCursorHidden(False)
             props.setMouseMode(WindowProperties.M_absolute)
             self.win.requestProperties(props)
         else:
             # 재개 — MNormal 복귀. 첫 프레임 dt 폭발은 _update 의 cap (≤0.1) 이 잡음.
             clock.setMode(ClockObject.MNormal)
-            self.pause_frame.hide()
+            self._animate_pause_out()    # 열기 역재생 페이드아웃 후 hide
             props.setCursorHidden(True)
             props.setMouseMode(WindowProperties.M_confined)
             self.win.requestProperties(props)
@@ -4368,55 +5429,76 @@ class ZombieGame(ShowBase):
     # 점수/리스폰 없음. 모든 메서드는 online_mode 일 때만 호출된다.
 
     def _build_lobby_ui(self):
-        """준비방 UI — 정중앙 기준 좌=나 / 우=상대(이름 + 준비 상태) + VS + 준비완료 버튼.
-        상대 이름/준비 상태는 _update_lobby 가 패킷에서 매 프레임 갱신한다."""
-        root = DirectFrame(frameColor=(0.01, 0.025, 0.04, 0.94),
+        """준비방 UI(인게임 온라인) — 발로란트풍 택티컬. 좌=나 / 우=상대 슬롯 카드 +
+        VS + READY UP 버튼. 상대 이름/준비 상태는 _update_lobby 가 매 프레임 갱신."""
+        self._tac_fonts()
+        root = DirectFrame(frameColor=(0.043, 0.047, 0.055, 0.96),
                            frameSize=(-2, 2, -1, 1), parent=self.aspect2d)
         root.setBin('fixed', 55)
         self.lobby_root = root
-        OnscreenText(text='준비방', pos=(0, 0.62), scale=0.10, fg=HUD_WHITE,
-                     align=TextNode.ACenter, mayChange=False, parent=root)
-        DirectFrame(frameColor=HUD_CYAN, frameSize=(-0.75, 0.75, -0.004, 0.004),
-                    pos=(0, 0, 0.50), parent=root)
-        OnscreenText(text='VS', pos=(0, 0.04), scale=0.10, fg=HUD_CYAN,
-                     align=TextNode.ACenter, mayChange=False, parent=root)
-        # 좌 = 나
-        OnscreenText(text='나', pos=(-0.62, 0.30), scale=0.05, fg=HUD_CYAN_DIM,
-                     align=TextNode.ACenter, mayChange=False, parent=root)
-        OnscreenText(text=self.player_name, pos=(-0.62, 0.16), scale=0.072,
-                     fg=HUD_WHITE, align=TextNode.ACenter, mayChange=False, parent=root)
-        self.lobby_my_status = OnscreenText(
-            text='대기 중', pos=(-0.62, -0.04), scale=0.05, fg=HUD_CYAN_DIM,
-            align=TextNode.ACenter, mayChange=True, parent=root)
-        # 우 = 상대
-        OnscreenText(text='상대', pos=(0.62, 0.30), scale=0.05, fg=HUD_CYAN_DIM,
-                     align=TextNode.ACenter, mayChange=False, parent=root)
-        self.lobby_op_name = OnscreenText(
-            text='접속 대기 중...', pos=(0.62, 0.16), scale=0.072, fg=HUD_WHITE,
-            align=TextNode.ACenter, mayChange=True, parent=root)
-        self.lobby_op_status = OnscreenText(
-            text='대기 중', pos=(0.62, -0.04), scale=0.05, fg=HUD_CYAN_DIM,
-            align=TextNode.ACenter, mayChange=True, parent=root)
-        # 준비완료 버튼
-        self.lobby_ready_btn = DirectButton(
-            text='준비완료', pos=(0, 0, -0.42), scale=0.08, parent=root,
-            frameColor=((0.05, 0.14, 0.18, 1.0), (0.10, 0.30, 0.38, 1.0),
-                        (0.09, 0.26, 0.34, 1.0), (0.05, 0.14, 0.18, 1.0)),
-            text_fg=HUD_WHITE, relief=1, frameSize=(-3.4, 3.4, -0.7, 1.1),
-            text_scale=0.85, command=self._on_ready)
-        OnscreenText(text='양쪽 모두 준비완료를 누르면 5초 뒤 시작',
-                     pos=(0, -0.60), scale=0.034, fg=HUD_CYAN_DIM,
-                     align=TextNode.ACenter, mayChange=False, parent=root)
+        # 캡션 + 타이틀
+        _tac_fill(root, -0.205, -0.145, 0.516, 0.524, TAC_ACCENT)
+        _tac_fill(root, 0.145, 0.205, 0.516, 0.524, TAC_ACCENT)
+        OnscreenText(text='MATCH LOBBY', pos=(0, 0.508), scale=0.026,
+                     fg=TAC_TEXT_2, align=TextNode.ACenter, mayChange=False,
+                     parent=root, font=self._tac_label_font)
+        OnscreenText(text='STANDBY', pos=(0, 0.37), scale=0.125, fg=TAC_TEXT_1,
+                     align=TextNode.ACenter, mayChange=False, parent=root,
+                     font=self._tac_hero_font)
+        OnscreenText(text='VS', pos=(0, 0.075), scale=0.058, fg=TAC_TEXT_3,
+                     align=TextNode.ACenter, mayChange=False, parent=root,
+                     font=self._tac_display_font)
+
+        def _slot(lx, rx, me, tag, who, name):
+            line = TAC_ACCENT_DIM if me else TAC_LINE
+            _tac_fill(root, lx, rx, -0.10, 0.30, TAC_BG_SURF, notch=0.04,
+                      corners=('tl',))
+            _tac_outline(root, lx, rx, -0.10, 0.30, line, notch=0.04,
+                         corners=('tl',), thickness=1.4)
+            OnscreenText(parent=root, text=tag, pos=(rx - 0.03, 0.24),
+                         scale=0.026, fg=TAC_TEXT_3, align=TextNode.ARight,
+                         font=self._tac_display_font, mayChange=False)
+            dot = _tac_fill(root, lx + 0.03, lx + 0.048, 0.238, 0.256,
+                            TAC_ACCENT if me else TAC_STEEL)
+            OnscreenText(parent=root, text=who, pos=(lx + 0.066, 0.236),
+                         scale=0.022, fg=(TAC_ACCENT if me else TAC_STEEL),
+                         align=TextNode.ALeft, font=self._tac_label_font,
+                         mayChange=False)
+            nm = OnscreenText(parent=root, text=name, pos=(lx + 0.03, 0.10),
+                              scale=0.052, fg=TAC_TEXT_1, align=TextNode.ALeft,
+                              mayChange=True)
+            st = OnscreenText(parent=root, text='STANDBY', pos=(lx + 0.03, -0.02),
+                              scale=0.024, fg=TAC_TEXT_2, align=TextNode.ALeft,
+                              font=self._tac_label_font, mayChange=True)
+            return nm, st, dot
+
+        _myname, self.lobby_my_status, _md = _slot(-0.62, -0.05, True, 'P1',
+                                                   'YOU', self.player_name or 'YOU')
+        self.lobby_op_name, self.lobby_op_status, op_dot = _slot(
+            0.05, 0.62, False, 'P2', 'REMOTE', 'CONNECTING…')
+        # 상대 점 펄스 — 접속 대기 표시(HTML 'connecting' 점 펄스). 클럭 정상이라 루프 OK.
+        op_dot.setTransparency(1)
+        self._lobby_pulse = Sequence(
+            LerpColorScaleInterval(op_dot, 0.55, (1, 1, 1, 0.2), (1, 1, 1, 1)),
+            LerpColorScaleInterval(op_dot, 0.55, (1, 1, 1, 1), (1, 1, 1, 0.2)))
+        self._lobby_pulse.loop()
+        # READY UP 버튼 + 안내
+        self.lobby_ready_btn = self._tac_button(
+            root, 'READY UP', (0, 0, -0.34), 0.6, 0.10, self._on_ready,
+            variant='accent', arrow=True)
+        OnscreenText(text='BOTH OPERATORS READY → MATCH STARTS IN 5S',
+                     pos=(0, -0.50), scale=0.026, fg=TAC_TEXT_3,
+                     align=TextNode.ACenter, mayChange=False, parent=root,
+                     font=self._tac_label_font)
 
     def _on_ready(self):
         # 내 준비완료 — 상태 표시 갱신 + 버튼 비활성. _ready 는 패킷으로 상대에게 전송됨.
         if self._ready:
             return
         self._ready = True
-        self.lobby_my_status.setText('준비완료!')
-        self.lobby_my_status.setFg((0.30, 1.0, 0.45, 1.0))
+        self.lobby_my_status.setText('READY')
+        self.lobby_my_status.setFg(TAC_ACCENT)
         self.lobby_ready_btn['state'] = 'disabled'
-        self.lobby_ready_btn['text_fg'] = HUD_CYAN_DIM
         print('[lobby] 내 준비완료', flush=True)
 
     def _update_lobby(self):
@@ -4427,19 +5509,34 @@ class ZombieGame(ShowBase):
         name, ready = rs[11], rs[12]
         self._remote_name = name
         self._remote_ready = ready
-        self.lobby_op_name.setText(name if name else '상대')
+        self.lobby_op_name.setText(name if name else 'REMOTE')
         if ready:
-            self.lobby_op_status.setText('준비완료!')
-            self.lobby_op_status.setFg((0.30, 1.0, 0.45, 1.0))
+            self.lobby_op_status.setText('READY')
+            self.lobby_op_status.setFg(TAC_ACCENT)
         else:
-            self.lobby_op_status.setText('대기 중')
-            self.lobby_op_status.setFg(HUD_CYAN_DIM)
+            self.lobby_op_status.setText('CONNECTED' if name else 'STANDBY')
+            self.lobby_op_status.setFg(TAC_TEXT_2)
+
+    def _set_ingame_hud_visible(self, on):
+        # 준비방(로비)이 떠 있는 동안 인게임 HUD(조준점/탄약/체력/킬피드/점수)를
+        # 숨겨 준비방 위로 겹쳐 보이는 걸 막는다. 매치 시작(_exit_lobby) 시 복귀.
+        for nm in ('crosshair', 'hitmarker', 'hud_ammo_num', 'hud_ammo_max',
+                   'hud_weapon_lbl', 'hud_reload_text', 'php_track', 'php_fill',
+                   'php_num', 'hud_vitals_lbl', 'hud_score', 'hud_score_frame',
+                   '_ammo_plate', '_health_plate', '_kf_parent'):
+            w = getattr(self, nm, None)
+            if w is not None:
+                (w.show if on else w.hide)()
 
     def _exit_lobby(self):
         # 양쪽 준비완료 — 준비방 종료. UI 숨기고 커서 잡아(FPS 마우스룩 복귀) 카운트다운으로.
         self._in_lobby = False
+        if getattr(self, '_lobby_pulse', None) is not None:
+            self._lobby_pulse.finish()
+            self._lobby_pulse = None
         if self.lobby_root is not None:
             self.lobby_root.hide()
+        self._set_ingame_hud_visible(True)   # 인게임 HUD 복귀
         props = WindowProperties()
         props.setCursorHidden(True)
         props.setMouseMode(WindowProperties.M_confined)
@@ -4487,6 +5584,7 @@ class ZombieGame(ShowBase):
             av.show()
             self._remote_smooth = Vec3(self._ai_pos)
         self.hud_score.show()
+        self.hud_score_frame.show()
         self._update_score_hud()
         print(f'[ai] AI 대결 시작 — 플레이어=A, AI=B, hp={self.ai_hp}', flush=True)
 
@@ -4779,12 +5877,14 @@ class ZombieGame(ShowBase):
         self._connect_relay()
         # PvP 점수 HUD 표시 (먼저 10점 승리). 단일플레이에선 숨김 유지.
         self.hud_score.show()
+        self.hud_score_frame.show()
         self._update_score_hud()
         # 준비방(로비) — 이름(좌=나 / 우=상대) 표시 + 양쪽 준비완료 대기. 버튼 클릭을
         # 위해 커서를 보이게 하고 마우스룩/카운트다운은 보류한다(_in_lobby).
         if self._arena_data is not None:
             self._in_lobby = True
             self._build_lobby_ui()
+            self._set_ingame_hud_visible(False)   # 준비방 동안 인게임 HUD 숨김
             props = WindowProperties()
             props.setCursorHidden(False)
             props.setMouseMode(WindowProperties.M_absolute)
@@ -5057,6 +6157,7 @@ class ZombieGame(ShowBase):
         self._paint_count = {1: 0, 2: 0}     # 칠한 칸 수(색별) — _paint_disc 가 증감
         self._paint_time_left = PAINT_TIME
         self.hud_score.hide()                # 킬 점수 HUD 숨김(땅따먹기는 안 씀)
+        self.hud_score_frame.hide()
         self._build_paint_hud()
         self._update_paint_hud()
         print(f'[paint] 땅따먹기 시작 — 내 색={"A(파랑)" if self._am_a else "B(주황)"} '
@@ -5066,6 +6167,15 @@ class ZombieGame(ShowBase):
         """상단 HUD — 3분 타이머 + 그 밑에 칠한 칸 수 (A 파랑):(B 주황). 시안/글리치 안 씀."""
         ca = PAINT_COLORS[1]
         cb = PAINT_COLORS[2]
+        # 타이머/점수 택티컬 프레임 — 다크 노치 패널 + 양쪽 레드 틱(메뉴 디자인 톤).
+        self.hud_paint_frame = self.aspect2d.attachNewNode('paint_frame')
+        _tac_fill(self.hud_paint_frame, -0.16, 0.16, 0.775, 0.965,
+                  (0.055, 0.060, 0.072, 0.55), notch=0.028, corners=('tl', 'br'))
+        _tac_outline(self.hud_paint_frame, -0.16, 0.16, 0.775, 0.965, TAC_LINE,
+                     notch=0.028, corners=('tl', 'br'), thickness=1.3)
+        _tac_fill(self.hud_paint_frame, -0.20, -0.165, 0.91, 0.924, TAC_ACCENT)
+        _tac_fill(self.hud_paint_frame, 0.165, 0.20, 0.91, 0.924, TAC_ACCENT)
+        _tac_fill(self.hud_paint_frame, -0.13, 0.13, 0.872, 0.8735, TAC_LINE)  # 구분선
         self.hud_paint_timer = OnscreenText(
             text='3:00', pos=(0, 0.92), scale=0.085, fg=(1, 1, 1, 0.96),
             align=TextNode.ACenter, mayChange=True, parent=self.aspect2d)
@@ -5267,6 +6377,14 @@ class ZombieGame(ShowBase):
     def _build_jump_hud(self):
         """상단 타이머 + 안내. 시안/글리치 안 씀."""
         if getattr(self, 'hud_jump_timer', None) is None:
+            # 타이머 택티컬 프레임 — 다크 노치 패널 + 양쪽 레드 틱(메뉴 디자인 톤).
+            self.hud_jump_frame = self.aspect2d.attachNewNode('jump_frame')
+            _tac_fill(self.hud_jump_frame, -0.14, 0.14, 0.872, 0.968,
+                      (0.055, 0.060, 0.072, 0.55), notch=0.025, corners=('tl', 'br'))
+            _tac_outline(self.hud_jump_frame, -0.14, 0.14, 0.872, 0.968, TAC_LINE,
+                         notch=0.025, corners=('tl', 'br'), thickness=1.3)
+            _tac_fill(self.hud_jump_frame, -0.18, -0.145, 0.913, 0.927, TAC_ACCENT)
+            _tac_fill(self.hud_jump_frame, 0.145, 0.18, 0.913, 0.927, TAC_ACCENT)
             self.hud_jump_timer = OnscreenText(
                 text='0.0s', pos=(0, 0.92), scale=0.07, fg=(1, 1, 1, 0.96),
                 align=TextNode.ACenter, mayChange=True, parent=self.aspect2d)
@@ -5850,6 +6968,7 @@ class ZombieGame(ShowBase):
         self._deathcam_t = 0.0
         self._exit_deathcam()
         self.hud_countdown.hide()
+        self._hide_match_huds()       # 슬로우모션 피날레 때부터 인게임 UI 숨김
         print(f'[pvp] 매치 종료 — {"WIN" if won else "LOSE"} '
               f'kills={self._my_score} deaths={self._enemy_score}', flush=True)
         # 결과창은 곧장 띄우지 않고, 슬로우모션으로 마지막 장면(처치 순간)을 ~1.8초
@@ -5861,47 +6980,165 @@ class ZombieGame(ShowBase):
             self.taskMgr.doMethodLater(1.8, self._reveal_match_result,
                                        'reveal_match_result')
 
+    def _hide_match_huds(self):
+        # 매치 종료~결산 동안 인게임 UI 전부 숨김(조준점/탄약/체력/점수/킬피드 +
+        # 모드별 상단 타이머·점수 + 피격 아크). 슬로우모션 피날레 때부터 깔끔하게.
+        self._set_ingame_hud_visible(False)
+        for nm in ('hud_paint_timer', 'hud_paint_a', 'hud_paint_colon',
+                   'hud_paint_b', 'hud_paint_frame', 'hud_jump_timer',
+                   'hud_jump_info', 'hud_jump_frame', 'hud_goal_banner',
+                   'hud_countdown'):
+            w = getattr(self, nm, None)
+            if w is not None:
+                w.hide()
+        self._dmg_dir_t = 0.0
+        if getattr(self, '_dmg_arc_geom', None) is not None:
+            self._dmg_arc_geom.removeNode()
+            self._dmg_arc_geom = None
+
+    def _build_results_screen(self, won, kicker, title, sub, stats):
+        # 디자인 ResultsScreen — 좌측정렬: 킥커(틱+라벨) + 큰 타이틀(Anton, 승=레드)
+        # + 서브 + 스탯 행(라벨/값, 첫 값 승=레드) + 버튼. 인게임 HUD 는 숨긴다.
+        self._tac_fonts()
+        self._hide_match_huds()        # 인게임 HUD/모드 HUD/피격 아크 전부 숨김
+        ar = self.getAspectRatio()
+        lx = -ar * 0.82
+        root = DirectFrame(frameColor=(0.043, 0.047, 0.055, 0.97),
+                           frameSize=(-2, 2, -1, 1), parent=self.aspect2d)
+        root.setBin('fixed', 90)
+        root.setTransparency(1)
+        self._results_root = root
+        groups = []                                   # (노드, 등장 지연)
+
+        def grp(delay):
+            g = root.attachNewNode('rg')
+            g.setTransparency(1)
+            groups.append((g, delay))
+            return g
+
+        # 킥커
+        gk = grp(0.0)
+        _tac_fill(gk, lx, lx + 0.10, 0.418, 0.426, TAC_ACCENT if won else TAC_STEEL)
+        OnscreenText(parent=gk, text=kicker, pos=(lx + 0.135, 0.41), scale=0.028,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft, font=self._tac_label_font,
+                     mayChange=False)
+        # 타이틀
+        gt = grp(0.07)
+        OnscreenText(parent=gt, text=title, pos=(lx - 0.012, 0.18), scale=0.22,
+                     fg=(TAC_ACCENT if won else TAC_TEXT_1), align=TextNode.ALeft,
+                     font=self._tac_hero_font, mayChange=False)
+        # 서브
+        gs = grp(0.13)
+        OnscreenText(parent=gs, text=sub, pos=(lx, 0.05), scale=0.030,
+                     fg=TAC_TEXT_2, align=TextNode.ALeft, font=self._tac_label_font,
+                     mayChange=False)
+        # 스탯 행
+        srx = lx + 0.86
+        for i, (k, v) in enumerate(stats):
+            zr = -0.07 - i * 0.10
+            gr = grp(0.19 + i * 0.06)
+            _tac_fill(gr, lx, srx, zr - 0.05, zr - 0.0486, TAC_LINE)   # 하단 구분선
+            OnscreenText(parent=gr, text=k, pos=(lx, zr - 0.012), scale=0.026,
+                         fg=TAC_TEXT_2, align=TextNode.ALeft,
+                         font=self._tac_label_font, mayChange=False)
+            OnscreenText(parent=gr, text=str(v), pos=(srx, zr - 0.018), scale=0.05,
+                         fg=(TAC_ACCENT if (i == 0 and won) else TAC_TEXT_1),
+                         align=TextNode.ARight, font=self._tac_display_font,
+                         mayChange=False)
+        # 버튼 + 카운트다운
+        bz = -0.07 - len(stats) * 0.10 - 0.10
+        gb = grp(0.19 + len(stats) * 0.06 + 0.06)
+        acc_lbl = 'REMATCH' if self.online_mode else 'RETRY'
+        self._tac_button(gb, acc_lbl, (lx + 0.19, 0, bz), 0.36, 0.10,
+                         self._retry_match, variant='accent', arrow=True)
+        self._tac_button(gb, 'RETURN TO MENU', (lx + 0.72, 0, bz), 0.52, 0.10,
+                         self._return_to_main_menu, variant='ghost')
+        self._results_groups = groups
+        self._animate_results_in()
+
+    def _animate_results_in(self):
+        # 등장 — 각 그룹이 살짝 왼쪽(투명)에서 제자리(불투명)로 슬라이드, 스태거.
+        # (일시정지는 아래→위, 여긴 요청대로 좌→우 이동.) 매치종료 중엔 글로벌
+        # 클럭이 정상이라 인터벌로 재생.
+        for g, delay in getattr(self, '_results_groups', []):
+            g.setColorScale(1, 1, 1, 0)
+            g.setX(-0.14)
+            Sequence(
+                Wait(delay),
+                Parallel(
+                    LerpPosInterval(g, 0.26, (0, 0, 0), (-0.14, 0, 0),
+                                    blendType='easeOut'),
+                    LerpColorScaleInterval(g, 0.26, (1, 1, 1, 1),
+                                           (1, 1, 1, 0), blendType='easeOut')),
+            ).start()
+
+    def _retry_match(self):
+        # REMATCH/RETRY — 같은 모드로 재시작(플래그 relaunch). 복합/AI대결은 메뉴로.
+        flag = None
+        if self.online_mode and not (self.soccer_mode or self.paint_mode
+                                     or self.jump_mode):
+            flag = '--online'
+        elif self.soccer_mode and not self.online_mode:
+            flag = '--soccer'
+        elif self.paint_mode and not self.online_mode:
+            flag = '--paint'
+        elif self.jump_mode and not self.online_mode:
+            flag = '--jump'
+        if flag is None:
+            self._return_to_main_menu()
+            return
+        import os
+        import subprocess
+        try:
+            self._net_shutdown()
+        except Exception:
+            pass
+        try:
+            kw = {}
+            if sys.platform == 'win32':
+                kw['creationflags'] = (subprocess.DETACHED_PROCESS
+                                       | subprocess.CREATE_NEW_PROCESS_GROUP)
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), flag],
+                             cwd=os.path.dirname(os.path.abspath(__file__)), **kw)
+        except Exception as e:
+            print('[retry] 재시작 실패:', e, flush=True)
+        self.userExit()
+
     def _reveal_match_result(self, task):
-        """슬로우모션 잠시 후 결과창(승/패 + 킬/데스)을 띄우고 메인 복귀 카운트다운 시작."""
+        """슬로우모션 잠시 후 결산화면(ResultsScreen)을 띄우고 메인 복귀 카운트다운."""
         won = getattr(self, '_pending_match_won', False)
         if getattr(self, 'hud_goal_banner', None) is not None:
-            self.hud_goal_banner.hide()       # 축구 '골!' 배너 숨김(승리! 와 겹침 방지)
-        # 킬 = 내가 상대를 죽인 횟수(my_score), 데스 = 내가 죽은 횟수(enemy_score).
-        self.hud_match_result.setText('승리!' if won else '패배...')
-        self.hud_match_result.setFg((0.30, 1.0, 0.45, 1.0) if won
-                                    else (1.0, 0.35, 0.35, 1.0))
+            self.hud_goal_banner.hide()       # 축구 '골!' 배너 숨김
+        # 모드별 타이틀/서브/스탯.
         if self.jump_mode:
-            self.hud_match_result.setText('완주!' if won else '패배...')
+            title = 'FINISH' if won else 'DEFEAT'
+            sub = 'COURSE CLEARED' if won else 'DID NOT FINISH'
             t = getattr(self, '_jump_time', 0.0)
-            self.hud_result.setText(f'완주 시간  {t:.1f}초')
+            stats = [['TIME', f'{t:.1f}S']]
         elif self.paint_mode:
             mine = self._paint_count.get(self._paint_my_id, 0)
             opp = self._paint_count.get(self._paint_opp_id, 0)
-            self.hud_result.setText(f'내 칸  {mine}      상대 칸  {opp}')
+            title = 'VICTORY' if won else 'DEFEAT'
+            sub = 'ZONE DOMINATED' if won else 'ZONE LOST'
+            stats = [['MY TILES', mine], ['ENEMY TILES', opp]]
         elif self.soccer_mode:
             mine = self._goals_a if self._am_a else self._goals_b
             opp = self._goals_b if self._am_a else self._goals_a
-            self.hud_result.setText(f'골  {mine}      실점  {opp}')
+            title = 'VICTORY' if won else 'DEFEAT'
+            sub = 'OBJECTIVE SECURED' if won else 'OPERATOR DOWN'
+            stats = [['GOALS', mine], ['CONCEDED', opp]]
         else:
-            self.hud_result.setText(f'킬  {self._my_score}      데스  {self._enemy_score}')
-        self.hud_result_bg.show()
-        self.hud_match_result.show()
-        self.hud_result.show()
-        # 결산 5초 카운트다운 후 메인 화면(시작 메뉴)으로 복귀.
-        self._return_secs = 5
-        self.hud_result_return.setText(f'{self._return_secs}초 후 메인 화면으로...')
-        self.hud_result_return.show()
-        self.taskMgr.doMethodLater(1.0, self._tick_return_menu, 'return_to_menu')
+            title = 'VICTORY' if won else 'DEFEAT'
+            sub = 'OBJECTIVE SECURED' if won else 'OPERATOR DOWN'
+            stats = [['KILLS', self._my_score], ['DEATHS', self._enemy_score]]
+        self._build_results_screen(won, 'MATCH RESULT', title, sub, stats)
+        # 버튼 클릭용 커서 표시.
+        props = WindowProperties()
+        props.setCursorHidden(False)
+        props.setMouseMode(WindowProperties.M_absolute)
+        self.win.requestProperties(props)
+        # 자동 복귀 없음 — RETURN TO MENU 버튼을 눌러야 메인 화면으로 간다.
         return Task.done
-
-    def _tick_return_menu(self, task):
-        # 1초마다 카운트다운 갱신, 0 이 되면 메인 화면으로 복귀.
-        self._return_secs -= 1
-        if self._return_secs <= 0:
-            self._return_to_main_menu()
-            return Task.done
-        self.hud_result_return.setText(f'{self._return_secs}초 후 메인 화면으로...')
-        return Task.again
 
     def _return_to_main_menu(self):
         # 게임 월드(좀비/네트워크/HUD/액터…)를 안전히 되감는 대신, 프로세스를 새로
@@ -6135,14 +7372,16 @@ class ZombieGame(ShowBase):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5.0)
-            s.connect((RELAY_HOST, RELAY_PORT))
+            host = getattr(self, '_relay_host', None) or RELAY_HOST
+            port = getattr(self, '_relay_port', None) or RELAY_PORT
+            s.connect((host, port))
             s.settimeout(None)        # 이후 blocking recv/send
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._sock = s
             self._net_alive = True
             atexit.register(self._net_shutdown)   # 프로세스 종료 시 소켓 정리
             threading.Thread(target=self._net_recv_loop, daemon=True).start()
-            print(f'[net] 릴레이 접속 성공 {RELAY_HOST}:{RELAY_PORT}', flush=True)
+            print(f'[net] 릴레이 접속 성공 {host}:{port}', flush=True)
         except Exception as e:
             self._sock = None
             self._net_alive = False
@@ -6500,8 +7739,9 @@ class ZombieGame(ShowBase):
             self.slide_node.setX(self.slide_rest_x + self.slide_recoil)
 
         # 마우스 룩 — 1인칭이면 player_yaw/pitch, editor 면 editor_yaw/pitch.
-        # 준비방 동안은 커서가 자유(버튼 클릭용)라 마우스룩/포인터 재중심을 건너뛴다.
-        if self.win.hasPointer(0) and not self._in_lobby:
+        # 준비방·결산(매치 종료) 동안은 커서가 자유(버튼 클릭용)라 마우스룩/포인터
+        # 재중심을 건너뛴다.
+        if self.win.hasPointer(0) and not self._in_lobby and not self._match_over:
             md = self.win.getPointer(0)
             dx = md.getX() - self._win_cx
             dy = md.getY() - self._win_cy
