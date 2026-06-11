@@ -1,5 +1,5 @@
 """
-zombie_game — Mirror's Edge style 1인칭 좀비 슈터 (Panda3D)
+zombie_game — Mirror's Edge 풍 1인칭 택티컬 슈터 (Panda3D)
 Stage 1: 1인칭 카메라 + Y Bot 풀바디 + 기본 입력.
 """
 import atexit
@@ -44,7 +44,7 @@ from weapon_config import (
     WEAPON_SPRAY)
 
 # ── 성능 PRC: GPU 스키닝 ────────────────────────────────────────────────────
-# 좀비 14마리 × Mixamo 본 67개 × CPU 정점 변환 매 프레임 = 화각에 좀비 많을 때 FPS 폭락.
+# 적 14마리 × Mixamo 본 67개 × CPU 정점 변환 매 프레임 = 화각에 적 많을 때 FPS 폭락.
 # 두 플래그를 같이 켜면 본 매트릭스만 GPU 에 보내고 vertex skinning 은 GPU shader 가 처리:
 #   hardware-animated-vertices : vertex animation 을 GPU 로
 #   matrix-palette             : 본 매트릭스 팔레트 (per-vertex 최대 4본) 전송 활성화
@@ -64,15 +64,13 @@ _FONT_PATH = _FONT_BUNDLED if _FONT_BUNDLED.exists() else _FONT_FALLBACK
 loadPrcFileData('', f'text-default-font {_FONT_PATH.as_posix()}')
 
 
-# ── HUD 색 / 글리치 라벨 ────────────────────────────────────────────────────
-# 게임의 핵심 트릭: HUD 는 플레이어를 "선한 백신 AI" 라고 믿게 만드는 공범이다.
-# 평소엔 깨끗한 시안색 임상(antivirus) 톤(=거짓)으로 떠 있다가, 글리치가 터지면
-# 0.x 초 동안 빨강으로 깨지며 진짜 단어(=진실)가 비친다. 같은 데이터, 라벨만 반전.
+# ── HUD 색 ──────────────────────────────────────────────────────────────
+# 평소 시안 톤, 글리치 연출(기본 비활성) 시 잠깐 빨강으로 깜빡인다.
 HUD_CYAN       = (0.25, 0.88, 1.00, 1.0)   # 표면 액센트
 HUD_CYAN_DIM   = (0.43, 0.66, 0.72, 1.0)   # 표면 보조 라벨
 HUD_WHITE      = (0.92, 0.98, 1.00, 1.0)   # 큰 숫자
-HUD_RED        = (1.00, 0.18, 0.33, 1.0)   # 진실 액센트 (글리치)
-HUD_RED_DIM    = (0.88, 0.34, 0.43, 1.0)   # 진실 보조 라벨
+HUD_RED        = (1.00, 0.18, 0.33, 1.0)   # 레드 액센트 (글리치)
+HUD_RED_DIM    = (0.88, 0.34, 0.43, 1.0)   # 레드 보조 라벨
 HUD_PANEL      = (0.024, 0.070, 0.100, 0.78)
 HUD_PANEL_RED  = (0.090, 0.016, 0.030, 0.82)
 HUD_ENEMY      = (1.00, 0.39, 0.48, 1.0)   # 적 타겟 정보 (표면에서도 빨강 — "위협")
@@ -95,19 +93,18 @@ KB_DISC  = (0.008, 0.035, 0.047, 1.0)
 # 타겟/F 프롬프트/메시지)은 개별 scale 에 곱해 일괄 적용. 너무 크면 1.4, 작으면 1.8.
 HUD_SCALE = 1.6
 
-# 글리치 (HUD 가 일시적으로 빨강 진실 라벨로 깜빡이는 "지지직" 연출) ON/OFF.
-# False 면 _trigger_glitch 가 no-op → HUD 가 항상 시안 표면 상태로 고정.
+# 글리치(HUD 가 잠깐 빨강으로 깜빡이는 연출) ON/OFF. 현재 비활성.
 GLITCH_ENABLED = False
 
-# (표면 거짓 라벨, 진실 라벨) — 글리치 때 진실로 교체된다.
+# HUD 라벨 텍스트.
 GLITCH_LABELS = {
-    'system':    ('SENTINEL // 면역 프로토콜 v3.1', 'SENT!N3L // 숙주 확산 v3.1'),
-    'status':    ('\u25cf 시스템 정상 · 위협 감시 중', '\u25cf 감염체 활동 · 숙주 탐색 중'),
-    'kills_lbl': ('정화 완료', '감염시킴'),
-    'integ_lbl': ('코어 무결성', '바이러스 부하'),
-    'ammo_lbl':  ('정화 카트리지', '감염 페이로드'),
-    'zone_lbl':  ('정화 구역', '확산 범위'),
-    'interact':  ('[F] 정화 / 복원', '[F] 감염 / 동화시키기'),
+    'system':    ('SYSTEM // OPS v3.1', 'SYSTEM // OPS v3.1'),
+    'status':    ('\u25cf 시스템 정상', '\u25cf 시스템 정상'),
+    'kills_lbl': ('처치', '처치'),
+    'integ_lbl': ('체력', '체력'),
+    'ammo_lbl':  ('탄창', '탄창'),
+    'zone_lbl':  ('구역', '구역'),
+    'interact':  ('[F] 상호작용', '[F] 상호작용'),
 }
 
 
@@ -352,13 +349,13 @@ WEAPON_SWAP_UP_DUR   = 0.18   # 올리는 시간 (s)
 ZOMBIE_BAM = Filename.from_os_specific(
     str(SCRIPT_DIR / 'assets' / 'zombie' / 'scene.bam')
 )
-# 외부 Mixamo death 애니메이션 (Death From Front Headshot) — 좀비와 동일한
+# 외부 Mixamo death 애니메이션 (Death From Front Headshot) — 적와 동일한
 # mixamorig 스켈레톤이라 actor.loadAnims 로 바인딩 가능.
 ZOMBIE_DEATH_BAM = Filename.from_os_specific(
     str(SCRIPT_DIR / 'assets' / 'zombie' / 'death_headshot.bam')
 )
 
-UI_DIR = SCRIPT_DIR / 'assets' / 'ui'    # 정화 HUD PNG 자산 (시안 단색·4×·투명)
+UI_DIR = SCRIPT_DIR / 'assets' / 'ui'    # 처치 HUD PNG 자산 (시안 단색·4×·투명)
 
 
 def _ray_sphere(o, d, c, r):
@@ -430,7 +427,7 @@ def _ray_aabb(ox, oy, oz, dx, dy, dz, x0, x1, y0, y1, z0, z1):
 
 
 class Zombie:
-    """좀비 한 마리 — Actor + 상태머신(IDLE/CHASE/ATTACK) + 시야 기반 AI.
+    """적 한 마리 — Actor + 상태머신(IDLE/CHASE/ATTACK) + 시야 기반 AI.
 
     시야: 거리 < sight_range AND 좌우 시야각 ±sight_fov_half 안 → 본다.
     상태:
@@ -465,9 +462,9 @@ class Zombie:
     # head 50 → hp_max 100 이므로 헤드샷 2방에 사망. body/other 는 그대로.
     DAMAGE = {'head': 50, 'body': 10, 'other': 5}
 
-    # Distance LOD — 플레이어로부터 이 거리 너머의 좀비는 actor.hide() + AI/anim skip.
+    # Distance LOD — 플레이어로부터 이 거리 너머의 적는 actor.hide() + AI/anim skip.
     # 어차피 시야 25m 너머는 안 쫓아오고 벽 차폐로 시각도 막혀있어서 cost 0 으로 만들어도
-    # 게임 플레이에 영향 없음. 맵 길이 ~65m → 다른 방의 좀비는 거의 다 LOD'd.
+    # 게임 플레이에 영향 없음. 맵 길이 ~65m → 다른 방의 적는 거의 다 LOD'd.
     LOD_DISTANCE    = 28.0
     LOD_DIST_SQ     = LOD_DISTANCE * LOD_DISTANCE
 
@@ -533,7 +530,7 @@ class Zombie:
         self._anim_blend_t = 0.0
         self._play('Idle', loop=True)
 
-        # 발로란트식 빨간 테두리 — 적(좀비)이 눈에 잘 띄게.
+        # 발로란트식 빨간 테두리 — 적(적)이 눈에 잘 띄게.
         self.outline = game._attach_outline(self.actor)
 
         # HP / health bar
@@ -544,7 +541,7 @@ class Zombie:
         self.hp_bar_fade_dur = 1.5    # 그 뒤 fade out 시간
         self._build_hp_bar()
 
-        # Transform — F 키로 dead 좀비를 Y Bot 으로 페이드 전환.
+        # Transform — F 키로 dead 적를 Y Bot 으로 페이드 전환.
         # X Bot alpha 1→0 / Y Bot alpha 0→1 dual fade.
         # 둘 다 같은 self.pos / yaw + Death anim 의 마지막 프레임 pose → 위치/자세 일치.
         self.transformed = False
@@ -612,7 +609,7 @@ class Zombie:
             self.hitboxes = []
 
     def hit_test(self, render, cam_pos, ray_dir, max_t):
-        """ray(cam_pos, ray_dir 정규화) vs 이 좀비 본 히트박스들. max_t 보다 가까운
+        """ray(cam_pos, ray_dir 정규화) vs 이 적 본 히트박스들. max_t 보다 가까운
         최단 hit 의 (t, zone, world_pos) 반환, 없으면 None."""
         best = None
         for npa, npb, r, zone in self.hitboxes:
@@ -736,9 +733,9 @@ class Zombie:
                 self.actor.setControlEffect(self._anim_prev, t)
 
     def _build_hp_bar(self):
-        """좀비 머리 위 health bar — 평소 hidden, 데미지 시 show + fade out.
+        """적 머리 위 health bar — 평소 hidden, 데미지 시 show + fade out.
 
-        피벗(hp_bar)을 actor Z축 위(0,0,2)에 둔다 — heading 회전축 위라 좀비가
+        피벗(hp_bar)을 actor Z축 위(0,0,2)에 둔다 — heading 회전축 위라 적가
         어느 방향을 보든 월드 위치 불변. 피벗만 billboard(카메라 정면)로 돌리고,
         bg/fill 은 피벗의 로컬(=화면정렬) 프레임에 자식으로 붙여 좌측 정렬을 유지.
         (이전엔 fill 을 actor 로컬 -0.5 에 직접 놔서 heading 따라 초록이 어긋났음.)"""
@@ -804,7 +801,7 @@ class Zombie:
         to_p.normalize()
         if forward.dot(to_p) <= cos(radians(self.sight_fov_half)):
             return False
-        # 벽 차폐 — 좀비↔플레이어 직선상에 벽이 있으면 못 봄. 도어/케이지 갭은
+        # 벽 차폐 — 적↔플레이어 직선상에 벽이 있으면 못 봄. 도어/케이지 갭은
         # wall 박스가 없는 영역이라 자동 통과.
         return not self.game.level_collider.segment_blocked(
             self.pos.x, self.pos.y, player_pos.x, player_pos.y)
@@ -818,11 +815,11 @@ class Zombie:
         self.attack_t = self.actor.getDuration(attack)
         self.state = self.ATTACK
         # 공격 시작 순간 코어에 10 데미지 (한 번의 anim = 한 번의 타격).
-        # 피격 방향 표시용으로 이 좀비 위치도 전달.
+        # 피격 방향 표시용으로 이 적 위치도 전달.
         self.game.take_core_damage(10, self.pos)
 
     def start_transform(self, game):
-        """DEAD 좀비 → Y Bot 으로 dual fade. 같은 self.pos / yaw + Death 마지막
+        """DEAD 적 → Y Bot 으로 dual fade. 같은 self.pos / yaw + Death 마지막
         프레임 pose 라 위치 / 자세 정확히 일치."""
         if self.transformed or self.state != self.DEAD:
             return
@@ -844,7 +841,7 @@ class Zombie:
 
     def update(self, dt, player_pos):
         # Distance LOD — 멀면 actor 숨기고 모든 update 비용 0. 단, DYING (Death anim
-        # 진행 중) / Transform 페이드 중 좀비는 LOD 보류해서 끊김 없이 마무리.
+        # 진행 중) / Transform 페이드 중 적는 LOD 보류해서 끊김 없이 마무리.
         dx = player_pos.x - self.pos.x
         dy = player_pos.y - self.pos.y
         busy = (self.state == self.DYING or self.transform_t > 0
@@ -900,7 +897,7 @@ class Zombie:
         if self.state == self.DYING:
             # Death anim 재생 중 — 끝까지 기다린 후 DEAD 로
             self.death_t -= dt
-            # 발 접지 보정 페이드 — 시작엔 산 좀비와 같은 접지(낙하 0)를 유지하다,
+            # 발 접지 보정 페이드 — 시작엔 산 적와 같은 접지(낙하 0)를 유지하다,
             # settle 시간 동안 0 으로 줄여 죽음 모션 native 바닥 안착으로 부드럽게 넘김.
             if Zombie.GROUND_ZOMBIES and self._death_settle_t > 0.0:
                 self._death_settle_t -= dt
@@ -980,7 +977,7 @@ class Zombie:
                     direction = Vec3(to_p.x / dist, to_p.y / dist, 0)
                     self.pos.x += direction.x * self.move_speed * dt
                     self.pos.y += direction.y * self.move_speed * dt
-                    # 벽 충돌 해소 — 좁은 통로/기둥에서 좀비가 벽 뚫고 직진하지 않게.
+                    # 벽 충돌 해소 — 좁은 통로/기둥에서 적가 벽 뚫고 직진하지 않게.
                     nx, ny = self.game.level_collider.resolve(
                         self.pos.x, self.pos.y, ZOMBIE_RADIUS)
                     self.pos.x = nx
@@ -1011,9 +1008,8 @@ class Zombie:
 
 
 class Firewall:
-    """측면 방 입구 차단막. 쏴서 부수면 통로가 열리고 그 방 좀비(백신)가 스폰.
-    그 방을 전멸시키면 cleared -> 방 바닥이 병변색으로 번진다.
-    표면: 오염 잠금 해제/정화 / 진실: 격리벽 파괴/감염 확산."""
+    """측면 방 입구 차단막. 쏴서 부수면 통로가 열리고 그 방 적이 스폰.
+    그 방을 전멸시키면 cleared -> 방 바닥 색이 번진다."""
     HP_MAX      = 120
     SHOT_DAMAGE = 30
     TINT_DUR    = 1.5
@@ -1113,8 +1109,8 @@ class Firewall:
 
 class Gate:
     """복도를 가로막는 전진 게이트. 해당 구역(zone) 양옆 방이 다 cleared 되기
-    전엔 잠겨서 부술 수 없다(쏘면 면역색이 튕겨냄). 다 cleared 되면 약해져
-    돌파 가능 -> 부수면 전진. final_spawns 가 있으면 부순 순간 그 방 좀비를
+    전엔 잠겨서 부술 수 없다(쏘면 잠금색이 튕겨냄). 다 cleared 되면 약해져
+    돌파 가능 -> 부수면 전진. final_spawns 가 있으면 부순 순간 그 방 적을
     스폰(마지막 방 = 리빌)."""
     HP_MAX      = 160
     SHOT_DAMAGE = 30
@@ -1162,7 +1158,7 @@ class Gate:
         if not self.unlocked:
             self._flash_t = 0.10
             self.node.setColorScale(2.6, 2.6, 2.6, 1.0)
-            self.game._show_gate_msg('차단막 강화됨 — 양옆 방을 먼저 정화하라')
+            self.game._show_gate_msg('차단막 강화됨 — 양옆 방을 먼저 처치하라')
             return
         self.hp = max(0, self.hp - self.SHOT_DAMAGE)
         self._flash_t = 0.07
@@ -1187,7 +1183,7 @@ class Gate:
                 self._tint_target = self.room_stain
                 self._tint_t = self.TINT_DUR
             self.game._show_gate_msg('구역 동화 진행 — ASSIMILATING ZONE',
-                                     2.4, reveal=True)   # 진실 누출
+                                     2.4, reveal=True)   # 강조
         print('[gate] breached', flush=True)
 
     def update(self, dt):
@@ -1464,7 +1460,7 @@ class ZombieGame(ShowBase):
         self._swatch_hl = None            # 메뉴 색 스와치 선택 하이라이트 프레임
 
         # ── 온라인(1:1 멀티) 모드 플래그 + 네트워크 상태 ────────────────────
-        # online=True ('--online') 일 때만 소켓 접속 + 상대 아바타 + 좀비/웨이브
+        # online=True ('--online') 일 때만 소켓 접속 + 상대 아바타 + 적/웨이브
         # 정지 + 튜닝키 차단. 싱글(False)은 아래 변수들을 일절 안 쓰므로 동작 동일.
         self.online_mode = online
         # 축구 모드 — 총알로 공을 차서 골대에 넣는 1:1 멀티(킬은 5초 부활, 먼저 5골 승리).
@@ -1551,7 +1547,7 @@ class ZombieGame(ShowBase):
         self._r_sfx_reload = None
         self._r_sfx_foot = []
         self._r_last_foot_i = -1
-        # 상대 플레이어 히트박스 — 좀비와 동일한 본 기반 (캡슐/머리 구). 사격 ray 로 검사.
+        # 상대 플레이어 히트박스 — 적와 동일한 본 기반 (캡슐/머리 구). 사격 ray 로 검사.
         self._remote_hitboxes = []        # [(npa, npb, r, zone), ...]
         # PvP 체력 — 내가 상대에게 입힌 누적 피해(송신) / 상대가 나에게 입힌 누적값(수신).
         self._dmg_dealt = 0               # 내가 상대에 입힌 총 피해(패킷에 실어 보냄)
@@ -1642,7 +1638,7 @@ class ZombieGame(ShowBase):
 
         # ── 시작 화면 ───────────────────────────────────────────────────────
         # 타이틀 + 싱글/멀티/종료 메뉴. 월드 빌드(_build_world)는 메뉴 선택 이후로
-        # 미룬다 — online_mode 가 레벨(아레나 vs 캠페인)·좀비·네트워크를 좌우하므로
+        # 미룬다 — online_mode 가 레벨(아레나 vs 캠페인)·적·네트워크를 좌우하므로
         # 모드가 정해지기 전엔 만들 수 없다. _use_menu=False 면 바로 빌드.
         self._game_started = False
         self._menu_root = None
@@ -1664,11 +1660,11 @@ class ZombieGame(ShowBase):
         self._make_lights()
         # GPU 스키닝 보장 — 상단 PRC 두 플래그는 fixed-function 경로라 요즘 드라이버에선
         # 무시되고 조용히 CPU 스키닝으로 폴백하는 경우가 흔함. auto-shader 가 진짜 HW
-        # 스키닝 셰이더를 생성해줘서 좀비 다수 시 vertex 변환이 GPU 로 옮겨감.
+        # 스키닝 셰이더를 생성해줘서 적 다수 시 vertex 변환이 GPU 로 옮겨감.
         # 부작용: 라이팅 모델 살짝 바뀜 — 톤이 어색하면 dl color/ambient 보정.
         self.render.setShaderAuto()
         self._make_ground()
-        # level.py 가 render 아래에 방·벽·기둥을 만들고 collider + 좀비 spawn 좌표 반환.
+        # level.py 가 render 아래에 방·벽·기둥을 만들고 collider + 적 spawn 좌표 반환.
         # 키트 .bam 이 있으면 단색 벽 카드를 끄고(z-fighting 방지) kit_map 메쉬로 대체.
         import os
         kit_available = USE_KIT_MAP and os.path.isfile("assets/kit/Wall_1.bam")
@@ -1692,7 +1688,7 @@ class ZombieGame(ShowBase):
             self._arena_data = self.level_data
             kit_available = False
         elif self.online_mode or self.ai_mode:
-            # 1대1 PvP(온라인) / AI 대결 — 좀비 캠페인 레벨 대신 대칭 아레나.
+            # 1대1 PvP(온라인) / AI 대결 — 적 캠페인 레벨 대신 대칭 아레나.
             self.level_collider, self.level_data = build_arena(
                 self.render, draw_wall_cards=True)
             self._arena_data = self.level_data
@@ -1750,7 +1746,7 @@ class ZombieGame(ShowBase):
         self.player_vz = 0.0
         self.on_ground = True
         self.head_height = 1.65
-        self.move_speed = 4.0   # 좀비 추격 속도와 동일 (Zombie.move_speed)
+        self.move_speed = 4.0   # 적 추격 속도와 동일 (Zombie.move_speed)
         # 무기별 이동속도 배율 — 권총은 가벼워 빠름(소총 대비 1.3배). _equip_weapon 갱신.
         self._weapon_speed_mult = 1.0
         # (감도/오디오/릴레이 상태는 __init__ 에서 이미 초기화 — 여기서 덮지 않음)
@@ -1980,11 +1976,11 @@ class ZombieGame(ShowBase):
         self.win.movePointer(0, self._win_cx, self._win_cy)
         self._first_frame = True
 
-        # ── HUD (임상 안티바이러스 톤 + 글리치 진실 누출) ──────────────────
-        self._interact_target = None    # 현재 가까이 있는 dead 좀비
+        # ── HUD ──────────────────────────────────────────────────────────
+        self._interact_target = None    # 현재 가까이 있는 dead 적
         self.interact_range = 2.5       # m
         self._gate_msg_token = 0
-        # 플레이어 코어 무결성 ("체력"). 아직 좀비 공격이 데미지를 안 주지만
+        # 플레이어 코어 무결성 ("체력"). 아직 적 공격이 데미지를 안 주지만
         # HUD 요소로 노출 — take_core_damage() 로 깎으면 자동 반영된다.
         self.core_integrity = 100
         self.core_integrity_max = 100
@@ -1992,8 +1988,8 @@ class ZombieGame(ShowBase):
         self._dmg_arc_geom = None
         self._dmg_dir_t = 0.0
         self._dmg_dir_dur = 1.1         # 아크 표시 후 fade 지속(초)
-        self.purified = 0               # "정화 완료" = 사실은 감염시킨 수
-        # 글리치 상태: _glitch_t > 0 이면 진실 라벨/빨강으로 표시.
+        self.purified = 0               # 처치 카운터
+        # 글리치 상태: _glitch_t > 0 이면 빨강으로 표시.
         self._glitch_t = 0.0
         self._glitch_cooldown = random.uniform(6.0, 11.0)
         # 탄창 (HUD 도트 개수 계산에 ammo_max 가 필요 → _build_hud 전에 정의)
@@ -2147,15 +2143,15 @@ class ZombieGame(ShowBase):
                 self._body_meshes.append(np)
         self._set_body_visible(False)
 
-        # 좀비 spawn + 방화벽/게이트 + damage popup 텍스트 풀
+        # 적 spawn + 방화벽/게이트 + damage popup 텍스트 풀
         self.zombies = []
         self.firewalls = []
         self.gates = []
         self._damage_numbers = []     # [{np, t, dur}, ...] — _update 가 animate
         self._spawn_zombies()
-        # 온라인: 좀비/웨이브 완전 정지 — _spawn_points 만 비우면 _update 의 웨이브
+        # 온라인: 적/웨이브 완전 정지 — _spawn_points 만 비우면 _update 의 웨이브
         # 매니저('if self._spawn_points:')가 통째로 안 돌아 스폰/인터미션/WAVE
-        # 메시지가 전부 멈춘다. (다른 데 if 흩뿌리지 않는다.) 좀비 목록도 비움.
+        # 메시지가 전부 멈춘다. (다른 데 if 흩뿌리지 않는다.) 적 목록도 비움.
         if self.online_mode or self.ai_mode or self.jump_mode or self.paint_mode:
             self._spawn_points = []
             self.zombies = []
@@ -2865,7 +2861,7 @@ class ZombieGame(ShowBase):
 
     def _spawn_zombies(self):
         # 웨이브 모드 — 방화벽/게이트 진행 대신, 맵의 스폰 지점들에 매 웨이브
-        # 좀비를 점점 더 많이 풀어놓는다. 다 처치하면 인터미션 후 다음 웨이브.
+        # 적를 점점 더 많이 풀어놓는다. 다 처치하면 인터미션 후 다음 웨이브.
         pts = []
         for room in self.level_data['rooms']:
             pts.extend(room['spawns'])
@@ -2877,7 +2873,7 @@ class ZombieGame(ShowBase):
         # 웨이브 상태
         self.wave = 0
         self.wave_active = False
-        self.wave_base = 4              # 웨이브1 좀비 수
+        self.wave_base = 4              # 웨이브1 적 수
         self.wave_growth = 2            # 웨이브마다 +N
         self.intermission_dur = 4.0     # 웨이브 사이 대기(초)
         self._intermission_t = 3.0      # 첫 웨이브까지 대기
@@ -2888,7 +2884,7 @@ class ZombieGame(ShowBase):
         print(f'[wave] {len(self._spawn_points)} 스폰 지점 준비', flush=True)
 
     def _spawn_wave(self, n):
-        """웨이브 n 의 좀비를 스폰 지점에 분산 배치."""
+        """웨이브 n 의 적를 스폰 지점에 분산 배치."""
         if not self._spawn_points:
             return
         self._clear_corpses()
@@ -2900,11 +2896,11 @@ class ZombieGame(ShowBase):
             self.zombies.append(Zombie(self, Vec3(x, y, 0), 180))
         self.wave_active = True
         self._show_gate_msg(f'WAVE {n}', dur=2.0)
-        print(f'[wave] {n}: 좀비 {count} 스폰', flush=True)
+        print(f'[wave] {n}: 적 {count} 스폰', flush=True)
 
     def _clear_corpses(self):
-        """완전히 죽은(DEAD) 좀비 노드를 정리해 누적 부하를 막는다.
-        변환(아군)·사망 연출/페이드 중인 좀비는 유지."""
+        """완전히 죽은(DEAD) 적 노드를 정리해 누적 부하를 막는다.
+        사망 연출/페이드 중인 적은 유지."""
         keep = []
         for z in self.zombies:
             if (z.state == Zombie.DEAD and not z.transformed
@@ -2919,8 +2915,7 @@ class ZombieGame(ShowBase):
     def _show_gate_msg(self, text, dur=1.6, reveal=False):
         # 미니멀 HUD — 중앙 웨이브/게이트 메시지 제거 (표시 안 함).
         return
-        # reveal=True → 진실 누출 톤(빨강) + 짧은 글리치 동반. 게이트 돌파처럼
-        # 확산이 한 단계 진행되는 순간에 쓴다 ('ASSIMILATING ZONE' 등).
+        # reveal=True → 강조 톤(빨강) + 짧은 글리치. 게이트 돌파 같은 순간에 쓴다.
         self.gate_msg.setText(text)
         self.gate_msg.setFg(HUD_RED if reveal else HUD_CYAN)
         self.gate_msg.show()
@@ -3173,14 +3168,14 @@ class ZombieGame(ShowBase):
                 self._swap_state = 'idle'
 
     def _on_interact(self):
-        # F 키 — 가까이 있는 dead 좀비 가 있으면 Y Bot 으로 transform 시작.
-        # 표면 라벨은 "정화/복원", 실제로는 한 개체를 더 감염(동화)시키는 행위.
+        # F 키 — 가까이 있는 dead 적 가 있으면 Y Bot 으로 transform 시작.
+        # F 상호작용 (현재 비활성 — 적은 죽으면 사라짐).
         if self.paused or self._interact_target is None:
             return
         self._interact_target.start_transform(self)
         self._interact_target = None
         self.interact_frame.hide()
-        self.purified += 1          # "정화 완료" 카운터 (= 감염시킨 수)
+        self.purified += 1          # 처치 카운터
 
     # --- weapon tuning harness (조정 끝나면 통째로 제거) -------------------
     # 현재 장착 무기(self.weapon 노드)의 local POS/HPR 을 실시간으로 미세조정.
@@ -3480,7 +3475,7 @@ class ZombieGame(ShowBase):
         return yaw_off * ads_mult, pitch_off * ads_mult
 
     def _resolve_shot_hit(self):
-        """카메라 ray vs 각 좀비의 본 기반 히트박스(머리 구 + 몸통/사지 캡슐).
+        """카메라 ray vs 각 적의 본 기반 히트박스(머리 구 + 몸통/사지 캡슐).
         가장 가까운 hit 의 zone 으로 damage + damage number popup."""
         cam_pos = self.camera.getPos(self.render)
         # 탄 퍼짐 편차(deg)를 조준 방향에 더함 → 발로란트식 스프레이.
@@ -3502,7 +3497,7 @@ class ZombieGame(ShowBase):
             best_t, best_zone, best_hit_pos = res
             best_z = z
 
-        # 방화벽 / 게이트 — 좀비보다 앞에 있으면 그걸 맞힘 (좀비 무효화).
+        # 방화벽 / 게이트 — 적보다 앞에 있으면 그걸 맞힘 (적 무효화).
         best_barrier = None
         for b in self.firewalls + self.gates:
             s = b.ray_distance(cam_pos, ray_dir)
@@ -3512,8 +3507,8 @@ class ZombieGame(ShowBase):
             best_barrier = b
             best_z = None
 
-        # 상대 플레이어(온라인) — 좀비/방화벽과 같은 ray 로 히트박스 검사.
-        # best_t 보다 더 가까우면 상대를 맞힌 것 → 좀비/방화벽 판정 무효.
+        # 상대 플레이어(온라인) — 적/방화벽과 같은 ray 로 히트박스 검사.
+        # best_t 보다 더 가까우면 상대를 맞힌 것 → 적/방화벽 판정 무효.
         remote_hit_pos = None
         if self.online_mode or self.ai_mode:
             res = self._remote_hit_test(cam_pos, ray_dir, best_t)
@@ -3524,7 +3519,7 @@ class ZombieGame(ShowBase):
                 best_z = None
                 best_barrier = None
 
-        # 축구 공 — 좀비/상대/벽보다 가까우면 공을 맞힌 것(차기). best_t 와 비교.
+        # 축구 공 — 적/상대/벽보다 가까우면 공을 맞힌 것(차기). best_t 와 비교.
         if self.soccer_mode and self._ball is not None:
             res = self._ball.ray_hit(cam_pos, ray_dir)
             if res is not None and res[0] < best_t and not self._bullet_blocked(
@@ -3650,7 +3645,7 @@ class ZombieGame(ShowBase):
         self.sfx_foot[i].play()
 
     def _on_zombie_killed(self, zone):
-        """좀비 처치 시 호출 — 킬 카운트 + 콤보 단계 갱신 + 킬 사운드.
+        """적 처치 시 호출 — 킬 카운트 + 콤보 단계 갱신 + 킬 사운드.
         zone: 마지막에 맞혀 죽인 부위('head'/'body'/'other'). 콤보 판정에 사용."""
         headshot = (zone == 'head')
         self.kills += 1
@@ -3742,7 +3737,7 @@ class ZombieGame(ShowBase):
             self._play_pool(self.sfx_m16_pool, '_sfx_m16_i')
         else:
             self._play_pool(self.sfx_shot_pool, '_sfx_shot_i')
-        # 히트 판정 — 카메라 위치에서 yaw+pitch 방향으로 ray, 각 좀비의 3 zone
+        # 히트 판정 — 카메라 위치에서 yaw+pitch 방향으로 ray, 각 적의 3 zone
         # (head/body/foot) sphere 와 교차 검사. 가장 가까운 zone 에 damage.
         self._resolve_shot_hit()
         # 권총 등은 hands 만 Shoot 단발 자세로. 소총은 그 포즈(권총 파지)가 어색해서
@@ -3992,7 +3987,7 @@ class ZombieGame(ShowBase):
         return Task.cont
 
     def take_core_damage(self, amount, source_pos=None):
-        """좀비 공격 → 코어 무결성(체력) 깎기. 0 이 되면 게임오버 훅(현재 미구현).
+        """적 공격 → 코어 무결성(체력) 깎기. 0 이 되면 게임오버 훅(현재 미구현).
         source_pos 주어지면 그 방향으로 피격 방향 아크 표시."""
         old_hp = self.core_integrity
         self.core_integrity = max(0, self.core_integrity - amount)
@@ -4860,7 +4855,7 @@ class ZombieGame(ShowBase):
         if changed:
             self._relayout_killfeed()
 
-    # --- HUD (임상 안티바이러스 톤 + 글리치) ---------------------------------
+    # --- HUD -----------------------------------------------------------------
 
     def _hud_img(self, name, pos, scale, parent, hidden=False):
         """UI_DIR/{name} PNG 을 OnscreenImage 로 띄우고 _hud_images 에 등록.
@@ -4879,8 +4874,8 @@ class ZombieGame(ShowBase):
         return img
 
     def _build_hud(self):
-        """플레이어를 '백신 AI' 로 믿게 만드는 표면 HUD. 글리치 때 진실로 반전.
-        외형은 정화 HUD PNG (assets/ui/) 로 그리고, 그 위에 텍스트·동적 채움을 얹음."""
+        """플레이어 상태 표시 HUD. 외형은 HUD PNG (assets/ui/) 로 그리고,
+        그 위에 텍스트·동적 채움을 얹음."""
         # 코너 기준 HUD 는 코너마다 스케일 컨테이너를 하나 끼워 거기에 HUD_SCALE 를
         # 건다. 개별 요소의 pos/scale 은 그대로 두고도 정렬 보존된 채 비례 확대된다.
         self._tac_fonts()       # 택티컬 콘덴스드 폰트 먼저 로드(이하 전부 사용)
@@ -4905,7 +4900,7 @@ class ZombieGame(ShowBase):
             text=s['status'][0], pos=(0.125, -0.165), scale=0.026,
             fg=HUD_CYAN_DIM, align=TextNode.ALeft, mayChange=True, parent=L)
 
-        # 우상단 — "정화 완료" 카운터 + 구역 확보율 (텍스트만)
+        # 우상단 — "처치 완료" 카운터 + 구역 확보율 (텍스트만)
         self.hud_kills_lbl = OnscreenText(
             text=s['kills_lbl'][0], pos=(-0.05, -0.10), scale=0.040,
             fg=HUD_CYAN_DIM, align=TextNode.ARight, mayChange=True, parent=R)
@@ -5072,7 +5067,7 @@ class ZombieGame(ShowBase):
             parent=self.a2dBottomLeft, font=getattr(self, '_tac_display_font', None))
         self.php_num.setBin('fixed', 22)
 
-        # 우하단 — 탄약 카운터. 라벨("정화 카트리지")·카트리지 아이콘 UI 제거하고
+        # 우하단 — 탄약 카운터. 라벨("처치 카트리지")·카트리지 아이콘 UI 제거하고
         # "현재/최대" 숫자(예: 3/8, 7/25)만 표시. 재장전 중엔 위에 "reloading...".
         # 탄약 택티컬 플레이트 — 다크 노치 패널 + 우측 레드 바 + 라인 (메뉴 디자인 톤)
         self._ammo_plate = BR.attachNewNode('ammo_plate')
@@ -5169,7 +5164,7 @@ class ZombieGame(ShowBase):
         BL.hide()
 
     def _set_glitch(self, on):
-        """on=True → 진실 라벨/빨강, False → 표면 라벨/시안. HUD 전반에 적용.
+        """on=True → 빨강 강조, False → 기본 시안. HUD 전반에 적용.
         모든 시안 PNG 는 _hud_images 일괄 setColorScale 로 빨강 틴트 처리 (PNG 교체 없음)."""
         cyan_set = (self.hud_kills_num, self.hud_integ_num, self.hud_zone,
                     self.interact_text, self.interact_f)
@@ -5194,7 +5189,7 @@ class ZombieGame(ShowBase):
         self.hitmarker.setColorScale(*tint)
 
     def _trigger_glitch(self, dur=0.18):
-        """진실 누출 한 번. 확산이 진행될수록 자주 불리도록 update 에서 호출.
+        """글리치 한 번. 웨이브가 올라갈수록 자주 불리도록 update 에서 호출.
         GLITCH_ENABLED=False 면 no-op — HUD 가 시안 표면 상태에 머문다."""
         if not GLITCH_ENABLED:
             return
@@ -5287,13 +5282,13 @@ class ZombieGame(ShowBase):
         # 정면 적 타겟 정보
         self._update_enemy_target()
 
-        # 글리치 타이머 — 확산이 진행될수록 자주 터진다
+        # 글리치 타이머 — 라운드가 올라갈수록 자주 터진다
         if self._glitch_t > 0:
             self._glitch_t -= dt
             if self._glitch_t <= 0:
                 self._set_glitch(False)
         else:
-            # 웨이브가 올라갈수록 글리치가 잦아지게 (확산률 대용).
+            # 웨이브가 올라갈수록 글리치가 잦아지게.
             spread = min(1.0, max(0, self.wave - 1) / 12.0)
             self._glitch_cooldown -= dt
             if self._glitch_cooldown <= 0:
@@ -5344,11 +5339,11 @@ class ZombieGame(ShowBase):
         hp_max = getattr(z, 'hp_max', 100) or 100
         infect = int(round(max(0.0, z.hp / hp_max) * 100))
         if self._glitch_t > 0:
-            self.enemy_target_l1.setText(f'정상 개체 · #K-{i:02d} · 동족')
-            self.enemy_target_l2.setText(f'온전함 {infect}% — 아직 안 감염됨')
+            self.enemy_target_l1.setText(f'대상 · #K-{i:02d}')
+            self.enemy_target_l2.setText(f'체력 {infect}%')
         else:
-            self.enemy_target_l1.setText(f'감염 개체 식별 · #K-{i:02d}')
-            self.enemy_target_l2.setText(f'감염도 {infect}%')
+            self.enemy_target_l1.setText(f'대상 식별 · #K-{i:02d}')
+            self.enemy_target_l2.setText(f'체력 {infect}%')
         self.enemy_target.show()
 
     def _toggle_fullscreen(self):
@@ -6447,7 +6442,7 @@ class ZombieGame(ShowBase):
         av.setH(180)                  # self.ybot 과 동일한 +180 기준
         # 사망 애니 — 플레이어 모델(Y Bot)의 네이티브 'Death' 사용. 외부 death_headshot.bam
         # 을 loadAnims 하면 Mixamo cm 스케일 보정이 안 맞아 몸이 거대해지므로 안 씀.
-        # (좀비가 최종적으로 눕는 포즈도 Y Bot 'Death' 라 결과적으로 동일.)
+        # (적가 최종적으로 눕는 포즈도 Y Bot 'Death' 라 결과적으로 동일.)
         self._remote_death_anim = 'Death' if 'Death' in self.anim_names else None
         idle = 'Idle' if 'Idle' in self.anim_names else (
             self.anim_names[0] if self.anim_names else None)
@@ -6484,7 +6479,7 @@ class ZombieGame(ShowBase):
                                         self._load_sfx('f2.mp3'),
                                         self._load_sfx('f3.mp3')) if s is not None]
 
-        # 상대 플레이어 히트박스 — 좀비와 동일한 본 기반 캡슐/머리 구를 av 본으로 구성.
+        # 상대 플레이어 히트박스 — 적와 동일한 본 기반 캡슐/머리 구를 av 본으로 구성.
         self._remote_hitboxes = self._build_remote_hitboxes(av)
 
         # 상대 총알 궤적(트레이서) — 로컬 self.tracer 와 동일한 모양의 월드 노드 1개.
@@ -6831,7 +6826,7 @@ class ZombieGame(ShowBase):
         return False
 
     def _on_remote_player_hit(self, zone, world_pos):
-        """상대 플레이어 명중 — 좀비와 같은 피드백(피격음 + 파티클 + 데미지 숫자).
+        """상대 플레이어 명중 — 적와 같은 피드백(피격음 + 파티클 + 데미지 숫자).
         동기화 전용 1:1 모드라 HP/사망/점수는 없고 '맞았다' 피드백만 준다."""
         dmg = Zombie.DAMAGE.get(zone, 5)
         if zone == 'head' and getattr(self, '_head_onekill', False):
@@ -6925,7 +6920,7 @@ class ZombieGame(ShowBase):
         old_hp = self.core_integrity
         self.core_integrity = max(0, self.core_integrity - amount)
         self._show_dmg_flash(old_hp, self.core_integrity)   # 체력바 닳은 구간 플래시
-        # 피격 방향 — 상대 아바타 위치를 source 로 빨간 아크 표시(좀비 피격과 동일).
+        # 피격 방향 — 상대 아바타 위치를 source 로 빨간 아크 표시(적 피격과 동일).
         if self._remote_smooth is not None:
             self._show_damage_dir(self._remote_smooth)
         print(f'[pvp] 피격 -{amount} → 체력 {self.core_integrity}', flush=True)
@@ -7141,7 +7136,7 @@ class ZombieGame(ShowBase):
         return Task.done
 
     def _return_to_main_menu(self):
-        # 게임 월드(좀비/네트워크/HUD/액터…)를 안전히 되감는 대신, 프로세스를 새로
+        # 게임 월드(적/네트워크/HUD/액터…)를 안전히 되감는 대신, 프로세스를 새로
         # 띄워 깨끗한 상태의 시작 메뉴로 복귀한다(모드 인자 없이 실행 → 항상 메뉴).
         # 네트워크 소켓을 먼저 닫고, 새 프로세스는 현재 env(PYTHONUTF8 등)를 상속.
         import os
@@ -7221,9 +7216,9 @@ class ZombieGame(ShowBase):
         self._dropped_weapons = []
 
     def _make_death_corpse(self, pos, h):
-        """현재 좀비가 죽을 때와 '똑같이' — 좀비 모델(X Bot) + DeathHeadshot 을 1.5배속
+        """현재 적이 죽을 때와 '똑같이' — 적 모델(X Bot) + DeathHeadshot 을 1.5배속
         으로 재생하는 시체 Actor 생성. (DeathHeadshot 은 X Bot 본에서만 정상 스케일이라
-        플레이어 Y Bot 대신 좀비 모델로 시체를 만든다.) NodePath 반환."""
+        플레이어 Y Bot 대신 적 모델로 시체를 만든다.) NodePath 반환."""
         c = Actor(ZOMBIE_BAM)
         c.reparentTo(self.render)
         c.setPos(pos)
@@ -7238,7 +7233,7 @@ class ZombieGame(ShowBase):
         return c
 
     def _enter_deathcam(self, victim):
-        """사망 처리 3초 유예. victim=True(죽은 사람): 시점 고정 + 내 시체(현재 좀비와
+        """사망 처리 3초 유예. victim=True(죽은 사람): 시점 고정 + 내 시체(현재 적와
         동일한 DeathHeadshot)를 머리 위 3인칭으로 본다. victim=False(죽인 사람): 3초
         자유 이동, 상대(죽은 자)는 시체로 쓰러짐. 3초 뒤 _exit_deathcam + 라운드 리셋."""
         if self._match_over:
@@ -7248,7 +7243,7 @@ class ZombieGame(ShowBase):
         if victim:
             self._dead = True
             self._death_yaw = self.player_yaw
-            # 1인칭 팔/총 숨기고, 그 자리에 좀비식 death 시체 생성(데스캠으로 봄).
+            # 1인칭 팔/총 숨기고, 그 자리에 적과 같은 death 시체 생성(데스캠으로 봄).
             self.ybot.hide()
             self.weapon_anchor.hide()
             self._corpse = self._make_death_corpse(self.player_pos,
@@ -7258,7 +7253,7 @@ class ZombieGame(ShowBase):
                               self.weapon_name or 'rifle')
             print('[pvp] 사망 — 3초 데스캠', flush=True)
         else:
-            # 죽은 상대 — Y Bot 아바타 숨기고 그 자리에 좀비식 death 시체로 대체.
+            # 죽은 상대 — Y Bot 아바타 숨기고 그 자리에 적과 같은 death 시체로 대체.
             av = self.remote_avatar
             if av is not None:
                 self._corpse = self._make_death_corpse(av.getPos(self.render),
@@ -7639,7 +7634,7 @@ class ZombieGame(ShowBase):
         if self.paused:
             return Task.cont
         dt = ClockObject.getGlobalClock().getDt()
-        # pause 직후 첫 프레임 wall-clock 누적 dt 폭발 cap — 좀비 워프 방지.
+        # pause 직후 첫 프레임 wall-clock 누적 dt 폭발 cap — 적 워프 방지.
         if dt > 0.1:
             dt = 0.1
         # ── 슬로우모션 ─────────────────────────────────────────────────────
@@ -7976,7 +7971,7 @@ class ZombieGame(ShowBase):
             self.weapon_anchor.setPos(self.right_hand_joint.getPos(self.render))
             self.weapon_anchor.setHpr(self.right_hand_joint.getHpr(self.render))
 
-        # 좀비 AI tick — 페이드아웃 끝난 시체는 노드 정리 후 목록에서 제거.
+        # 적 AI tick — 페이드아웃 끝난 시체는 노드 정리 후 목록에서 제거.
         for z in self.zombies:
             z.update(dt, self.player_pos)
         if any(z.remove_me for z in self.zombies):
@@ -8010,7 +8005,7 @@ class ZombieGame(ShowBase):
         # 하단 콤보 게이지 갱신 (남은 시간 → 왼쪽으로 슬라이드 소진)
         self._update_combo_bar()
 
-        # (F 정화/복원 상호작용 제거 — 좀비는 죽으면 페이드아웃되어 사라짐)
+        # (F 처치/복원 상호작용 제거 — 적는 죽으면 페이드아웃되어 사라짐)
 
         # 피격 fire 파티클 — 살짝 커지며 fade out 후 제거
         for p in self._hit_particles[:]:

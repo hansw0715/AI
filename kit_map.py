@@ -157,7 +157,7 @@ def build_kit_visuals(render, collider, loader=None):
             inst.setH(yaw)                      # yaw 는 Z축 회전 → 바닥 높이 불변
             inst.setPos(x, y, z - lo.z * s)     # 발을 바닥에 정렬(+z 만큼 쌓기)
 
-        # ── 시작 케이지(격리체 보관함) = Pod. 표면: 갇혔던 정상 AI / 진실: 격리된 바이러스.
+        # ── 시작 케이지 = Pod (시각용 메쉬).
         place("Props_Pod", 0.0, 0.0)
 
         # ── W1 (좌1) — 보급 창고: 선반 + 크레이트 + 컨테이너  (벽: x=-19) ───────
