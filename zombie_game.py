@@ -2553,7 +2553,7 @@ class ZombieGame(ShowBase):
         OnscreenText(text='ENEMY OUTLINE', pos=(lx, -0.32), scale=0.026,
                      fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
                      parent=scr, font=self._tac_label_font)
-        self._build_outline_swatches(scr, -0.42, sw=0.10, cx=lx + 0.05, left=True)
+        self._build_outline_swatches(scr, -0.42, sw=0.115, cx=lx + 0.05, left=True)
         # ── 우측: CONTROLS 표 ──
         self._tac_panel_head(scr, 'CONTROLS', colR, rx, 0.36)
         controls = [('W / S', 'MOVE'), ('A / D', 'STRAFE'), ('SPACE', 'JUMP'),
@@ -4308,13 +4308,14 @@ class ZombieGame(ShowBase):
                 frameColor=col, relief=DGG.FLAT, frameSize=(-1.1, 1.1, -1.1, 1.1),
                 command=self._set_outline_color, extraArgs=[col])
 
+            # 호버 스케일 — pause 메뉴는 일시정지 중 글로벌 클럭이 멈춰 direct.interval
+            # 이 안 도므로(LerpScaleInterval 무효), 실시간 태스크로 구동해 settings·pause
+            # 양쪽에서 동일하게 동작하게 한다.
             def _en(_=None, bb=b):
-                LerpScaleInterval(bb, 0.10, Vec3(0.050, 0.050, 0.050),
-                                  blendType='easeOut').start()
+                self._anim_swatch(bb, 0.050)
 
             def _ex(_=None, bb=b):
-                LerpScaleInterval(bb, 0.10, Vec3(0.042, 0.042, 0.042),
-                                  blendType='easeOut').start()
+                self._anim_swatch(bb, 0.042)
 
             b.bind(DGG.WITHIN, _en)
             b.bind(DGG.WITHOUT, _ex)
@@ -4325,6 +4326,31 @@ class ZombieGame(ShowBase):
         _tac_outline(self._swatch_hl, -m, m, z - m, z + m, TAC_TEXT_1, thickness=2.2)
         self._swatch_hl.setTransparency(1)
         self._refresh_outline_swatches()
+
+    def _anim_swatch(self, bb, target, dur=0.10):
+        """스와치 호버 스케일 애니 — 일시정지(글로벌 클럭 정지) 중에도 동작하도록
+        direct.interval 대신 실시간(time.time) 태스크로 구동. settings/pause 공통."""
+        name = 'swhover_%d' % id(bb)
+        self.taskMgr.remove(name)
+        try:
+            start = bb.getScale()[0]
+        except Exception:
+            start = target
+        if abs(start - target) < 1e-4:
+            bb.setScale(target)
+            return
+        t0 = time.time()
+
+        def _step(task, bb=bb, start=start, target=target, t0=t0, dur=dur):
+            if bb.isEmpty():
+                return Task.done
+            el = time.time() - t0
+            f = min(1.0, el / dur)
+            e = 1.0 - (1.0 - f) ** 2          # easeOut
+            bb.setScale(start + (target - start) * e)
+            return Task.done if f >= 1.0 else Task.cont
+
+        self.taskMgr.add(_step, name)
 
     # ── 디자인 키트 컴포넌트 (Settings/Lobby 화면 공통) ───────────────────────
     def _tac_panel_head(self, parent, text, lx, rx, z, right=None):
@@ -4829,6 +4855,26 @@ class ZombieGame(ShowBase):
         np.setLightOff()
         return np
 
+    @staticmethod
+    def _cb_ease(t, x1, y1, x2, y2):
+        """CSS cubic-bezier(x1,y1,x2,y2) — 시간비 t(0..1)에 대한 진행값을 반환.
+        Bx(u)=t 를 Newton 으로 풀어 u 를 구한 뒤 By(u). 버스트 이징을 HTML 과 일치."""
+        if t <= 0.0:
+            return 0.0
+        if t >= 1.0:
+            return 1.0
+        u = t
+        for _ in range(8):
+            mu = 1.0 - u
+            x = 3.0 * mu * mu * u * x1 + 3.0 * mu * u * u * x2 + u * u * u
+            dx = (3.0 * mu * mu * x1 + 6.0 * mu * u * (x2 - x1)
+                  + 3.0 * u * u * (1.0 - x2))
+            if abs(dx) < 1e-6:
+                break
+            u = min(1.0, max(0.0, u - (x - t) / dx))
+        mu = 1.0 - u
+        return 3.0 * mu * mu * u * y1 + 3.0 * mu * u * u * y2 + u * u * u
+
     def _build_kill_banner(self):
         """처치 알림 위젯을 한 번만 생성하고 평소엔 hide. 색은 흰색 고정.
         HTML(kill_banner_motion.html): 정적 타겟팅 프레임 + 회전 레티클 2겹 + 원반
@@ -4912,7 +4958,7 @@ class ZombieGame(ShowBase):
         self.kb_burst.setBin('fixed', 63)
         self._kb_dots = []
         for _ in range(28):
-            d = self._make_filled_circle(1.6 * S, KB, segs=10)
+            d = self._make_filled_circle(1.0 * S, KB, segs=12)
             d.reparentTo(self.kb_burst)
             d.setTransparency(True)
             d.setColorScale(1, 1, 1, 0)
@@ -4939,7 +4985,7 @@ class ZombieGame(ShowBase):
                 LerpScaleInterval(self.kb_motion, 0.07, 1.0,
                                   startScale=0.97, blendType='easeOut'),
             ),
-            LerpColorScaleInterval(self.kb_motion, 0.18, (1, 1, 1, 1),
+            LerpColorScaleInterval(self.kb_motion, 0.204, (1, 1, 1, 1),
                                    startColorScale=(1, 1, 1, 0), blendType='easeOut'),
             LerpColorScaleInterval(self.kb_flash, 0.45, (1, 1, 1, 0),
                                    startColorScale=(1, 1, 1, 0.85), blendType='easeOut'),
@@ -4957,7 +5003,7 @@ class ZombieGame(ShowBase):
         self._kb_seq = Sequence(
             Func(self._kb_prep),
             appear,
-            Wait(1.6),
+            Wait(1.25),    # appear(최대 0.55s) + 1.25 = play 후 1.8s 에 out (HTML 동일)
             leave,
             Func(self.kb_root.hide),
         )
@@ -4979,9 +5025,10 @@ class ZombieGame(ShowBase):
         self._kb_burst_life = 0.0
         for i, d in enumerate(self._kb_dots):
             ang = random.uniform(0.0, 6.283185307179586)
-            dist = (52.0 + random.uniform(0.0, 84.0)) * S   # 더 넓게 퍼짐
-            life = 0.30 + random.uniform(0.0, 0.22)
-            scl = random.uniform(0.7, 2.3)                  # 원 크기 다양
+            # HTML burst(): dist 46+rand*60, dur 320+rand*240ms, size 2+rand*3 px.
+            dist = (46.0 + random.uniform(0.0, 60.0)) * S
+            life = 0.32 + random.uniform(0.0, 0.24)
+            scl = 1.0 + random.uniform(0.0, 1.5)            # 지름 2~5px (base r=1px)
             self._kb_dot_dir[i] = (cos(ang), -sin(ang))     # svg y-down → z-up
             self._kb_dot_dist[i] = dist
             self._kb_dot_life[i] = life
@@ -5009,12 +5056,12 @@ class ZombieGame(ShowBase):
             for i, d in enumerate(self._kb_dots):
                 life = self._kb_dot_life[i] or 1.0
                 f = min(1.0, elapsed / life)
-                ease = 1.0 - (1.0 - f) ** 4                # quartic easeOut (초반 폭발)
+                ease = self._cb_ease(f, 0.12, 0.85, 0.25, 1.0)   # HTML cubic-bezier
                 ux, uz = self._kb_dot_dir[i]
                 dist = self._kb_dot_dist[i] * ease
                 d.setPos(ux * dist, 0, uz * dist)
-                d.setScale(self._kb_dot_scale[i] * (1.0 - 0.62 * f))   # 점점 작아짐
-                a = 1.0 if f < 0.55 else max(0.0, 1.0 - (f - 0.55) / 0.45)
+                d.setScale(self._kb_dot_scale[i] * (1.0 - 0.6 * ease))  # 1→.4
+                a = 1.0 if f < 0.5 else max(0.0, 1.0 - (f - 0.5) / 0.5)
                 d.setColorScale(1, 1, 1, a)
             if self._kb_burst_t <= 0.0:
                 for d in self._kb_dots:
@@ -5022,8 +5069,11 @@ class ZombieGame(ShowBase):
         return task.cont
 
     def _show_kill_banner(self):
-        """처치 시 호출 — 발로란트식 킬피드 행을 우상단에 추가. (구 해골 슬램 폐기)"""
-        self._push_killfeed('ELIMINATED', mine=True)
+        """처치 시 호출 — HTML(kill_banner_motion.html) 그대로 화면 하단 중앙에 해골
+        슬램 배너를 재생. play()/setInterval 처럼 진행 중이어도 처음부터 재시작."""
+        seq = getattr(self, '_kb_seq', None)
+        if seq is not None:
+            seq.start()
 
     def _push_killfeed(self, text='ELIMINATED', mine=True):
         # 한 줄 행(좌측 레드/스틸 바 + 우측정렬 텍스트)을 쌓고, 최신이 위로.
@@ -5494,6 +5544,17 @@ class ZombieGame(ShowBase):
                 sil.hide()
                 self._wsils[w] = sil
 
+        # 무기 교체 시 우하단 패널 전체가 살짝 내려갔다 올라오는 슬라이드(디자인
+        # silStyle clip-out/in)를 한 번에 주려면 패널 요소가 한 노드 아래 모여 있어야
+        # 한다. BR 직속이던 탄약 텍스트·재장전 바를 _ammo_plate(원점 (0,0,0)) 자식으로
+        # 옮긴다 — pos 는 BR 기준 = 패널 기준이라 보이는 위치는 그대로 유지된다.
+        for _w in (self.hud_weapon_lbl, self.hud_ammo_max, self.hud_ammo_num,
+                   self.hud_reload_text, self.hud_reload_track,
+                   self.hud_reload_fill):
+            _w.reparentTo(self._ammo_plate)
+        self._ammo_plate_z0 = 0.0
+        self._ammo_slide = None
+
         # 중앙 상단 — 적 타겟 정보 그룹 (enemy.png 1600×1040 ≈ 1.54:1, 평소 hidden).
         # 컨테이너 NodePath 아래에 PNG + 2줄 텍스트 묶음 → enemy_target.show/hide 한 번에 처리.
         self.enemy_target = self.aspect2d.attachNewNode('enemy_target_grp')
@@ -5610,12 +5671,20 @@ class ZombieGame(ShowBase):
         # 무기 라벨/실루엣과 겹쳐 보였다. 재장전 중엔 '00'(채워지는 중)으로 표시.
         if self.ammo == 0 and not self._reload_oneshot:
             ft = ClockObject.getGlobalClock().getFrameTime()
+            # 'EMPTY'(5글자)는 숫자(2글자)용 큰 스케일로 그리면 플레이트를 벗어난다.
+            # 상태 진입 시 한 번만 작은 스케일로 낮춰 "(R)" 와 한 줄에 들어오게.
+            if not getattr(self, '_ammo_empty_shown', False):
+                self.hud_ammo_num.setScale(0.052)
+                self._ammo_empty_shown = True
             self.hud_ammo_num.setText('EMPTY')
             self.hud_ammo_num.setFg(TAC_ACCENT if int(ft * 3) % 2 == 0
                                     else TAC_ACCENT_DIM)
             self.hud_ammo_max.setText('(R)')
             self.hud_ammo_max.setFg(TAC_ACCENT_DIM)
         else:
+            if getattr(self, '_ammo_empty_shown', False):
+                self.hud_ammo_num.setScale(0.135)   # 숫자 표시 — 원래 큰 스케일 복원
+                self._ammo_empty_shown = False
             low = self.ammo <= max(1, self.ammo_max // 4)
             self.hud_ammo_num.setText(f'{self.ammo:02d}')
             self.hud_ammo_num.setFg(TAC_ACCENT if low else TAC_TEXT_1)
@@ -5641,11 +5710,17 @@ class ZombieGame(ShowBase):
         # 무기 실루엣 — 현재 무기 표시 + 교체 시 슬라이드 스왑(파일 꺼내듯: 이전 건
         # 아래로 빠지며 사라지고, 새 건 위에서 미끄러져 안착).
         sils = getattr(self, '_wsils', {})
-        prev_w = getattr(self, '_hud_prev_w', cur_w)
-        if cur_w != prev_w:
+        # _hud_prev_w 는 트리거 안에서만 기록하므로 getattr 기본값을 cur_w 로 두면
+        # prev_w 가 영영 cur_w 와 같아져 스왑이 절대 감지되지 않는다 → 기본 None,
+        # 최초 1회는 애니 없이 기록만, 이후 실제 변경에서만 슬라이드/실루엣 스왑.
+        prev_w = getattr(self, '_hud_prev_w', None)
+        if prev_w is None:
+            self._hud_prev_w = cur_w
+        elif cur_w != prev_w:
             self._hud_swap_t = self.HUD_SWAP_DUR
             self._hud_swap_from = prev_w
             self._hud_prev_w = cur_w
+            self._start_ammo_panel_slide()
         swt = getattr(self, '_hud_swap_t', 0.0)
         if swt > 0.0 and sils:
             swt = max(0.0, swt - dt)
@@ -7393,6 +7468,35 @@ class ZombieGame(ShowBase):
             self.hitmarker.setColorScale(1.0, 1.0, 1.0, 1.0)     # 흰색 그대로
         self.hitmarker.show()
         self._hitmarker_t = 0.18
+        # 팝 — 크게(1.4) 떴다 빠르게 1.0 으로 settle. 명중 순간(상태 전환)에만 start.
+        pop = getattr(self, '_hm_pop', None)
+        if pop is not None:
+            pop.finish()
+        self.hitmarker.setScale(1.4)
+        self._hm_pop = LerpScaleInterval(self.hitmarker, 0.09, 1.0,
+                                         startScale=1.4, blendType='easeOut')
+        self._hm_pop.start()
+
+    def _start_ammo_panel_slide(self):
+        """무기 교체 시 우하단 탄약 패널이 살짝 내려갔다(clip-out) 다시 올라오는
+        (clip-in) 슬라이드. 무기 변경(상태 전환) 시점에만 인터벌 start — 매 프레임
+        setPos 하지 않는다. online·솔로 공통(무기 교체는 로컬 동작)."""
+        panel = getattr(self, '_ammo_plate', None)
+        if panel is None:
+            return
+        z0 = getattr(self, '_ammo_plate_z0', 0.0)
+        sl = getattr(self, '_ammo_slide', None)
+        if sl is not None:
+            sl.finish()
+        panel.setPos(0, 0, z0)
+        drop = 0.05
+        self._ammo_slide = Sequence(
+            LerpPosInterval(panel, 0.08, (0, 0, z0 - drop),
+                            startPos=(0, 0, z0), blendType='easeIn'),
+            LerpPosInterval(panel, 0.16, (0, 0, z0),
+                            startPos=(0, 0, z0 - drop), blendType='easeOut'),
+        )
+        self._ammo_slide.start()
 
     def _show_dmg_flash(self, old_hp, new_hp):
         """체력바에서 방금 닳은 구간 위에 하얀 직사각형을 띄워 '팍' 커지며 페이드아웃.
