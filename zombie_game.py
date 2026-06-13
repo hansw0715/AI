@@ -4,6 +4,7 @@ Stage 1: 1인칭 카메라 + Y Bot 풀바디 + 기본 입력.
 """
 import atexit
 import json
+import math
 import random
 import socket
 import struct
@@ -26,10 +27,11 @@ from direct.interval.IntervalGlobal import (
     Parallel, Sequence, Wait,
 )
 from panda3d.core import (
-    AmbientLight, CardMaker, ClockObject, ColorBlendAttrib, CullFaceAttrib,
+    AmbientLight, BitMask32, CardMaker, ClockObject, ColorBlendAttrib, CullFaceAttrib,
     DirectionalLight, Filename,
     Geom, GeomNode, GeomTriangles, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
-    LineSegs, NodePath, PerspectiveLens, Quat, Spotlight, TextNode, Triangulator,
+    LineSegs, NodePath, PerspectiveLens, PNMImage, Quat, Spotlight, TextNode,
+    Texture, Triangulator,
     Vec3, Vec4, WindowProperties, loadPrcFileData,
 )
 
@@ -62,6 +64,13 @@ _FONT_BUNDLED = Path(__file__).parent / '온글잎 긍정.ttf'
 _FONT_FALLBACK = Path('C:/Windows/Fonts/malgun.ttf')
 _FONT_PATH = _FONT_BUNDLED if _FONT_BUNDLED.exists() else _FONT_FALLBACK
 loadPrcFileData('', f'text-default-font {_FONT_PATH.as_posix()}')
+
+# ── 그림자 ───────────────────────────────────────────────────────────────
+# 키라이트 그림자 패스(깊이맵)에 렌더될 객체를 거르는 카메라 마스크. 평평한 바닥·
+# 천장 카드는 이 비트에서 숨겨 '그림자를 던지지' 않게 한다(천장이 맵 전체를 가리는
+# 사태 방지). 캐릭터·벽·플랫폼 등 나머지는 기본값(전 비트 켜짐)이라 그대로 캐스팅.
+# 그림자를 '받는' 것(메인 셰이딩 패스)은 이 마스크와 무관하므로 바닥도 그림자를 받는다.
+SHADOW_CASTER_MASK = BitMask32.bit(1)
 
 
 # ── HUD 색 ──────────────────────────────────────────────────────────────
@@ -226,6 +235,50 @@ def _tac_outline(parent, l, r, b, t, color, notch=0.0, corners=(), thickness=1.6
     np.setLightOff()
     np.setTransparency(True)
     return np
+
+
+def _parse_svg_points(d):
+    """단순 SVG path(d) → 절대좌표 (x, y) 폴리곤 점 리스트. M/H/V/L/C/Z 만 지원
+    (HUD 무기 실루엣용). C(3차 베지어)는 6등분 샘플링. 좌표계는 SVG 그대로(아래로 +y)."""
+    import re
+    toks = re.findall(r'[MHVLCZ]|-?\d+\.?\d*', d)
+    pts = []
+    i = 0
+    cx = cz = 0.0
+    cmd = None
+    while i < len(toks):
+        t = toks[i]
+        if t in 'MHVLCZ':
+            cmd = t
+            i += 1
+            if cmd == 'Z':
+                break
+            continue
+        if cmd in ('M', 'L'):
+            cx, cz = float(toks[i]), float(toks[i + 1]); i += 2
+            pts.append((cx, cz))
+        elif cmd == 'H':
+            cx = float(toks[i]); i += 1
+            pts.append((cx, cz))
+        elif cmd == 'V':
+            cz = float(toks[i]); i += 1
+            pts.append((cx, cz))
+        elif cmd == 'C':
+            x1, y1 = float(toks[i]), float(toks[i + 1])
+            x2, y2 = float(toks[i + 2]), float(toks[i + 3])
+            ex, ey = float(toks[i + 4]), float(toks[i + 5]); i += 6
+            for s in range(1, 7):
+                u = s / 6.0
+                m = 1.0 - u
+                bx = (m * m * m * cx + 3 * m * m * u * x1
+                      + 3 * m * u * u * x2 + u * u * u * ex)
+                by = (m * m * m * cz + 3 * m * m * u * y1
+                      + 3 * m * u * u * y2 + u * u * u * ey)
+                pts.append((bx, by))
+            cx, cz = ex, ey
+        else:
+            i += 1
+    return pts
 
 
 def _load_settings():
@@ -1661,7 +1714,7 @@ class ZombieGame(ShowBase):
         # GPU 스키닝 보장 — 상단 PRC 두 플래그는 fixed-function 경로라 요즘 드라이버에선
         # 무시되고 조용히 CPU 스키닝으로 폴백하는 경우가 흔함. auto-shader 가 진짜 HW
         # 스키닝 셰이더를 생성해줘서 적 다수 시 vertex 변환이 GPU 로 옮겨감.
-        # 부작용: 라이팅 모델 살짝 바뀜 — 톤이 어색하면 dl color/ambient 보정.
+        # (simplepbr 는 텍스처/IBL 없는 Mixamo 모델에선 오히려 더 평평·칙칙해 되돌림.)
         self.render.setShaderAuto()
         self._make_ground()
         # level.py 가 render 아래에 방·벽·기둥을 만들고 collider + 적 spawn 좌표 반환.
@@ -1708,6 +1761,14 @@ class ZombieGame(ShowBase):
                 for w in self.level_collider.walls:
                     w.make_card(self.render)
 
+        # 단색 벽 카드(level.py)는 두께 0 의 앞/뒤 카드가 같은 평면에 겹쳐 있어, 그림자
+        # 깊이맵에서 자기 자신에게 그림자를 드리워 벽에 물결(섀도우 애크네)이 생긴다.
+        # → 벽을 그림자 '캐스팅'에서만 제외(SHADOW_CASTER_MASK off). 받기(receive)는
+        # 그대로라 캐릭터·적 그림자는 벽에 정상적으로 비친다. 두께 있는 키트 메쉬는 제외 안 함.
+        if self.kit_root is None:
+            for w in self.render.findAllMatches('**/wall'):
+                w.hide(SHADOW_CASTER_MASK)
+
         # 카메라 — 캐릭터 머리 안쪽에서 보더라도 클리핑 안 되게 near 매우 작게.
         # FOV 크면 시야 넓어지고 자기 몸이 작게 보임 (FPS 표준 90~100).
         self.camLens.setNear(0.01)
@@ -1749,6 +1810,15 @@ class ZombieGame(ShowBase):
         self.move_speed = 4.0   # 적 추격 속도와 동일 (Zombie.move_speed)
         # 무기별 이동속도 배율 — 권총은 가벼워 빠름(소총 대비 1.3배). _equip_weapon 갱신.
         self._weapon_speed_mult = 1.0
+        # 피격 연출 — 화면 흔들림 + 피격 후 잠깐 감속(플레이어/AI 봇).
+        self._shake_t = 0.0       # 카메라 흔들림 남은 시간
+        self._shake_dur = 0.0
+        self._shake_mag = 0.0     # 흔들림 진폭(deg)
+        self._slow_t = 0.0        # 플레이어 피격 감속 남은 시간
+        self._ai_slow_t = 0.0     # AI 봇 피격 감속 남은 시간
+        self.HIT_SLOW_DUR = 0.45  # 피격 감속 지속(초)
+        self.HIT_SLOW_MULT = 0.55 # 감속 중 이동속도 배율
+        self.HUD_SWAP_DUR = 0.26  # 무기 교체 시 HUD 실루엣 스왑 애니 길이(초)
         # (감도/오디오/릴레이 상태는 __init__ 에서 이미 초기화 — 여기서 덮지 않음)
         self.jump_speed = 5.0   # 정점 ~1.04m — 낮은 플랫폼(≤1.0)에 점프해 올라설 수 있게
         self.gravity = 12.0
@@ -2934,27 +3004,63 @@ class ZombieGame(ShowBase):
     # --- world setup --------------------------------------------------------
 
     def _make_lights(self):
-        # 밝은 실내 — ambient 를 충분히 올려 맵 전체가 환하게. (플래시라이트 제거)
+        # 4점 조명(키/필/림/앰비언트) + 키라이트 그림자. ambient 를 낮춰 음영을 살리고,
+        # 웜 키 / 쿨 필 대비 + 쿨 림으로 어두운 배경에서 모델 윤곽을 또렷이 분리한다.
+        # auto-shader(render.setShaderAuto) 위에서 setShadowCaster 만으로 그림자 생성.
         amb = AmbientLight('ambient')
-        amb.setColor(Vec4(0.62, 0.63, 0.67, 1))      # 밝은 회백색 베이스
+        amb.setColor(Vec4(0.25, 0.27, 0.33, 1))      # 낮고 살짝 쿨 — 그림자 면 톤
         self.render.setLight(self.render.attachNewNode(amb))
 
-        # 메인 디렉셔널 — 표면 음영/입체감.
+        # 키 라이트 — 강하고 살짝 웜. 그림자 캐스터.
         dl = DirectionalLight('dir')
-        dl.setColor(Vec4(0.48, 0.48, 0.50, 1))
+        dl.setColor(Vec4(1.00, 0.95, 0.86, 1))       # 웜 톤, 강하게
+        # 그림자 — 넓은 맵(64×98)을 한 번에 덮으면 텍셀이 흩어져 흐릿해진다. 대신
+        # 고해상도 + 좁은(타이트) 직교 프러스텀을 매 프레임 플레이어를 따라가게 해서
+        # (_update_shadow_frustum) 항상 플레이어 주변에 텍셀을 몰아 어디서든 선명하게.
+        SHADOW_RES = 4096                             # 2048 → 4096 (밀도 2배)
+        dl.setShadowCaster(True, SHADOW_RES, SHADOW_RES)
+        # 깊이맵 패스는 SHADOW_CASTER_MASK 비트 객체만 렌더 → 바닥·천장 카드 제외
+        # (_make_ground 에서 hide). 천장이 맵 전체를 그림자로 가리는 사태 방지.
+        dl.setCameraMask(SHADOW_CASTER_MASK)
+        # 직교 프러스텀을 플레이어 주변 ~45 유닛에 타이트하게. 4096² / 45 ≈ 1cm/텍셀.
+        lens = dl.getLens()
+        lens.setFilmSize(45, 45)
+        lens.setNearFar(2, 90)
         dlnp = self.render.attachNewNode(dl)
-        dlnp.setHpr(45, -55, 0)
+        dlnp.setHpr(45, -55, 0)                       # 방향 고정(웜 키) — 위치만 추적
         self.render.setLight(dlnp)
+        # 플레이어 추적용 — 라이트 전방 벡터(고정) + 뒤로 물러나는 거리(backoff).
+        self._shadow_light_np = dlnp
+        self._shadow_fwd = dlnp.getQuat(self.render).getForward()
+        self._shadow_backoff = 45.0
 
-        # 보조 디렉셔널(반대쪽) — 그림자 지는 면도 너무 어둡지 않게 채움.
+        # 필 라이트(반대쪽) — 차갑게, 약하게. 그림자 지는 면을 너무 어둡지 않게 채움.
         dl2 = DirectionalLight('dir2')
-        dl2.setColor(Vec4(0.26, 0.26, 0.30, 1))
+        dl2.setColor(Vec4(0.30, 0.34, 0.45, 1))      # 쿨 톤 대비 → 영화 같은 룩
         dl2np = self.render.attachNewNode(dl2)
         dl2np.setHpr(-130, -35, 0)
         self.render.setLight(dl2np)
 
+        # 림(백) 라이트 — 위·뒤에서 차갑고 강하게 쏴 캐릭터/적의 윤곽 모서리만 밝게
+        # 태운다(grazing). 어두운 배경에서 실루엣이 분리돼 모델이 또렷하게 '뜬다'.
+        # 정면 면엔 거의 안 닿아 전체 노출은 안 올리는 게 핵심(엣지 분리 전용).
+        rim = DirectionalLight('rim')
+        rim.setColor(Vec4(0.55, 0.62, 0.78, 1))      # 쿨 림 — 살짝 푸른 하이라이트
+        rimnp = self.render.attachNewNode(rim)
+        rimnp.setHpr(200, -18, 0)                     # 높이 뒤쪽에서 낮은 각도로
+        self.render.setLight(rimnp)
+
         # 플래시라이트 제거 — 밝은 맵이라 불필요. (참조 안전용 None)
         self.flashlight = None
+
+    def _update_shadow_frustum(self):
+        """키 라이트 그림자 프러스텀을 매 프레임 플레이어 중심으로 이동. 방향(HPR)은
+        고정하고 위치만 라이트 전방 반대로 backoff 만큼 물러나게 둬, 좁은 고해상 그림자가
+        항상 플레이어 주변을 따라오게 한다(넓은 맵 어디서나 선명)."""
+        np_ = getattr(self, '_shadow_light_np', None)
+        if np_ is None:
+            return
+        np_.setPos(self.player_pos - self._shadow_fwd * self._shadow_backoff)
 
     def _make_ground(self):
         # level.py 의 5방 라인업(y=-2~70) + 아레나(y=-18~18)를 모두 여유 있게 덮음.
@@ -2963,6 +3069,7 @@ class ZombieGame(ShowBase):
         gnd = self.render.attachNewNode(cm.generate())
         gnd.setHpr(0, -90, 0)        # XY 평면으로 눕히기 — 법선 +Z 위
         gnd.setColor(0.55, 0.55, 0.58, 1)
+        gnd.hide(SHADOW_CASTER_MASK)   # 평평한 바닥은 그림자 캐스팅 제외(받기는 함)
 
         # 천장 — 같은 XY 풋프린트 / z = WALL_HEIGHT 에 놓고 법선은 아래(-Z) 향함.
         # setHpr(0, 90, 0) 으로 P=+90 → 카드 법선이 -Z 로 뒤집힘 → 아래에서 비추는
@@ -2973,6 +3080,7 @@ class ZombieGame(ShowBase):
         ceil.setHpr(0, 90, 0)
         ceil.setZ(WALL_HEIGHT)
         ceil.setColor(0.30, 0.30, 0.34, 1)
+        ceil.hide(SHADOW_CASTER_MASK)   # 천장이 맵 전체를 그림자로 덮는 사태 방지
 
     # --- input --------------------------------------------------------------
 
@@ -3519,6 +3627,11 @@ class ZombieGame(ShowBase):
                 best_z = None
                 best_barrier = None
 
+        # 트레이서 종점 — 카메라 ray 상의 실제 명중 지점(없으면 먼 거리). 머즐→이 점으로
+        # 트레이서를 그어야 조준점(화면 중앙)에 수렴한다. 머즐에서 평행선만 그으면
+        # 카메라와 머즐 오프셋만큼 조준점을 빗나가 '안 날아가고 끊긴' 것처럼 보였다.
+        self._last_shot_end = cam_pos + ray_dir * (best_t if best_t < 1e8 else 120.0)
+
         # 축구 공 — 적/상대/벽보다 가까우면 공을 맞힌 것(차기). best_t 와 비교.
         if self.soccer_mode and self._ball is not None:
             res = self._ball.ray_hit(cam_pos, ray_dir)
@@ -3552,7 +3665,7 @@ class ZombieGame(ShowBase):
             self._on_zombie_killed(best_zone)
         self._spawn_hit_particle(best_hit_pos)
         self._spawn_damage_number(best_hit_pos, dmg)
-        self._show_hitmarker()      # 명중 — 조준점에 빨간 X
+        self._show_hitmarker(kill=(was_alive and best_z.hp <= 0))  # 명중=흰 X, 처치=레드
         print(f'[hit] {best_zone} dmg={dmg} → hp={best_z.hp}/{best_z.hp_max}',
               flush=True)
 
@@ -3752,10 +3865,19 @@ class ZombieGame(ShowBase):
             self.muzzle_flash_t = self.muzzle_flash_dur
             self.muzzle_flash.setScale(self.muzzle_flash_base_scale)
             self.muzzle_flash.show()
-            # Tracer — muzzle 위치에서 발사 방향(조준 + 탄 퍼짐 편차). ray 와 일치.
-            self.tracer.setPos(self.muzzle_flash.getPos(self.render))
-            self.tracer.setHpr(self.player_yaw + self._shot_yaw_off,
-                               self.player_pitch + self._shot_pitch_off, 0)
+            # Tracer — 머즐에서 '실제 명중 지점'(_last_shot_end, 카메라 ray 상)으로 향하게
+            # lookAt + 길이 스케일. 이러면 조준점에 수렴하고 끊겨 보이지 않는다.
+            muzzle = self.muzzle_flash.getPos(self.render)
+            end = getattr(self, '_last_shot_end', None)
+            self.tracer.setPos(muzzle)
+            if end is not None:
+                self.tracer.lookAt(end)                  # 로컬 +Y 를 명중점으로
+                dist = (end - muzzle).length()
+                self.tracer.setSy(max(0.05, dist / 30.0))  # 30m 기준 라인을 실제 거리로
+            else:
+                self.tracer.setHpr(self.player_yaw + self._shot_yaw_off,
+                                   self.player_pitch + self._shot_pitch_off, 0)
+                self.tracer.setSy(1.0)
             self.tracer.show()
             self.tracer_t = self.tracer_dur
         if not is_rifle:
@@ -3797,6 +3919,9 @@ class ZombieGame(ShowBase):
         self._reload_token += 1
         token = self._reload_token
         dur = self._reload_dur.get(anim, self.ybot.getDuration(anim))  # 동기화된 재생 시간
+        # HUD 재장전 진행 게이지용 — 시작 시각 + 총 길이 기록.
+        self._reload_started = ClockObject.getGlobalClock().getFrameTime()
+        self._reload_total = max(0.05, dur)
 
         # 슬라이드 래킹 — reload 후반에 기존 slide_recoil 재사용
         def _slide_kick(task, t=token):
@@ -3986,12 +4111,23 @@ class ZombieGame(ShowBase):
             return Task.done
         return Task.cont
 
+    def _trigger_shake(self, mag=2.2, dur=0.28):
+        """피격 화면 흔들림 1회. mag=진폭(deg), dur=지속(초). 더 센 흔들림이 들어오면
+        진폭은 큰 값으로 갱신(겹쳐도 약해지지 않게)."""
+        self._shake_mag = max(self._shake_mag, mag) if self._shake_t > 0 else mag
+        self._shake_dur = dur
+        self._shake_t = dur
+
     def take_core_damage(self, amount, source_pos=None):
         """적 공격 → 코어 무결성(체력) 깎기. 0 이 되면 게임오버 훅(현재 미구현).
         source_pos 주어지면 그 방향으로 피격 방향 아크 표시."""
         old_hp = self.core_integrity
         self.core_integrity = max(0, self.core_integrity - amount)
         self._show_dmg_flash(old_hp, self.core_integrity)   # 체력바 닳은 구간 플래시
+        if self.core_integrity < old_hp:
+            self._trigger_dmg_vignette()                    # 화면 가장자리 레드 플래시
+            self._trigger_shake(2.2, 0.28)                  # 화면 흔들림
+            self._slow_t = self.HIT_SLOW_DUR                # 피격 후 잠깐 감속
         if source_pos is not None:
             self._show_damage_dir(source_pos)
 
@@ -4327,6 +4463,77 @@ class ZombieGame(ShowBase):
         self._start_game(True, soccer=(m == 'soccer'), paint=(m == 'paint'),
                          jump=(m == 'jump'))
 
+    def _make_vignette_tex(self, inner, edge_alpha):
+        """레드 라디얼 비네트 텍스처 1장 생성. 중앙 inner(0~1) 까지 완전 투명,
+        가장자리(1.0)로 갈수록 TAC_ACCENT 레드 alpha 가 edge_alpha 까지 차오름.
+        (디자인 .dmg-vig / .low-vig 의 radial-gradient 를 PNMImage 로 베이크.)"""
+        size = 128
+        img = PNMImage(size, size, 4)
+        cx = cy = (size - 1) * 0.5
+        maxd = size * 0.5
+        r, g, b = TAC_ACCENT[0], TAC_ACCENT[1], TAC_ACCENT[2]
+        span = max(1e-4, 1.0 - inner)
+        for y in range(size):
+            for x in range(size):
+                dx, dy = x - cx, y - cy
+                d = ((dx * dx + dy * dy) ** 0.5) / maxd     # 0(중앙)~1.41(모서리)
+                t = max(0.0, min(1.0, (d - inner) / span))
+                t = t * t                                    # 가장자리로 더 가파르게
+                img.setXel(x, y, r, g, b)
+                img.setAlpha(x, y, t * edge_alpha)
+        tex = Texture()
+        tex.load(img)
+        return tex
+
+    def _build_vignette(self):
+        """화면 가장자리 레드 비네트 2종(피격 플래시 + 저체력 상시)을 풀스크린
+        쿼드로 깔아 둔다. render2d 의 background bin → 모든 HUD 보다 뒤(디자인과 동일).
+        피격 시 _vig_dmg_t 로 '팍' 떴다 페이드, 저체력(<30%)이면 _vig_low 상시 표시."""
+        self._vig_dmg_tex = self._make_vignette_tex(0.58, 0.55)
+        self._vig_low_tex = self._make_vignette_tex(0.64, 0.34)
+        for name, tex in (('vig_low', self._vig_low_tex),
+                          ('vig_dmg', self._vig_dmg_tex)):
+            cm = CardMaker(name)
+            cm.setFrame(-1, 1, -1, 1)            # render2d 전체(풀스크린)
+            cm.setUvRange((0, 0), (1, 1))
+            card = self.render2d.attachNewNode(cm.generate())
+            card.setTexture(tex)
+            card.setTransparency(True)
+            card.setLightOff()
+            card.setBin('background', 10)        # 모든 2D 보다 뒤에 깔림
+            card.setDepthTest(False)
+            card.setDepthWrite(False)
+            card.setColorScale(1, 1, 1, 0)       # 평소 완전 투명
+            setattr(self, name, card)
+        self._vig_dmg_t = 0.0                    # 피격 비네트 잔여 시간
+        self._vig_dmg_dur = 0.30
+
+    def _trigger_dmg_vignette(self):
+        """피격 순간 레드 비네트 플래시 1회 (디자인 .dmg-vig.on 130ms 점멸)."""
+        if getattr(self, 'vig_dmg', None) is None:
+            return
+        self._vig_dmg_t = self._vig_dmg_dur
+
+    def _update_vignette(self, dt, hp_ratio):
+        """피격 비네트 페이드 + 저체력 비네트 상시 표시(살짝 맥동)."""
+        if getattr(self, 'vig_dmg', None) is None:
+            return
+        # 피격 — 떴다가 선형 페이드아웃.
+        if self._vig_dmg_t > 0.0:
+            self._vig_dmg_t = max(0.0, self._vig_dmg_t - dt)
+            a = self._vig_dmg_t / self._vig_dmg_dur
+            self.vig_dmg.setColorScale(1, 1, 1, a)
+        else:
+            self.vig_dmg.setColorScale(1, 1, 1, 0)
+        # 저체력(30% 이하) — 상시 표시, 체력 낮을수록 진하게 + 은은한 맥동.
+        if hp_ratio < 0.30:
+            ft = ClockObject.getGlobalClock().getFrameTime()
+            pulse = 0.82 + 0.18 * (0.5 + 0.5 * math.sin(ft * 4.0))
+            depth = 0.45 + 0.55 * (1.0 - hp_ratio / 0.30)   # 0.45~1.0
+            self.vig_low.setColorScale(1, 1, 1, depth * pulse)
+        else:
+            self.vig_low.setColorScale(1, 1, 1, 0)
+
     def _build_crosshair(self):
         """발로란트식 크로스헤어 — 중앙 점 + 상하좌우 4선. 정지 시 좁고 이동/연사 시
         바깥으로 벌어짐(spread). 명중 순간 빨간 X 히트마커. 흰색 기본·적중 시 레드."""
@@ -4367,7 +4574,7 @@ class ZombieGame(ShowBase):
         self.hitmarker.setDepthWrite(False)
         hm = LineSegs()
         hm.setThickness(2.6)
-        hm.setColor(*TAC_ACCENT)
+        hm.setColor(*TAC_TEXT_1)   # 흰색 베이스 — 명중=흰 X, 처치=setColorScale 로 레드
         g0, g1 = 0.012 * S, 0.027 * S
         for (sx, sz) in [(1, 1), (-1, -1), (1, -1), (-1, 1)]:
             hm.moveTo(sx * g0, 0, sz * g0)
@@ -4873,12 +5080,102 @@ class ZombieGame(ShowBase):
         self._hud_images.append(img)
         return img
 
+    def _build_weapon_tab(self, parent, l, r, b, t, keynum, name):
+        """무기 레일 탭 하나 — 노치 다크 패널 + 키번호 + 이름 + (액티브) 좌측 레드 바.
+        반환 dict 의 위젯 색을 _update_hud 에서 토글해 현재 무기를 강조한다."""
+        n = 0.018
+        fill = _tac_fill(parent, l, r, b, t, (0.055, 0.060, 0.072, 0.50),
+                         notch=n, corners=('tl', 'br'))
+        _tac_outline(parent, l, r, b, t, TAC_LINE, notch=n, corners=('tl', 'br'),
+                     thickness=1.2)
+        bar = _tac_fill(parent, l, l + 0.012, b + 0.009, t - 0.009, TAC_ACCENT)
+        zc = (b + t) / 2 - 0.013
+        OnscreenText(parent=parent, text=keynum, pos=(l + 0.028, zc), scale=0.028,
+                     fg=TAC_TEXT_3, align=TextNode.ALeft, mayChange=False,
+                     font=getattr(self, '_tac_label_font', None))
+        nm = OnscreenText(parent=parent, text=name, pos=(l + 0.066, zc), scale=0.032,
+                          fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=True,
+                          font=getattr(self, '_tac_label_font', None))
+        return {'fill': fill, 'bar': bar, 'name': nm}
+
+    # 무기 실루엣 — 디자인 kit 의 PistolSil/RifleSil SVG path 를 그대로 폴리곤화.
+    WEAPON_SIL = {
+        'pistol': (150.0, 90.0,
+                   'M8 30 H132 V44 L104 47 L97 58 H78 L72 50 H46 V52 H40 V72 H60 '
+                   'L54 86 H26 L19 64 C16 54 20 49 30 48 H34 V44 H8 Z'),
+        'rifle': (220.0, 84.0,
+                  'M6 30 H150 V22 H176 V30 H214 V40 H176 V36 H150 V46 H120 L112 64 '
+                  'H92 L99 46 H64 V58 H82 V64 H40 V58 H50 V46 H30 L24 58 H10 L16 46 H6 Z'),
+    }
+
+    def _build_weapon_sil(self, parent, weapon, right_x, top_z, width):
+        """무기 실루엣(흰 단색)을 ammo 플레이트 상단 우측에 그린다. SVG y(아래로+)는
+        flip 해서 z(위로+)로. 오목 형상이라 Triangulator 로 삼각분할."""
+        vb = self.WEAPON_SIL.get(weapon)
+        if vb is None:
+            return None
+        vbw, vbh, d = vb
+        raw = _parse_svg_points(d)
+        if len(raw) < 3:
+            return None
+        sc = width / vbw
+        pts = [(x * sc + (right_x - width), top_z - y * sc) for (x, y) in raw]
+        tri = Triangulator()
+        for (x, z) in pts:
+            tri.addPolygonVertex(tri.addVertex(x, z))
+        tri.triangulate()
+        if tri.getNumTriangles() == 0:
+            return None
+        vdata = GeomVertexData('wsil', GeomVertexFormat.getV3(), Geom.UHStatic)
+        vw = GeomVertexWriter(vdata, 'vertex')
+        for (x, z) in pts:
+            vw.addData3(x, 0, z)
+        prim = GeomTriangles(Geom.UHStatic)
+        for k in range(tri.getNumTriangles()):
+            prim.addVertices(tri.getTriangleV0(k), tri.getTriangleV1(k),
+                             tri.getTriangleV2(k))
+        gn = GeomNode('wsil')
+        gn.addGeom(self._geom_from(vdata, prim))
+        np = parent.attachNewNode(gn)
+        np.setColor(*TAC_TEXT_1)
+        np.setTwoSided(True)
+        np.setTransparency(True)
+        np.setLightOff()
+        return np
+
+    def _deathmatch_active(self):
+        """데스매치(킬 점수) 진행 중인가 — 상대 HP 칩(OppCompact)을 띄울 조건.
+        축구/땅따먹기/점프맵·준비방 제외."""
+        return ((self.online_mode or self.ai_mode)
+                and not (self.soccer_mode or self.paint_mode
+                         or getattr(self, 'jump_mode', False))
+                and not getattr(self, '_in_lobby', False))
+
+    def _rebuild_mag_strip(self, amax):
+        """탄창 스트립을 amax 개의 세그먼트로 다시 그린다(무기 교체 시 ammo_max 변동 대응).
+        매 프레임 색만 갱신하면 되도록 지오메트리는 여기서 한 번만 만든다."""
+        for seg in getattr(self, '_mag_segs', []):
+            seg.removeNode()
+        self._mag_segs = []
+        amax = max(1, int(amax))
+        mag_l, mag_r, mag_z, mag_hh = -0.360, -0.045, 0.072, 0.011
+        gap = 0.004 if amax <= 12 else 0.0022
+        seg_w = (mag_r - mag_l) / amax
+        for i in range(amax):
+            x0 = mag_l + seg_w * i
+            x1 = x0 + max(0.004, seg_w - gap)
+            seg = _tac_fill(self._mag_strip, x0, x1, mag_z - mag_hh, mag_z + mag_hh,
+                            TAC_LINE)
+            self._mag_segs.append(seg)
+        self._mag_built_max = amax
+
     def _build_hud(self):
         """플레이어 상태 표시 HUD. 외형은 HUD PNG (assets/ui/) 로 그리고,
         그 위에 텍스트·동적 채움을 얹음."""
         # 코너 기준 HUD 는 코너마다 스케일 컨테이너를 하나 끼워 거기에 HUD_SCALE 를
         # 건다. 개별 요소의 pos/scale 은 그대로 두고도 정렬 보존된 채 비례 확대된다.
         self._tac_fonts()       # 택티컬 콘덴스드 폰트 먼저 로드(이하 전부 사용)
+        self._build_vignette()  # 화면 가장자리 레드 비네트(피격/저체력) — 풀스크린
         L = self.a2dTopLeft.attachNewNode('hud_tl');     L.setScale(HUD_SCALE)
         R = self.a2dTopRight.attachNewNode('hud_tr');    R.setScale(HUD_SCALE)
         BL = self.a2dBottomLeft.attachNewNode('hud_bl');  BL.setScale(HUD_SCALE)
@@ -4922,11 +5219,41 @@ class ZombieGame(ShowBase):
         _tac_fill(self.hud_score_frame, 0.17, 0.205, 0.838, 0.852, TAC_ACCENT)
         self.hud_score_frame.hide()
         # ── PvP 점수(online 전용) — 상단 중앙 "내점수 : 상대점수", 먼저 10점이면 승리.
-        self.hud_score = OnscreenText(
-            text='0 : 0', pos=(0, 0.84), scale=0.10,
-            fg=TAC_TEXT_1, align=TextNode.ACenter, mayChange=True,
-            parent=self.aspect2d, font=self._tac_display_font)
+        # 버서스 규칙: 나 = 레드, 상대 = 콜드 스틸, 콜론 = 흐림. (디자인 ScorePlate)
+        self.hud_score = self.aspect2d.attachNewNode('score_grp')
+        self.hud_score_colon = OnscreenText(
+            text=':', pos=(0, 0.84), scale=0.10,
+            fg=TAC_TEXT_3, align=TextNode.ACenter, mayChange=False,
+            parent=self.hud_score, font=self._tac_display_font)
+        self.hud_score_me = OnscreenText(
+            text='0', pos=(-0.03, 0.84), scale=0.10,
+            fg=TAC_ACCENT, align=TextNode.ARight, mayChange=True,
+            parent=self.hud_score, font=self._tac_display_font)
+        self.hud_score_op = OnscreenText(
+            text='0', pos=(0.03, 0.84), scale=0.10,
+            fg=TAC_STEEL, align=TextNode.ALeft, mayChange=True,
+            parent=self.hud_score, font=self._tac_display_font)
+        self.hud_score_cap = OnscreenText(
+            text='FIRST TO 10', pos=(0, 0.798), scale=0.025,
+            fg=TAC_TEXT_2, align=TextNode.ACenter, mayChange=True,
+            parent=self.hud_score, font=getattr(self, '_tac_label_font', None))
         self.hud_score.hide()             # online 일 때만 _setup_online 에서 show
+        # ── 상대 HP 칩(점수 플레이트 우측) — 이름 + 콜드 스틸 막대. (디자인 OppCompact)
+        #    데스매치에서만 표시. HP 는 AI 모드에선 ai_hp 반영, 온라인은 동기화 안 돼 풀.
+        self.hud_opp = self.aspect2d.attachNewNode('opp_comp')
+        ocx, ocr, ocz, ochh = 0.235, 0.40, 0.838, 0.007
+        self._opp_bar_l, self._opp_bar_w = ocx, ocr - ocx
+        self.hud_opp_name = OnscreenText(
+            text='OPERATOR', pos=(ocx, ocz + 0.022), scale=0.030,
+            fg=TAC_STEEL, align=TextNode.ALeft, mayChange=True,
+            parent=self.hud_opp, font=getattr(self, '_tac_label_font', None))
+        self.hud_opp_track = DirectFrame(
+            frameColor=(0.094, 0.102, 0.125, 0.9), relief=DGG.FLAT,
+            frameSize=(ocx, ocr, ocz - ochh, ocz + ochh), parent=self.hud_opp)
+        self.hud_opp_fill = DirectFrame(
+            frameColor=TAC_STEEL, relief=DGG.FLAT,
+            frameSize=(ocx, ocr, ocz - ochh, ocz + ochh), parent=self.hud_opp)
+        self.hud_opp.hide()
         # 승/패 결과 배너 — 매치 종료 시 화면 중앙에 크게.
         self.hud_match_result = OnscreenText(
             text='', pos=(0, 0.12), scale=0.20,
@@ -5044,28 +5371,53 @@ class ZombieGame(ShowBase):
         _tac_outline(self._health_plate, 0.035, 0.665, 0.085, 0.235, TAC_LINE,
                      notch=0.03, corners=('tl', 'br'), thickness=1.3)
         _tac_fill(self._health_plate, 0.035, 0.051, 0.10, 0.22, TAC_ACCENT)
+        # 레이어 순서를 '씬그래프 순서'로 확정 — setBin draw_order 가 이 DirectFrame
+        # 들에선 신뢰가 안 돼(반투명/불투명 자동 bin 분류로 트랙이 fill 위로 올라옴),
+        # ghost·fill 을 track 의 '자식'으로 둔다. 같은 bin 내 자식은 부모 뒤에(=위에)
+        # 그려지므로 track → ghost → fill 순서가 보장된다(회색 트랙 위로 vital 이 또렷).
         self.php_track = DirectFrame(
-            frameColor=(0.094, 0.102, 0.125, 0.88),     # #181A20 톤 트랙
+            frameColor=(0.094, 0.102, 0.125, 1.0),      # #181A20 톤 트랙(불투명)
             frameSize=(-0.006, php_w + 0.006, -php_h - 0.006, php_h + 0.006),
             pos=(php_x, 0, php_z), parent=self.a2dBottomLeft)
-        self.php_track.setBin('fixed', 20)
-        self.php_fill = DirectFrame(
-            frameColor=(0.92, 0.93, 0.94, 0.96),        # 기본 흰색(감소 시 레드로)
+        # 고스트(지연) 바 — 방금 잃은 체력 구간을 레드로 남겼다 천천히 줄어듦(잔상).
+        self.php_ghost = DirectFrame(
+            frameColor=TAC_ACCENT,
             frameSize=(0, php_w, -php_h, php_h),
-            pos=(php_x, 0, php_z), parent=self.a2dBottomLeft)
-        self.php_fill.setBin('fixed', 21)
+            pos=(0, 0, 0), parent=self.php_track)        # track 자식 → track 위
+        self._php_ghost_r = 1.0
+        self.php_fill = DirectFrame(
+            frameColor=(0.92, 0.93, 0.94, 1.0),         # 불투명 흰색(감소 시 레드로)
+            frameSize=(0, php_w, -php_h, php_h),
+            pos=(0, 0, 0), parent=self.php_track)        # ghost 뒤에 생성 → 맨 위
         # 바 위쪽 행: VITALS 라벨(좌) + 숫자(우). 디자인 .health .hrow.
+        # 반투명 플레이트 패널이 텍스트 위로 올라와 흐려 보이던 문제 → fill 과 똑같이
+        # php_track 자식으로 둬서 패널보다 위에 그린다(pos 는 track 원점 기준 상대).
         self.hud_vitals_lbl = OnscreenText(
-            text='V I T A L S', pos=(php_x, php_z + 0.050), scale=0.030,
+            text='V I T A L S', pos=(0, 0.050), scale=0.030,
             fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
-            parent=self.a2dBottomLeft,
+            parent=self.php_track,
             font=getattr(self, '_tac_label_font', None))
-        self.hud_vitals_lbl.setBin('fixed', 22)
         self.php_num = OnscreenText(
-            text='100', pos=(php_x + php_w, php_z + 0.044), scale=0.072,
+            text='100', pos=(php_w, 0.044), scale=0.072,
             fg=TAC_TEXT_1, align=TextNode.ARight, mayChange=True,
-            parent=self.a2dBottomLeft, font=getattr(self, '_tac_display_font', None))
-        self.php_num.setBin('fixed', 22)
+            parent=self.php_track, font=getattr(self, '_tac_display_font', None))
+        # 바 위 눈금(tick) — 25/50/75% 자리에 얇은 어두운 선. (디자인 .hbar .tick)
+        for f in (0.25, 0.5, 0.75):
+            tx = php_x + php_w * f
+            tk = _tac_fill(self._health_plate, tx - 0.0014, tx + 0.0014,
+                           php_z - php_h, php_z + php_h, (0.055, 0.060, 0.072, 0.92))
+            tk.setBin('fixed', 22)
+        # LOW 배지 — 체력 30% 이하일 때 VITALS 옆에 레드 칩. (디자인 .low-tag)
+        self.hud_low_bg = _tac_fill(self._health_plate, 0.305, 0.40,
+                                    php_z + 0.036, php_z + 0.074, TAC_ACCENT)
+        self.hud_low_tag = OnscreenText(
+            text='LOW', pos=(0.3525, php_z + 0.0445), scale=0.026,
+            fg=(0.055, 0.060, 0.072, 1.0), align=TextNode.ACenter, mayChange=False,
+            parent=self._health_plate, font=getattr(self, '_tac_label_font', None))
+        self.hud_low_bg.setBin('fixed', 22)
+        self.hud_low_tag.setBin('fixed', 23)
+        self.hud_low_bg.hide()
+        self.hud_low_tag.hide()
 
         # 우하단 — 탄약 카운터. 라벨("처치 카트리지")·카트리지 아이콘 UI 제거하고
         # "현재/최대" 숫자(예: 3/8, 7/25)만 표시. 재장전 중엔 위에 "reloading...".
@@ -5077,8 +5429,10 @@ class ZombieGame(ShowBase):
                      notch=0.05, corners=('tl', 'br'), thickness=1.3)
         _tac_fill(self._ammo_plate, -0.022, -0.005, 0.07, 0.30, TAC_ACCENT)
         # 디자인 .ammo — 무기 라벨(위) + 큰 현재탄(Oswald) + 작은 최대탄(흐림).
+        # 세로 밴드로 또렷이 분리: (위) 실루엣 → 무기 라벨(z0.255) → 큰 현재탄(z0.10,
+        # 작게) + 최대탄 → 탄창 스트립 → 재장전 바. 큰 숫자가 라벨·실루엣과 안 겹치게.
         self.hud_weapon_lbl = OnscreenText(
-            text='P I S T O L', pos=(-0.05, 0.285), scale=0.038,
+            text='P I S T O L', pos=(-0.05, 0.255), scale=0.034,
             fg=TAC_TEXT_2, align=TextNode.ARight, mayChange=True, parent=BR,
             font=self._tac_label_font)
         self.hud_ammo_max = OnscreenText(
@@ -5086,14 +5440,59 @@ class ZombieGame(ShowBase):
             fg=TAC_TEXT_3, align=TextNode.ARight, mayChange=True, parent=BR,
             font=self._tac_display_font)
         self.hud_ammo_num = OnscreenText(
-            text='08', pos=(-0.16, 0.10), scale=0.150,
+            text='08', pos=(-0.16, 0.10), scale=0.135,
             fg=TAC_TEXT_1, align=TextNode.ARight, mayChange=True, parent=BR,
             font=self._tac_display_font)
+        # RELOADING — 라벨과 같은 행(z0.255). 재장전 중엔 무기 라벨 대신 이게 뜬다
+        # (실루엣과 겹치지 않게 라벨 자리로). _update_hud 에서 상호 토글.
         self.hud_reload_text = OnscreenText(
-            text='RELOADING', pos=(-0.05, 0.345), scale=0.040,
+            text='RELOADING', pos=(-0.05, 0.255), scale=0.034,
             fg=TAC_ACCENT, align=TextNode.ARight, mayChange=False, parent=BR,
             font=self._tac_label_font)
         self.hud_reload_text.hide()
+        # 재장전 진행 게이지 — 탄창 스트립 바로 아래(빈 하단 레인)에 얇은 레드 바가
+        # 좌→우로 채워짐. (디자인 .reloadg) 무기 실루엣과 안 겹치게 하단 배치.
+        # 재장전 중에만 표시. 진행도는 _update_hud 에서 갱신.
+        rg_l, rg_r, rg_z, rg_hh = -0.360, -0.045, 0.054, 0.005
+        self._rg_l, self._rg_w = rg_l, rg_r - rg_l
+        self.hud_reload_track = DirectFrame(
+            frameColor=TAC_LINE,
+            frameSize=(rg_l, rg_r, rg_z - rg_hh, rg_z + rg_hh), parent=BR)
+        self.hud_reload_track.setBin('fixed', 22)
+        self.hud_reload_fill = DirectFrame(
+            frameColor=TAC_ACCENT,
+            frameSize=(rg_l, rg_l, rg_z - rg_hh, rg_z + rg_hh), parent=BR)
+        self.hud_reload_fill.setBin('fixed', 23)
+        self.hud_reload_track.hide()
+        self.hud_reload_fill.hide()
+        # 무기 레일 탭(플레이트 위) — "1 PISTOL" / "2 RIFLE", 현재 무기 = 좌측 레드 바 + 강조.
+        # _ammo_plate 자식이라 인게임 HUD show/hide 에 같이 따라간다. (디자인 .wrail)
+        self._wtabs = {}
+        order = [w for w in ('pistol', 'rifle') if w in self._weapons]
+        if not order:
+            order = list(self._weapons.keys()) or ['pistol']
+        keymap = {'pistol': '1', 'rifle': '2'}
+        tab_w, tab_gap, tab_b, tab_t = 0.188, 0.014, 0.415, 0.475
+        group_l = -0.005 - (len(order) * tab_w + (len(order) - 1) * tab_gap)
+        for idx, w in enumerate(order):
+            tl = group_l + idx * (tab_w + tab_gap)
+            self._wtabs[w] = self._build_weapon_tab(
+                self._ammo_plate, tl, tl + tab_w, tab_b, tab_t,
+                keymap.get(w, '?'), w.upper())
+        # 탄창 스트립 — 플레이트 하단, 남은 탄을 작은 세그먼트로. (디자인 .magstrip)
+        self._mag_strip = self._ammo_plate.attachNewNode('mag_strip')
+        self._mag_segs = []
+        self._mag_built_max = 0
+        self._rebuild_mag_strip(getattr(self, 'ammo_max', 8))
+        # 무기 실루엣(플레이트 상단 우측) — 무기마다 하나씩 만들어 두고 현재 것만 show.
+        self._wsils = {}
+        for w in order:
+            wid = 0.165 if w == 'rifle' else 0.14
+            sil = self._build_weapon_sil(self._ammo_plate, w,
+                                         right_x=-0.04, top_z=0.39, width=wid)
+            if sil is not None:
+                sil.hide()
+                self._wsils[w] = sil
 
         # 중앙 상단 — 적 타겟 정보 그룹 (enemy.png 1600×1040 ≈ 1.54:1, 평소 hidden).
         # 컨테이너 NodePath 아래에 PNG + 2줄 텍스트 묶음 → enemy_target.show/hide 한 번에 처리.
@@ -5207,7 +5606,9 @@ class ZombieGame(ShowBase):
         glitching = self._glitch_t > 0
 
         # 탄약 — 큰 현재탄 + 작은 최대탄. 0발이면 EMPTY (R) 레드 점멸. 무기명 갱신.
-        if self.ammo == 0:
+        # 단, 재장전 중엔 EMPTY 를 띄우지 않는다 — 'EMPTY'(5글자)가 숫자보다 넓어
+        # 무기 라벨/실루엣과 겹쳐 보였다. 재장전 중엔 '00'(채워지는 중)으로 표시.
+        if self.ammo == 0 and not self._reload_oneshot:
             ft = ClockObject.getGlobalClock().getFrameTime()
             self.hud_ammo_num.setText('EMPTY')
             self.hud_ammo_num.setFg(TAC_ACCENT if int(ft * 3) % 2 == 0
@@ -5220,14 +5621,78 @@ class ZombieGame(ShowBase):
             self.hud_ammo_num.setFg(TAC_ACCENT if low else TAC_TEXT_1)
             self.hud_ammo_max.setText(f'/ {self.ammo_max}')
             self.hud_ammo_max.setFg(TAC_TEXT_3)
+        # 구경 캡션 — "PISTOL · 9MM" / "RIFLE · AR-10". (디자인 .wname)
+        cur_w = self.weapon_name or 'pistol'
         self.hud_weapon_lbl.setText(
-            'R I F L E' if (self.weapon_name or 'pistol') == 'rifle'
-            else 'P I S T O L')
-        # 재장전 중 "reloading..." 표시.
-        if self._reload_oneshot:
-            self.hud_reload_text.show()
+            {'pistol': 'PISTOL · 9MM', 'rifle': 'RIFLE · AR-10'}.get(
+                cur_w, cur_w.upper()))
+        # 무기 레일 탭 — 현재 무기 강조(레드 바 + 밝은 면/글자), 나머지는 흐림.
+        for nm, tab in getattr(self, '_wtabs', {}).items():
+            active = (nm == cur_w)
+            tab['bar'].setColor(*(TAC_ACCENT if active else (0, 0, 0, 0)))
+            tab['name'].setFg(TAC_TEXT_1 if active else TAC_TEXT_2)
+            tab['fill'].setColor(*((0.13, 0.14, 0.17, 0.62) if active
+                                   else (0.055, 0.060, 0.072, 0.50)))
+        # 탄창 스트립 — ammo_max 변동 시 재생성, 매 프레임 채움 색만 갱신.
+        if getattr(self, '_mag_built_max', 0) != self.ammo_max:
+            self._rebuild_mag_strip(self.ammo_max)
+        for i, seg in enumerate(self._mag_segs):
+            seg.setColor(*(TAC_TEXT_1 if i < self.ammo else TAC_LINE))
+        # 무기 실루엣 — 현재 무기 표시 + 교체 시 슬라이드 스왑(파일 꺼내듯: 이전 건
+        # 아래로 빠지며 사라지고, 새 건 위에서 미끄러져 안착).
+        sils = getattr(self, '_wsils', {})
+        prev_w = getattr(self, '_hud_prev_w', cur_w)
+        if cur_w != prev_w:
+            self._hud_swap_t = self.HUD_SWAP_DUR
+            self._hud_swap_from = prev_w
+            self._hud_prev_w = cur_w
+        swt = getattr(self, '_hud_swap_t', 0.0)
+        if swt > 0.0 and sils:
+            swt = max(0.0, swt - dt)
+            self._hud_swap_t = swt
+            p = 1.0 - swt / self.HUD_SWAP_DUR            # 0→1 진행
+            frm = getattr(self, '_hud_swap_from', None)
+            for w, sil in sils.items():
+                if w == cur_w:                          # 새 무기 — 후반에 위에서 안착
+                    if p < 0.5:
+                        sil.hide()
+                    else:
+                        q = (p - 0.5) / 0.5
+                        sil.show(); sil.setZ(0.05 * (1.0 - q))
+                        sil.setColorScale(1, 1, 1, q)
+                elif w == frm:                          # 이전 무기 — 전반에 아래로 빠짐
+                    if p < 0.5:
+                        q = p / 0.5
+                        sil.show(); sil.setZ(-0.05 * q)
+                        sil.setColorScale(1, 1, 1, 1.0 - q)
+                    else:
+                        sil.hide()
+                else:
+                    sil.hide()
         else:
+            for w, sil in sils.items():
+                if w == cur_w:
+                    sil.show(); sil.setZ(0); sil.setColorScale(1, 1, 1, 1)
+                else:
+                    sil.hide()
+        # 재장전 중 "reloading..." + 진행 게이지(좌→우 채움) 표시.
+        if self._reload_oneshot:
+            self.hud_weapon_lbl.hide()        # 라벨 자리에 RELOADING 표시(상호 배타)
+            self.hud_reload_text.show()
+            self.hud_reload_track.show()
+            self.hud_reload_fill.show()
+            ft = ClockObject.getGlobalClock().getFrameTime()
+            total = getattr(self, '_reload_total', 0.0) or 0.05
+            p = max(0.0, min(1.0,
+                             (ft - getattr(self, '_reload_started', ft)) / total))
+            z0, z1 = self.hud_reload_fill['frameSize'][2:4]
+            self.hud_reload_fill['frameSize'] = (
+                self._rg_l, self._rg_l + self._rg_w * p, z0, z1)
+        else:
+            self.hud_weapon_lbl.show()
             self.hud_reload_text.hide()
+            self.hud_reload_track.hide()
+            self.hud_reload_fill.hide()
 
         # 코어 무결성 — 두 단계 채움.
         #   HP 68 ~ 100 : baked PNG fill 은 그대로 + cyan 확장이 rail 영역 채움 (풀바)
@@ -5251,9 +5716,43 @@ class ZombieGame(ShowBase):
         # 플레이어 체력바 — 너비 = 체력 비율, 색 = 흰색(만땅)→레드(위험).
         self.php_fill['frameSize'] = (0, self._php_w * r, -self._php_h, self._php_h)
         self.php_fill['frameColor'] = (0.90, 0.25 + 0.68 * r,
-                                       0.22 + 0.72 * r, 0.96)
+                                       0.22 + 0.72 * r, 1.0)   # 불투명 — 회색 비침 방지
+        # 고스트 바 — 회복 시 즉시 따라붙고, 감소 시 천천히 따라 내려옴(레드 잔상).
+        gr = getattr(self, '_php_ghost_r', r)
+        gr = r if r >= gr else gr + (r - gr) * min(1.0, dt * 3.2)
+        self._php_ghost_r = gr
+        self.php_ghost['frameSize'] = (0, self._php_w * gr,
+                                       -self._php_h, self._php_h)
+        # 화면 가장자리 비네트 — 피격 플래시 + 저체력 상시.
+        self._update_vignette(dt, r)
         self.php_num.setText(str(int(round(self.core_integrity))))
-        self.php_num.setFg(TAC_ACCENT if r < 0.3 else TAC_TEXT_1)
+        low_hp = r < 0.3
+        self.php_num.setFg(TAC_ACCENT if low_hp else TAC_TEXT_1)
+        # LOW 배지 — 체력 30% 이하에서만 표시.
+        if low_hp:
+            self.hud_low_bg.show()
+            self.hud_low_tag.show()
+        else:
+            self.hud_low_bg.hide()
+            self.hud_low_tag.hide()
+
+        # 상대 HP 칩 — 데스매치에서만. AI 모드는 ai_hp 반영, 온라인은 동기화 없어 풀.
+        if self._deathmatch_active():
+            if self.hud_opp.isHidden():
+                self.hud_opp.show()
+            nm = (self._remote_name or 'OPERATOR') if self.online_mode else 'OPERATOR'
+            self.hud_opp_name.setText(nm.upper())
+            if self.ai_mode and not self.online_mode:
+                oratio = max(0.0, min(1.0, self.ai_hp / max(1, self.ai_max_hp)))
+            else:
+                oratio = 1.0
+            ol, ow = self._opp_bar_l, self._opp_bar_w
+            fs = self.hud_opp_track['frameSize']
+            self.hud_opp_fill['frameSize'] = (ol, ol + ow * oratio, fs[2], fs[3])
+            self.hud_opp_fill['frameColor'] = (TAC_ACCENT if oratio <= 0.3
+                                               else TAC_STEEL)
+        elif not self.hud_opp.isHidden():
+            self.hud_opp.hide()
 
         # 웨이브 모드 HUD — 총 처치 수 + 현재 웨이브/남은 적
         alive = sum(1 for z in self.zombies if z.hp > 0)
@@ -5517,8 +6016,8 @@ class ZombieGame(ShowBase):
         # 숨겨 준비방 위로 겹쳐 보이는 걸 막는다. 매치 시작(_exit_lobby) 시 복귀.
         for nm in ('crosshair', 'hitmarker', 'hud_ammo_num', 'hud_ammo_max',
                    'hud_weapon_lbl', 'hud_reload_text', 'php_track', 'php_fill',
-                   'php_num', 'hud_vitals_lbl', 'hud_score', 'hud_score_frame',
-                   '_ammo_plate', '_health_plate', '_kf_parent'):
+                   'php_ghost', 'php_num', 'hud_vitals_lbl', 'hud_score',
+                   'hud_score_frame', '_ammo_plate', '_health_plate', '_kf_parent'):
             w = getattr(self, nm, None)
             if w is not None:
                 (w.show if on else w.hide)()
@@ -5613,22 +6112,38 @@ class ZombieGame(ShowBase):
             if self._ai_strafe_t <= 0.0:
                 self._ai_strafe_dir = random.choice((-1, 1))
                 self._ai_strafe_t = random.uniform(0.5, 1.3)
+            # 멈춰서 쏘기 — 사거리 안 + 시야 트임 + 재장전 아님 + 탄약 있음이면 '정지'해
+            # 조준/사격(플레이어가 피할 여지를 줌). 그 외엔 접근/측면 무빙으로 자리 잡기.
+            los = not self.level_collider.segment_blocked(
+                self._ai_pos.x, self._ai_pos.y,
+                self.player_pos.x, self.player_pos.y)
+            shoot_stance = (dist < self.AI_SHOOT_RANGE and los
+                            and self._ai_reload_t <= 0.0 and self._ai_ammo > 0)
             fwd = 0.0
-            if dist > self.AI_PREF_MAX:
+            strafe_mult = 0.85
+            if shoot_stance:
+                strafe_mult = 0.0                  # 사격 자세 — 완전 정지
+            elif dist > self.AI_PREF_MAX:
                 fwd = 1.0                          # 멀면 접근
             elif dist < self.AI_PREF_MIN:
                 fwd = -1.0                         # 너무 가까우면 후퇴
+            # 피격 직후엔 봇도 잠깐 감속.
+            spd = self.AI_SPEED * (self.HIT_SLOW_MULT if self._ai_slow_t > 0.0 else 1.0)
             sx, sy = -uy, ux                       # 플레이어 기준 오른쪽(수직)
-            mvx = (ux * fwd + sx * self._ai_strafe_dir * 0.85) * self.AI_SPEED
-            mvy = (uy * fwd + sy * self._ai_strafe_dir * 0.85) * self.AI_SPEED
+            mvx = (ux * fwd + sx * self._ai_strafe_dir * strafe_mult) * spd
+            mvy = (uy * fwd + sy * self._ai_strafe_dir * strafe_mult) * spd
             nx0 = self._ai_pos.x + mvx * dt
             ny0 = self._ai_pos.y + mvy * dt
             nx, ny = self.level_collider.resolve(nx0, ny0, PLAYER_RADIUS)
+            # 발판(올라타는 박스) 옆면 충돌 — 봇은 지면(z≈0)이라 윗면보다 낮아 통과 못 함.
+            for p in self._platforms:
+                if self._ai_pos.z < p['top'] - self._step_assist:
+                    nx, ny = p['collider'].resolve(nx, ny, PLAYER_RADIUS)
             moved = ((nx - self._ai_pos.x) ** 2 + (ny - self._ai_pos.y) ** 2) ** 0.5
             self._ai_pos.x, self._ai_pos.y = nx, ny
             moving = moved > 0.003
-            # 벽에 비비면 스트레이프 방향 뒤집어 빠져나오게.
-            if (mvx * mvx + mvy * mvy) > 1e-4 and moved < 0.3 * self.AI_SPEED * dt:
+            # 벽/발판에 비비면 스트레이프 방향 뒤집어 빠져나오게.
+            if (mvx * mvx + mvy * mvy) > 1e-4 and moved < 0.3 * spd * dt:
                 self._ai_strafe_dir *= -1
         # 점프맵 — 봇은 자기 레인 B 코스를 스스로 진행(웨이포인트 추종, 점프하듯 호 그림)
         # 하고 플레이어를 독립적으로 향해 조준/사격. (플레이어를 따라하지 않음.)
@@ -5821,17 +6336,20 @@ class ZombieGame(ShowBase):
                 self._ai_pos.x, self._ai_pos.y,
                 self.player_pos.x, self.player_pos.y):
             return                                # 벽 뒤 — 사격 안 함
-        # 트레이서 방향(상대 yaw/pitch 규칙 재사용) — 내 머리로 피치 조준.
+        # 헤드샷 굴림 — 일정 확률로 머리 조준(데미지↑·트레이서도 머리로). 그 외 몸통.
         gun_z = 1.4
-        tgt_z = self.player_pos.z + self.head_height * 0.9
+        headshot = (not weak) and random.random() < 0.28
+        tgt_z = self.player_pos.z + self.head_height * (0.95 if headshot else 0.5)
         pitch = degrees(atan2(tgt_z - gun_z, dist))
         self._show_remote_tracer((0, 0, 0, self._ai_yaw, pitch))
         vol = self._remote_dist_volume(1.3, 5.0, 90.0)
         if vol > 0.0:
             self._play_pool_vol(self._r_sfx_m16, '_r_sfx_m16_i', vol)
-        # 명중 확률 — 가까울수록 높게(0.3~0.78). 빗나가면 데미지 없음.
-        acc = max(0.30, min(0.78, 0.82 - dist * 0.018))
+        # 명중 확률 — 살짝 낮춤(0.28~0.60). '멈춰 쏘므로' 플레이어가 피할 여지를 둔다.
+        acc = max(0.28, min(0.60, 0.64 - dist * 0.016))
         dmg = self.AI_DMG
+        if headshot:
+            dmg = int(self.AI_DMG * 2.2)      # 헤드샷 추가 데미지
         if weak:                              # 점프맵 견제 — 대부분 빗나가고 데미지도 약하게
             acc *= 0.40
             dmg = max(3, self.AI_DMG // 2)
@@ -6834,14 +7352,16 @@ class ZombieGame(ShowBase):
         self._play_pool(self.sfx_hit, '_hit_i')
         self._spawn_hit_particle(world_pos)
         self._spawn_damage_number(world_pos, dmg)
-        self._show_hitmarker()      # 적 명중 — 조준점에 빨간 X
+        self._show_hitmarker()      # 적 명중 — 조준점에 흰 X (처치 시 아래서 레드로)
         if self.ai_mode:
             if self._ai_invuln_t > 0.0:
                 return                       # 봇 부활 무적 — 피해 무효
             # AI 대결 — 로컬 HP 를 직접 깎고, 0 이하면 처치 처리(점수/데스캠/리셋).
             self.ai_hp -= dmg
+            self._ai_slow_t = self.HIT_SLOW_DUR   # 봇도 피격 시 잠깐 감속
             print(f'[ai] AI 명중 zone={zone} dmg={dmg} → hp={self.ai_hp}', flush=True)
             if self.ai_hp <= 0:
+                self._show_hitmarker(kill=True)   # 처치 — 레드 히트마커로 덮어쓰기
                 if self.paint_mode:      # 봇 처치 위치를 내 색으로 칠함(부위별 반경)
                     self._paint_on_kill((self._ai_pos.x, self._ai_pos.y),
                                         zone, self._paint_my_id)
@@ -6862,11 +7382,15 @@ class ZombieGame(ShowBase):
         print(f'[pvp] 상대 명중 zone={zone} dmg={dmg} 누적={self._dmg_dealt}',
               flush=True)
 
-    def _show_hitmarker(self):
-        """적 명중 — 조준점에 빨간 X(히트마커)를 0.18초 점멸."""
+    def _show_hitmarker(self, kill=False):
+        """적 명중 — 조준점에 X(히트마커)를 0.18초 점멸. 일반 명중=흰색,
+        처치(kill=True)=레드. (디자인 .hitx.white / .hitx.red)"""
         if getattr(self, 'hitmarker', None) is None:
             return
-        self.hitmarker.setColorScale(1.0, 0.2, 0.2, 1.0)
+        if kill:
+            self.hitmarker.setColorScale(2.0, 0.22, 0.25, 1.0)   # 흰 베이스 → 레드
+        else:
+            self.hitmarker.setColorScale(1.0, 1.0, 1.0, 1.0)     # 흰색 그대로
         self.hitmarker.show()
         self._hitmarker_t = 0.18
 
@@ -6920,6 +7444,10 @@ class ZombieGame(ShowBase):
         old_hp = self.core_integrity
         self.core_integrity = max(0, self.core_integrity - amount)
         self._show_dmg_flash(old_hp, self.core_integrity)   # 체력바 닳은 구간 플래시
+        if self.core_integrity < old_hp:
+            self._trigger_dmg_vignette()                    # 가장자리 레드 플래시
+            self._trigger_shake(2.6, 0.30)                  # 화면 흔들림(총상은 더 세게)
+            self._slow_t = self.HIT_SLOW_DUR                # 피격 후 잠깐 감속
         # 피격 방향 — 상대 아바타 위치를 source 로 빨간 아크 표시(적 피격과 동일).
         if self._remote_smooth is not None:
             self._show_damage_dir(self._remote_smooth)
@@ -6950,9 +7478,13 @@ class ZombieGame(ShowBase):
         if self.soccer_mode:
             mine = self._goals_a if self._am_a else self._goals_b
             opp = self._goals_b if self._am_a else self._goals_a
-            self.hud_score.setText(f'{mine} : {opp}')
+            self.hud_score_cap.setText('FIRST TO 5')
         else:
-            self.hud_score.setText(f'{self._my_score} : {self._enemy_score}')
+            mine = self._my_score
+            opp = self._enemy_score
+            self.hud_score_cap.setText('FIRST TO 10')
+        self.hud_score_me.setText(str(mine))
+        self.hud_score_op.setText(str(opp))
 
     def _end_match(self, won):
         """매치 종료 — 결과창(승/패 + 킬/데스) 표시 + 이후 정지. 진행 중이면 데스캠도 정리."""
@@ -7264,6 +7796,10 @@ class ZombieGame(ShowBase):
                 self._drop_weapon(av.getPos(self.render), av.getH() - 180,
                                   self._remote_weapon_shown or 'rifle')
                 av.hide()
+                # 손에 든 무기 앵커는 render 직속(av 자식이 아님)이라 av.hide() 로는
+                # 안 사라진다 → 따로 숨겨야 시체 옆에 총이 공중에 안 뜬다.
+                if self._remote_weapon_anchor is not None:
+                    self._remote_weapon_anchor.hide()
                 self._remote_hidden_for_death = True
             print('[pvp] 처치 — 3초 자유 이동', flush=True)
 
@@ -7653,6 +8189,16 @@ class ZombieGame(ShowBase):
             self._apply_slowmo_anim_rate(self._time_scale)
         dt *= self._time_scale
 
+        # 그림자 프러스텀을 플레이어 따라가게(좁은 고해상 그림자 추적).
+        self._update_shadow_frustum()
+        # 피격 연출 타이머 — 화면 흔들림 / 감속 감쇠.
+        if self._shake_t > 0.0:
+            self._shake_t = max(0.0, self._shake_t - dt)
+        if self._slow_t > 0.0:
+            self._slow_t = max(0.0, self._slow_t - dt)
+        if self._ai_slow_t > 0.0:
+            self._ai_slow_t = max(0.0, self._ai_slow_t - dt)
+
         # ── 온라인: 내 상태 송신(스로틀) + 상대 아바타 보간/애니 ──────────────
         # 싱글이면 online_mode=False 라 통째로 건너뜀(네트워크 코드 안 탐).
         if self.online_mode:
@@ -7787,6 +8333,8 @@ class ZombieGame(ShowBase):
                     mv.normalize()
                     spd_mult = (1.0 + (self.ads_move_factor - 1.0) * self.aim_t) \
                         * self._weapon_speed_mult   # 무기별 속도(권총 1.3배)
+                    if self._slow_t > 0.0:          # 피격 직후 잠깐 감속
+                        spd_mult *= self.HIT_SLOW_MULT
                     self.player_pos += mv * (self.move_speed * spd_mult * dt)
                     # 벽 충돌 해소 (XY 평면) — 박스 안쪽으로 침투했으면 바깥으로 밀어냄.
                     nx, ny = self.level_collider.resolve(
@@ -7950,7 +8498,15 @@ class ZombieGame(ShowBase):
                        + right_v * cam_lat_off
                        + Vec3(0, 0, new_up))
             self.camera.setPos(cam_pos)
-            self.camera.setHpr(self.player_yaw, self.player_pitch, 0)
+            # 피격 화면 흔들림 — 남은 시간 비례 진폭으로 yaw/pitch/roll 에 랜덤 오프셋.
+            if self._shake_t > 0.0:
+                k = self._shake_t / max(0.001, self._shake_dur)
+                a = self._shake_mag * k
+                self.camera.setHpr(self.player_yaw + random.uniform(-a, a),
+                                   self.player_pitch + random.uniform(-a, a),
+                                   random.uniform(-a, a))
+            else:
+                self.camera.setHpr(self.player_yaw, self.player_pitch, 0)
 
         # 데스캠 — 죽은 사람은 자기 시체 머리 위(뒤쪽) 3인칭에서 내려다봄.
         if self._dead and self._corpse is not None:
