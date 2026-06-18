@@ -1,6 +1,6 @@
-# zombie_game
+# Null Project
 
-Mirror's Edge 스타일 1인칭 좀비 슈터 프로토타입 (Panda3D).
+Mirror's Edge 스타일 1인칭 슈터 프로토타입 (Panda3D).
 풀바디 Mixamo Y Bot 캐릭터를 그대로 두고 카메라를 머리 본에 attach해서 — 아래 보면 자기 몸/다리, 옆 보면 어깨가 보이는 시점. 9mm 권총을 RightHand 본에 부착해서 사격 / 슬라이드 후퇴 / 5단계 IK 재장전까지 동작.
 
 > 이전 ursina 기반 FPS 프로토타입은 `zombie_game_ursina.py` 로 보존 (참고용).
