@@ -44,6 +44,8 @@ from weapon_config import (
     RIFLE_LOCAL_SCALE, RIFLE_LOCAL_POS, RIFLE_LOCAL_HPR, RIFLE_MUZZLE_POS,
     RIFLE_LOCAL_PREROT, WEAPON_BODY_OFFSET, WEAPON_BODY_HPR, WEAPON_ADS_OFFSET,
     WEAPON_SPRAY)
+from player_health import PlayerHealth   # 플레이어 체력(코어 무결성) 규칙
+from enemy_health import EnemyHealth     # 적(AI 봇) 체력 규칙
 
 # ── 성능 PRC: GPU 스키닝 ────────────────────────────────────────────────────
 # 적 14마리 × Mixamo 본 67개 × CPU 정점 변환 매 프레임 = 화각에 적 많을 때 FPS 폭락.
@@ -386,6 +388,26 @@ PAINT_COLORS = {1: (0.20, 0.45, 1.0, 1.0), 2: (1.0, 0.50, 0.12, 1.0)}
 # 킬 부위별 칠하는 디스크 반경(m) — 헤드샷이 가장 넓게. (1m 격자라 작게 — 칸 수 과증가 방지)
 PAINT_KILL_RADIUS = {'head': 1.8, 'body': 1.2, 'other': 0.7}
 PAINT_TIME = 180.0          # 한 판 제한시간(초, 3분) — 끝나면 많이 칠한 쪽 승리
+# 스폰 캠핑 방지(페인트 전용) — 자기 스폰룸 안에 오래 머물면 경고 후 지속 데미지.
+SPAWN_CAMP_WARN = 8.0       # 이 시간(초)부터 화면 경고
+SPAWN_CAMP_LIMIT = 10.0     # 이 시간(초)부터 데미지 시작
+SPAWN_CAMP_DPS = 15.0       # 초당 데미지(HP/s)
+
+# 적 AI 난이도 — easy/medium/hard. 모드 선택창에서 고름. 헤드샷 확률·정확도·무빙샷
+# (움직이며 사격) 여부/정확도·이동속도·연사·데미지를 한 번에 조절.
+AI_BASE_SPEED = 4.2
+AI_BASE_FIRE_INTERVAL = 0.22
+AI_BASE_DMG = 10
+BOT_DEATH_DUR = 1.6         # 추가 봇 사망 모션(시체) 시간(초) — 끝나면 부활
+AI_DIFFICULTY = {
+    #          헤드샷  정확도배율  무빙샷확률  무빙정확도  속도   연사배율  데미지배율
+    'easy':   {'headshot': 0.10, 'acc': 0.70, 'move_shoot': 0.00, 'move_acc': 0.35,
+               'speed': 0.85, 'fire': 1.5, 'dmg': 0.8},
+    'medium': {'headshot': 0.25, 'acc': 1.00, 'move_shoot': 0.40, 'move_acc': 0.65,
+               'speed': 1.00, 'fire': 1.0, 'dmg': 1.0},
+    'hard':   {'headshot': 0.40, 'acc': 1.30, 'move_shoot': 0.80, 'move_acc': 1.00,
+               'speed': 1.15, 'fire': 0.8, 'dmg': 1.2},
+}
 
 # 무기별 스탯 — _equip_weapon 이 적용. ammo_max=탄창, cooldown=발사간격(s),
 # auto=연발(mouse1 hold 연사), head_onekill=헤드샷 즉사.
@@ -1489,7 +1511,7 @@ class SoccerBall:
 
 class ZombieGame(ShowBase):
     def __init__(self, online=False, spawn_b=False, menu=True, soccer=False,
-                 paint=False, jump=False):
+                 paint=False, jump=False, enemies=1):
         super().__init__()
         # 직접실행('--soccer'/'--paint'/'--jump') — 상대 없이 솔로(AI 봇)로 시작. 멀티는 메뉴로.
         self._paint_solo_launch = paint and not online
@@ -1501,6 +1523,7 @@ class ZombieGame(ShowBase):
         self._jump_checkpoint = None
         self._jump_start_t = 0.0
         self._jump_finished = False
+        self._jump_started = False     # 점프맵 — 카운트다운(FIGHT) 전엔 봇 정지
         # 아레나 스폰 측 — False=스폰 A(0,-15 북향), True=스폰 B(0,15 남향).
         # 두 클라이언트가 겹치지 않게 한쪽은 '--p2' 로 띄운다(릴레이는 역할 배정 못함).
         self._spawn_b = spawn_b
@@ -1532,6 +1555,7 @@ class ZombieGame(ShowBase):
                             or self._jump_solo_launch)
         self.ai_max_hp = 100
         self.ai_hp = self.ai_max_hp
+        self.enemy_health = EnemyHealth(self.ai_max_hp)   # 적 체력 규칙(데미지/사망)
         self._ai_pos = Vec3(0, 0, 0)      # AI 봇 현재 위치(이동/충돌 해소 대상)
         self._ai_spawn = Vec3(0, 0, 0)    # AI 스폰(라운드 리셋 시 복귀)
         self._ai_yaw = 0.0
@@ -1549,18 +1573,29 @@ class ZombieGame(ShowBase):
         self._ai_jump_done = False        # 봇 결승 도달 여부
         self._ai_strafe_dir = 1           # 좌우 스트레이프 방향(+1/-1)
         self._ai_strafe_t = 0.0           # 스트레이프 방향 전환까지 남은 시간(초)
-        # AI 튜닝 — 이동/교전 거리/사격.
-        self.AI_SPEED = 4.2               # m/s
+        self._ai_mobile_shoot = False     # 이번 스트레이프 구간 동안 '무빙샷' 여부(난이도)
+        self._ai_in_spawn = False         # 봇이 자기 스폰 안인지(스폰 안 사격 금지)
+        self._ai_exit_door_x = None       # 봇이 이번에 나갈 문 x(여러 방향 분산)
+        # AI 튜닝 — 이동/교전 거리/사격. (속도/연사/데미지는 난이도가 곱으로 덮어씀)
         self.AI_PREF_MIN = 5.0            # 이보다 가까우면 후퇴
         self.AI_PREF_MAX = 11.0           # 이보다 멀면 접근
         self.AI_SHOOT_RANGE = 32.0        # 이 안이면 사격 시도
-        self.AI_FIRE_INTERVAL = 0.22      # 발 간격(초) — 소총 연사 느낌
-        self.AI_DMG = 10                  # 한 발 명중 시 내 체력 감소
         # AI 탄약 — 다 쓰면 재장전(모든 모드). 재장전 중엔 사격 안 함.
         self.AI_AMMO_MAX = 25
         self.AI_RELOAD_DUR = 2.2          # 재장전 시간(초)
         self._ai_ammo = self.AI_AMMO_MAX
         self._ai_reload_t = 0.0
+        # 난이도(easy/medium/hard) — 모드 선택창에서 고름. 기본 medium.
+        self._solo_difficulty = 'medium'
+        # 적 봇 수 — 솔로 메뉴에서 1~5 선택(AI DUEL/PAINT). 기본 1(=오늘과 동일).
+        # 직접실행(--enemies N)은 soccer/jump 이면 강제 1.
+        self._solo_enemies = max(1, min(5, int(enemies)))   # 메뉴 선택값
+        self._ai_enemy_count = (1 if (self._soccer_solo_launch
+                                      or self._jump_solo_launch)
+                                else self._solo_enemies)     # 실제 적용값
+        self._ai_enemy_count = max(1, min(5, self._ai_enemy_count))
+        self._ai_bots = []                # 추가 봇(인덱스 1..n-1). 봇0은 기존 _ai_* 머신
+        self._apply_ai_difficulty('medium')   # AI_SPEED/FIRE/DMG + 헤드샷·정확도 세팅
         # 준비방(로비) — 멀티 입장 시 이름 입력 + 양쪽 준비완료 후 시작.
         self.player_name = 'PLAYER'   # 멀티 입장 시 이름 입력으로 덮어씀(패킷에 실어 전송)
         self._in_lobby = False        # 준비방 진행 중(커서 보이게 + 마우스룩/카운트다운 보류)
@@ -1648,6 +1683,16 @@ class ZombieGame(ShowBase):
         self._spawn_barriers = []         # 런타임이 collider.walls 에 add/remove
         self._shimmer_cards = []          # 배리어 반투명 카드(해제 시 fade)
         self._barriers_active = False     # 배리어가 walls 에 들어가 있는 동안 True
+        # 스폰룸(페인트 전용) — 내 팀/적 팀 막(통과 skip 용) + 스폰존(캠핑 데미지) + 타이머.
+        self._spawn_mem_mine = []         # 내가 통과하는 막(내 팀 스폰)
+        self._spawn_mem_enemy = []        # AI 봇이 통과하는 막(적 팀 스폰)
+        self._spawn_zone_mine = None      # (x0,x1,y0,y1) 내 스폰 내부
+        self._spawn_zone_enemy = None     # 적(AI) 스폰 내부
+        self._spawn_dwell = 0.0           # 내가 스폰존에 머문 시간
+        self._spawn_dmg_accum = 0.0       # 데미지 소수 누적(정수 단위로 적용)
+        self._ai_spawn_dwell = 0.0
+        self._ai_spawn_dmg_accum = 0.0
+        self._spawn_warn_np = None        # '스폰을 떠나라' 경고 텍스트
         self._countdown_t = None          # None=상대 대기, 5.0→0 카운트다운
         self._fight_t = 0.0               # FIGHT! 배너 잔여 표시(초)
         self._shimmer_a = 0.25            # shimmer 현재 alpha (fade 용)
@@ -1672,10 +1717,13 @@ class ZombieGame(ShowBase):
         # 윈도우/마우스 — 시작 메뉴 동안은 커서 보이게(버튼 클릭용). 게임 시작 시
         # _build_world() 가 커서 숨김 + 화면 가둠(FPS 마우스룩)으로 전환한다.
         props = WindowProperties()
-        props.setTitle('zombie_game')
+        props.setTitle('Null Project')
         self.win.requestProperties(props)
         self.disableMouse()  # ShowBase 기본 마우스-카메라 비활성
         self._is_fullscreen = False   # F11 토글 — 진짜 전체화면(작업표시줄 가림)
+        # F11 은 메뉴/인게임 어디서든 동작해야 하므로 여기(__init__)서 한 번 바인딩한다.
+        # (_bind_inputs 는 _build_world 에서만 돌아 메뉴 화면엔 F11 이 안 걸렸었다.)
+        self.accept('f11', self._toggle_fullscreen)
         self.setBackgroundColor(0.015, 0.020, 0.030)   # 어두운 검푸른 야간 하늘
 
         # ── 설정/오디오/릴레이 상태 — 메뉴(SETTINGS/로비)에서 _build_world 전에도
@@ -1688,6 +1736,20 @@ class ZombieGame(ShowBase):
         self._vol_sfx = 1.0
         self._relay_host = None   # 로비에서 입력한 릴레이 주소(없으면 모듈 기본)
         self._relay_port = None
+
+        # ── UI 사운드 — 모든 DirectButton 공통 hover(마우스 진입)/click 효과음.
+        # 클릭음만 DGG 전역 기본값(PGItem B1PRESS)으로 자동 재생한다. 호버음은 자동
+        # 재생을 쓰지 않고(_play_ui_hover 로 직접) — 연속 호버 시 사운드가 겹쳐 '터지는'
+        # 문제와, 클릭 직후 새 버튼이 커서 밑에 떠 호버음이 또 나는 문제를 막기 위해
+        # 디바운스 + 클릭 직후 억제를 직접 건다.
+        self.sfx_ui_hover = self._load_sfx('Gentle_soft_UI_hover_#1-1781368393723.wav')
+        self.sfx_ui_click = self._load_sfx('user_interface_click_#2-1781369163746.wav')
+        if self.sfx_ui_click is not None:
+            DGG.setDefaultClickSound(self.sfx_ui_click)
+        self._ui_hover_last = -999.0      # 마지막 호버음 재생 시각(real time)
+        self._ui_click_last = -999.0      # 마지막 클릭 시각 — 직후 호버음 억제용
+        # 메뉴 단계에서 클릭 시각 기록(게임 시작 시 mouse1 이 사격으로 재바인딩되며 대체됨).
+        self.accept('mouse1', self._ui_note_click)
 
         # ── 시작 화면 ───────────────────────────────────────────────────────
         # 타이틀 + 싱글/멀티/종료 메뉴. 월드 빌드(_build_world)는 메뉴 선택 이후로
@@ -1866,13 +1928,8 @@ class ZombieGame(ShowBase):
             for p in self._parts:
                 self.ybot.loop('Idle', partName=p)
 
-        # Kneel 상태 머신: stand → (going_down=StandToKneel 단발) → kneel
-        #                 kneel → (going_up=KneelToStand 단발) → stand
-        # transition 중에는 이동/사격 모두 잠금.
-        self.kneel_state = 'stand'
         self.current_anim = 'Idle'        # upper 파트의 현재 상태 (HUD 표시용)
         self._hands_oneshot = False       # hands 가 Shoot 단발 중인지
-        self._anim_token = 0              # Kneel transition 단발 토큰
         self._hands_token = 0             # Shoot 단발 토큰
         self._reload_oneshot = False
         self._reload_token = 0
@@ -1898,13 +1955,13 @@ class ZombieGame(ShowBase):
         # 프레임이 갑자기 튀지 않게 함.
         self._loop_anim_set = {
             'Idle', 'RunForward', 'RunBackward', 'StrafeL', 'StrafeR',
-            'KneelIdle', 'Jump',
+            'Jump',
             # Walk* 도 loop 만 깔아둠 — 현재 코드에선 미사용이지만 추후 Shift+이동
             # 같은 걸 붙일 때 시작 프레임이 튀지 않게 미리 돌려 둠.
             'WalkForward', 'WalkBackward',
             # 소총(Pro Rifle Pack) 로코모션 — 소총 장착 시 _target_anim 이 선택.
             'RifleIdle', 'RifleRunForward', 'RifleRunBackward',
-            'RifleStrafeL', 'RifleStrafeR', 'RifleKneelIdle', 'RifleJump',
+            'RifleStrafeL', 'RifleStrafeR', 'RifleJump',
             'RifleWalkForward', 'RifleWalkBackward',
         }
         for a in self.anim_names:
@@ -2054,6 +2111,7 @@ class ZombieGame(ShowBase):
         # HUD 요소로 노출 — take_core_damage() 로 깎으면 자동 반영된다.
         self.core_integrity = 100
         self.core_integrity_max = 100
+        self.player_health = PlayerHealth(self.core_integrity_max)  # 플레이어 체력 규칙
         # 피격 방향 표시 — 데미지 입은 방향으로 조준점 둘레 빨간 아크, 잠깐 보이고 fade.
         self._dmg_arc_geom = None
         self._dmg_dir_t = 0.0
@@ -2107,8 +2165,8 @@ class ZombieGame(ShowBase):
         }
         self._last_kill_snd = None
         self._kill_tier = 0             # 현재 콤보 단계 (1..5)
-        self._combo_window = 0.0        # 콤보 유지 남은 시간(초)
-        self.kill_combo_dur = 5.0       # 연속킬 인정 시간
+        self._combo_window = 0.0        # 콤보 유지 남은 시간(초) — 1v1 외 모드에서만 사용
+        self.kill_combo_dur = 4.0       # 연속킬 인정 시간(4초 내 다음 킬이면 단계 상승)
         self.kills = 0                  # 총 처치 수 (HUD)
 
         # 피격 사운드 — 부위(head/body/other) 상관없이 Voicy_Headshot 으로 통일.
@@ -2196,8 +2254,7 @@ class ZombieGame(ShowBase):
         self._build_pause_menu()
         # 화면 중앙 십자 조준점
         self._build_crosshair()
-        # 화면 하단 연속킬 콤보 게이지 (남은 시간 → 왼쪽으로 슬라이드 소진)
-        self._build_combo_bar()
+        # (연속킬 콤보 게이지 제거 — 시간제한 없이 죽일수록 킬 사운드 단계만 오른다)
         # 발로란트 스타일 킬배너 (처치 시 하단 중앙에 '쾅' 등장)
         self._build_kill_banner()
 
@@ -2235,6 +2292,9 @@ class ZombieGame(ShowBase):
             self._setup_paint()       # 색 배정 + 페인트 격자 참조
         if self.jump_mode:
             self._setup_jump()        # 스폰/발판/체크포인트/결승 세팅
+        # 추가 봇(적 수>1, AI DUEL/PAINT) — 스폰존/막이 모두 세팅된 뒤 생성.
+        if self.ai_mode:
+            self._setup_extra_bots()
 
         # 메인 루프
         self.taskMgr.add(self._update, 'game_update')
@@ -2266,6 +2326,25 @@ class ZombieGame(ShowBase):
         self._tac_hero_font = _load(TAC_FONT_HERO_PATH)
         self._tac_display_font = _load(TAC_FONT_DISPLAY_PATH)
         self._tac_label_font = _load(TAC_FONT_LABEL_PATH)
+
+    def _ui_note_click(self):
+        """좌클릭 시각 기록(real time) — 클릭 직후 호버음 중복 억제에 쓴다."""
+        self._ui_click_last = ClockObject.getGlobalClock().getRealTime()
+
+    def _play_ui_hover(self):
+        """버튼 호버음 — 연속 호버로 사운드가 겹쳐 터지지 않게 디바운스(0.07s)하고,
+        클릭 직후(0.18s) 새 버튼이 커서 밑에 떠 ENTER 가 또 울리는 것도 억제한다.
+        일시정지 중에도 동작하도록 frame time 이 아닌 real time 을 쓴다."""
+        s = self.sfx_ui_hover
+        if s is None:
+            return
+        now = ClockObject.getGlobalClock().getRealTime()
+        if now - self._ui_click_last < 0.18:   # 막 클릭함 → 호버음 억제
+            return
+        if now - self._ui_hover_last < 0.07:   # 연속 호버 디바운스(터짐 방지)
+            return
+        self._ui_hover_last = now
+        s.play()
 
     def _tac_button(self, parent, text, pos, w, h, command,
                     text_scale=0.052, variant='base', arrow=False):
@@ -2313,6 +2392,7 @@ class ZombieGame(ShowBase):
             arrow_np = _tac_tri_right(btn, r - 0.05, 0.0, text_scale * 0.34, acol)
 
         def _enter(_=None):
+            self._play_ui_hover()
             if variant == 'ghost':
                 surf.setColorScale(1, 1, 1, 1.0)
                 lbl.setFg(TAC_TEXT_1)
@@ -2376,7 +2456,7 @@ class ZombieGame(ShowBase):
 
         # ── 캡션: 레드 틱 + CONTAINMENT PROTOCOL ──────────────────────────────
         _tac_fill(root, lx, lx + 0.10, 0.516, 0.524, TAC_ACCENT)
-        OnscreenText(text='CONTAINMENT  PROTOCOL', pos=(lx + 0.135, 0.508),
+        OnscreenText(text='FIRST-PERSON SHOOTER', pos=(lx + 0.135, 0.508),
                      scale=0.030, fg=TAC_TEXT_2, align=TextNode.ALeft,
                      mayChange=False, parent=root, font=self._tac_label_font)
 
@@ -2388,7 +2468,7 @@ class ZombieGame(ShowBase):
                      fg=TAC_ACCENT, align=TextNode.ALeft, mayChange=False,
                      parent=root, font=self._tac_hero_font)
         OnscreenText(
-            text='ISOLATE THE BREACH  ·  PURIFY THE FACILITY  ·  TRUST NO SIGNAL',
+            text='AIM  ·  SHOOT  ·  WIN',
             pos=(lx, -0.04), scale=0.028, fg=TAC_TEXT_2, align=TextNode.ALeft,
             mayChange=False, parent=root, font=self._tac_label_font)
 
@@ -2416,7 +2496,7 @@ class ZombieGame(ShowBase):
                                      (-0.04, 0, 0), blendType='easeOut')).start()
 
         # ── 푸터: © SECTOR-7 … + 우측 틱 ──────────────────────────────────────
-        OnscreenText(text='© SECTOR-7 SIMULATION DIVISION', pos=(lx, -0.92),
+        OnscreenText(text='© NULL PROJECT', pos=(lx, -0.92),
                      scale=0.025, fg=TAC_TEXT_3, align=TextNode.ALeft,
                      mayChange=False, parent=root, font=self._tac_label_font)
         ticks = LineSegs('foot_ticks')
@@ -2466,6 +2546,7 @@ class ZombieGame(ShowBase):
         nz = zc - 0.026                        # 이름 baseline z
 
         def _en(_=None):
+            self._play_ui_hover()
             LerpColorScaleInterval(hover, 0.10, (1, 1, 1, 1), (1, 1, 1, 0),
                                    blendType='easeOut').start()   # 회색 베이스 페이드인
             slash.setSx(0.001)
@@ -2553,11 +2634,11 @@ class ZombieGame(ShowBase):
         OnscreenText(text='ENEMY OUTLINE', pos=(lx, -0.32), scale=0.026,
                      fg=TAC_TEXT_2, align=TextNode.ALeft, mayChange=False,
                      parent=scr, font=self._tac_label_font)
-        self._build_outline_swatches(scr, -0.42, sw=0.10, cx=lx + 0.05, left=True)
+        self._build_outline_swatches(scr, -0.42, sw=0.115, cx=lx + 0.05, left=True)
         # ── 우측: CONTROLS 표 ──
         self._tac_panel_head(scr, 'CONTROLS', colR, rx, 0.36)
         controls = [('W / S', 'MOVE'), ('A / D', 'STRAFE'), ('SPACE', 'JUMP'),
-                    ('CTRL', 'CROUCH'), ('LMB', 'FIRE'), ('R', 'RELOAD'),
+                    ('LMB', 'FIRE'), ('R', 'RELOAD'),
                     ('F', 'INTERACT'), ('ESC', 'PAUSE')]
         rowh, top = 0.078, 0.28
         _tac_outline(scr, colR, rx, top - rowh * len(controls), top, TAC_LINE,
@@ -2649,8 +2730,7 @@ class ZombieGame(ShowBase):
                               (self.player_name or 'YOU').upper(), 'CONNECTED')
         self._tac_player_slot(scr, mid + 0.02, rx, 0.04, 0.30, False, 'P2',
                               'OPEN SLOT', 'AWAITING…')
-        self._lobby_ready_node = scr.attachNewNode('lobby_ready')
-        self._rebuild_lobby_ready()
+        # (READY 토글 제거 — 시작은 START 버튼이 한다. 토글은 동작이 없어 혼란만 줬음.)
         self._tac_button(scr, 'BACK', (colR + 0.19, 0, -0.44), 0.36, 0.09,
                          lambda: self._close_menu_overlay(scr), variant='ghost')
         self._tac_button(scr, 'START', (rx - 0.22, 0, -0.44), 0.4, 0.09,
@@ -2684,6 +2764,7 @@ class ZombieGame(ShowBase):
         def _en(_=None):
             if on:
                 return
+            self._play_ui_hover()
             surf.setColor(*TAC_SURF_TOP)
             lbl.setFg(TAC_TEXT_1)
             under.setSx(0.001)
@@ -2799,15 +2880,24 @@ class ZombieGame(ShowBase):
                      scale=0.024, fg=TAC_TEXT_3, align=TextNode.ALeft,
                      mayChange=False, parent=scr, font=self._tac_label_font)
         # 모드 칩
-        self._tac_panel_head(scr, 'MODE', lx, rx, 0.36)
+        self._tac_panel_head(scr, 'MODE', lx, rx, 0.45)
         self._solo_modes_node = scr.attachNewNode('solo_modes')
         self._rebuild_solo_modes()
-        # 콜사인
+        # 난이도 칩 (EASY / MEDIUM / HARD) — 적 AI 강도.
+        self._tac_panel_head(scr, 'DIFFICULTY', lx, rx, 0.28)
+        self._solo_diff_node = scr.attachNewNode('solo_diff')
+        self._rebuild_solo_difficulty()
+        # 적 수 칩 (1~5) — AI DUEL / PAINT 에서 봇 수. (SOCCER/JUMP 은 항상 1)
+        self._tac_panel_head(scr, 'ENEMIES', lx, rx, 0.11)
+        self._solo_enemies_node = scr.attachNewNode('solo_enemies')
+        self._rebuild_solo_enemies()
+        # 콜사인 — 한글 입력 차단 + 입력 시 아래 슬롯 이름 라이브 갱신.
         self._solo_name_entry = self._tac_field(
-            scr, 'CALLSIGN', lx, lx + 0.7, 0.11, self.player_name)
+            scr, 'CALLSIGN', lx, lx + 0.7, -0.13, self.player_name)
+        self._attach_callsign_filter(self._solo_name_entry)
         # ── 내 슬롯(가로로 길게, 상대 슬롯 없음) ──
-        self._tac_panel_head(scr, 'OPERATOR', lx, rx, -0.02)
-        sb, st = -0.30, -0.10
+        self._tac_panel_head(scr, 'OPERATOR', lx, rx, -0.26)
+        sb, st = -0.50, -0.32
         _tac_fill(scr, lx, rx, sb, st, TAC_BG_SURF, notch=0.04, corners=('tl',))
         _tac_outline(scr, lx, rx, sb, st, TAC_ACCENT_DIM, notch=0.04,
                      corners=('tl',), thickness=1.4)
@@ -2818,16 +2908,17 @@ class ZombieGame(ShowBase):
         OnscreenText(parent=scr, text='YOU', pos=(lx + 0.066, st - 0.056),
                      scale=0.022, fg=TAC_ACCENT, align=TextNode.ALeft,
                      font=self._tac_label_font, mayChange=False)
-        OnscreenText(parent=scr, text=(self.player_name or 'OPERATOR'),
-                     pos=(lx + 0.03, (sb + st) / 2 - 0.02), scale=0.055,
-                     fg=TAC_TEXT_1, align=TextNode.ALeft, mayChange=False)
+        self._solo_name_label = OnscreenText(
+            parent=scr, text=(self.player_name or 'OPERATOR'),
+            pos=(lx + 0.03, (sb + st) / 2 - 0.02), scale=0.055,
+            fg=TAC_TEXT_1, align=TextNode.ALeft, mayChange=True)
         OnscreenText(parent=scr, text='READY TO DEPLOY', pos=(rx - 0.03, sb + 0.05),
                      scale=0.024, fg=TAC_TEXT_2, align=TextNode.ARight,
                      font=self._tac_label_font, mayChange=False)
         # BACK / START
-        self._tac_button(scr, 'BACK', (lx + 0.19, 0, -0.46), 0.36, 0.10,
+        self._tac_button(scr, 'BACK', (lx + 0.19, 0, -0.60), 0.36, 0.10,
                          lambda: self._close_menu_overlay(scr), variant='ghost')
-        self._tac_button(scr, 'START', (rx - 0.22, 0, -0.46), 0.4, 0.10,
+        self._tac_button(scr, 'START', (rx - 0.22, 0, -0.60), 0.4, 0.10,
                          self._solo_start, variant='accent', arrow=True)
 
     def _rebuild_solo_modes(self):
@@ -2838,7 +2929,7 @@ class ZombieGame(ShowBase):
         lx = -ar * 0.85
         modes = [('ai', 'AI DUEL'), ('soccer', 'SOCCER'),
                  ('paint', 'PAINT'), ('jump', 'JUMP')]
-        w, gap, z = 0.28, 0.022, 0.27
+        w, gap, z = 0.28, 0.022, 0.38
         for i, (key, lbl) in enumerate(modes):
             x0 = lx + i * (w + gap)
             x1 = x0 + w
@@ -2849,6 +2940,62 @@ class ZombieGame(ShowBase):
         self._solo_mode = mode
         self._rebuild_solo_modes()
 
+    def _rebuild_solo_difficulty(self):
+        node = self._solo_diff_node
+        for c in list(node.getChildren()):
+            c.removeNode()
+        ar = self.getAspectRatio()
+        lx = -ar * 0.85
+        diffs = [('easy', 'EASY'), ('medium', 'MEDIUM'), ('hard', 'HARD')]
+        w, gap, z = 0.38, 0.022, 0.21
+        for i, (key, lbl) in enumerate(diffs):
+            x0 = lx + i * (w + gap)
+            x1 = x0 + w
+            self._tac_mode_chip(node, x0, x1, z, lbl, self._solo_difficulty == key,
+                                (lambda k=key: self._solo_set_difficulty(k)))
+
+    def _solo_set_difficulty(self, d):
+        self._solo_difficulty = d
+        self._rebuild_solo_difficulty()
+
+    def _rebuild_solo_enemies(self):
+        node = self._solo_enemies_node
+        for c in list(node.getChildren()):
+            c.removeNode()
+        ar = self.getAspectRatio()
+        lx = -ar * 0.85
+        counts = [1, 2, 3, 4, 5]
+        w, gap, z = 0.20, 0.022, 0.04
+        for i, n in enumerate(counts):
+            x0 = lx + i * (w + gap)
+            x1 = x0 + w
+            self._tac_mode_chip(node, x0, x1, z, str(n),
+                                self._solo_enemies == n,
+                                (lambda k=n: self._solo_set_enemies(k)))
+
+    def _solo_set_enemies(self, n):
+        self._solo_enemies = n
+        self._rebuild_solo_enemies()
+
+    def _attach_callsign_filter(self, entry):
+        """콜사인 입력칸 — ASCII(영문/숫자/기호)만 허용. 한글 등 비ASCII 는 입력 즉시
+        제거(한글 입력으로 IME 가 막혀 영문도 안 쳐지던 문제 방지). 입력할 때마다 아래
+        슬롯의 이름 표시도 라이브로 갱신한다."""
+        gi = entry.guiItem
+        # 타입/지움 이벤트는 guiEvent 인자를 함께 보낸다 → 람다로 흡수(인자 불일치로
+        # 예외나면 키 입력이 먹히지 않던 문제 방지). 영문은 정상 입력, 비ASCII만 제거.
+        for ev in (gi.getTypeEvent(), gi.getEraseEvent()):
+            self.accept(ev, lambda *a, e=entry: self._on_callsign_change(e))
+
+    def _on_callsign_change(self, entry):
+        txt = entry.get()
+        clean = ''.join(c for c in txt if 32 <= ord(c) < 127)[:8]  # ASCII 출력가능만
+        if clean != txt:
+            entry.set(clean)
+            entry.setCursorPosition(len(clean))
+        if getattr(self, '_solo_name_label', None) is not None:
+            self._solo_name_label.setText(clean or 'OPERATOR')
+
     def _solo_start(self):
         # 솔로 즉시 시작 — AI 봇 상대(online=False, ai=True). 모드 칩으로 분기.
         if self._menu_root is None or self._game_started:
@@ -2857,10 +3004,12 @@ class ZombieGame(ShowBase):
         self.player_name = name[:8]
         m = getattr(self, '_solo_mode', 'ai')
         self._start_game(False, True, soccer=(m == 'soccer'),
-                         paint=(m == 'paint'), jump=(m == 'jump'))
+                         paint=(m == 'paint'), jump=(m == 'jump'),
+                         difficulty=getattr(self, '_solo_difficulty', 'medium'),
+                         enemies=getattr(self, '_solo_enemies', 1))
 
     def _start_game(self, online, ai=False, soccer=False, paint=False,
-                    jump=False):
+                    jump=False, difficulty='medium', enemies=1):
         # 메뉴에서 모드 확정 → 메뉴 제거 후 실제 게임 월드 빌드(한 번만).
         if self._game_started:
             return
@@ -2870,6 +3019,10 @@ class ZombieGame(ShowBase):
         self.soccer_mode = soccer
         self.paint_mode = paint
         self.jump_mode = jump
+        # 적 봇 수 — SOCCER/JUMP 은 항상 1, AI DUEL/PAINT 만 1~5 허용.
+        self._ai_enemy_count = (1 if (soccer or jump)
+                                else max(1, min(5, int(enemies))))
+        self._apply_ai_difficulty(difficulty)   # 적 AI 강도(헤드샷/정확도/무빙샷/속도)
         if self._menu_root is not None:
             self._menu_root.destroy()
             self._menu_root = None
@@ -2912,6 +3065,13 @@ class ZombieGame(ShowBase):
                 z.outline.setColor(self.outline_color, 1)
         if self._remote_outline is not None:
             self._remote_outline.setColor(self.outline_color, 1)
+        # AI 대결에서 적 수>1 이면 봇0(remote_avatar)을 숨기고 적를 모두
+        # self._ai_bots 로 통일한다. 이 봇들의 테두리는 self.zombies 에도
+        # _remote_outline 에도 없어 위 루프가 못 잡으므로 직접 갱신한다.
+        for b in getattr(self, '_ai_bots', []):
+            ol = b.get('outline')
+            if ol is not None and not ol.isEmpty():
+                ol.setColor(self.outline_color, 1)
         self._refresh_outline_swatches()
 
     def _refresh_outline_swatches(self):
@@ -3099,10 +3259,6 @@ class ZombieGame(ShowBase):
         self.accept('f2', self._toggle_editor)
         self.accept('f3', self._toggle_debug)
         self.accept('f11', self._toggle_fullscreen)   # 진짜 전체화면 토글
-        # Ctrl 토글 — Panda3D 에선 'control' 단독 이벤트가 안 들어오므로 lcontrol/
-        # rcontrol 만 바인딩 (left/right 둘 다 잡힘)
-        for k in ('lcontrol', 'rcontrol'):
-            self.accept(k, self._toggle_kneel)
 
         # 무기 위치/회전 튜닝 하네스 — 장착 무기(self.weapon) local POS/HPR 조절.
         #   이동(POS):  ←/→ = X(좌/우),  ↑/↓ = Y(앞/뒤, 총신),  PageUp/Down = Z(위/아래)
@@ -3422,55 +3578,9 @@ class ZombieGame(ShowBase):
             return Task.done
         self.taskMgr.doMethodLater(3.0, _remove, 'weapon_tune_dump_remove')
 
-    def _toggle_kneel(self):
-        if self._reload_oneshot:
-            return
-        # transition 중에는 무시 (anim 끝까지 재생).
-        if self.kneel_state in ('going_down', 'going_up'):
-            return
-        if self.kneel_state == 'stand':
-            if 'StandToKneel' in self.anim_names:
-                self._play_kneel_transition('StandToKneel', 'going_down', 'kneel')
-            elif 'KneelIdle' in self.anim_names:
-                self.kneel_state = 'kneel'  # transition anim 없으면 즉시 전환
-        else:  # 'kneel'
-            if 'KneelToStand' in self.anim_names:
-                self._play_kneel_transition('KneelToStand', 'going_up', 'stand')
-            else:
-                self.kneel_state = 'stand'
-
-    def _play_kneel_transition(self, anim_name, mid_state, end_state):
-        """무릎꿇기/일어서기 transition 단발 — 모든 파트에 anim 적용."""
-        self.kneel_state = mid_state
-        self.current_anim = anim_name
-        new_t = {a: (1.0 if a == anim_name else 0.0) for a in self.anim_names}
-        self._target_w['lower'] = dict(new_t)
-        self._target_w['upper'] = dict(new_t)
-        if not self._hands_oneshot:
-            self._target_w['hands'] = dict(new_t)
-        for p in ('lower', 'upper'):
-            self.ybot.play(anim_name, partName=p)
-        if not self._hands_oneshot:
-            self.ybot.play(anim_name, partName='hands')
-
-        self._anim_token += 1
-        token = self._anim_token
-        dur = self.ybot.getDuration(anim_name)
-        back_after = max(dur - 0.05, 0.05)
-
-        def _back(task, t=token):
-            if t != self._anim_token:
-                return Task.done
-            self.kneel_state = end_state
-            # current_anim 이 transition anim 이름이라 _update_locomotion 의
-            # `if target != self.current_anim` 분기에서 KneelIdle / Idle 로 자동 갱신.
-            return Task.done
-
-        self.taskMgr.doMethodLater(back_after, _back, 'kneel_transition_return')
-
     def _loco_anim(self, base):
         """소총 장착 시 base 로코모션 anim 을 Pro Rifle Pack 변형(Rifle*)으로 치환.
-        해당 rifle 변형이 bam 에 없으면(예: 무릎 transition) base 그대로 폴백."""
+        해당 rifle 변형이 bam 에 없으면 base 그대로 폴백."""
         if self.weapon_name == 'rifle':
             rifle = 'Rifle' + base
             if rifle in self.anim_names:
@@ -3478,14 +3588,8 @@ class ZombieGame(ShowBase):
         return base
 
     def _target_anim(self):
-        """현재 상태(공중/무릎/이동방향)에 맞는 loop anim 이름.
+        """현재 상태(공중/이동방향)에 맞는 loop anim 이름.
         소총 장착 중이면 _loco_anim 이 Rifle* 변형으로 자동 치환."""
-        if self.kneel_state == 'going_down' and 'StandToKneel' in self.anim_names:
-            return self._loco_anim('StandToKneel')
-        if self.kneel_state == 'going_up' and 'KneelToStand' in self.anim_names:
-            return self._loco_anim('KneelToStand')
-        if self.kneel_state == 'kneel' and 'KneelIdle' in self.anim_names:
-            return self._loco_anim('KneelIdle')
         if not self.on_ground and 'Jump' in self.anim_names:
             return self._loco_anim('Jump')
         fwd = self.keys['w'] - self.keys['s']
@@ -3501,10 +3605,6 @@ class ZombieGame(ShowBase):
         return self._loco_anim('Idle')
 
     def _update_locomotion(self):
-        # Kneel transition 중에는 _play_kneel_transition 이 target_w 를 잡고 있음.
-        # 모든 파트가 transition anim 으로 가야 하니 여기서 건드리지 않음.
-        if self.kneel_state in ('going_down', 'going_up'):
-            return
         target = self._target_anim()
         # Reload 중 W/S = RunForward/RunBackward 는 Mixamo anim 의 Hips pitch
         # (앞으로 숙임) 가 살아있어서 Spine→Arm→Hand 로 전파 → 권총·팔이 화면
@@ -3618,14 +3718,27 @@ class ZombieGame(ShowBase):
         # 상대 플레이어(온라인) — 적/방화벽과 같은 ray 로 히트박스 검사.
         # best_t 보다 더 가까우면 상대를 맞힌 것 → 적/방화벽 판정 무효.
         remote_hit_pos = None
+        hit_bot = None          # None=봇0(또는 온라인 단일 상대), dict=추가 봇
         if self.online_mode or self.ai_mode:
             res = self._remote_hit_test(cam_pos, ray_dir, best_t)
             # 총알이 벽을 못 뚫게 — 나→상대 ray 가 벽/플랫폼(높이 인식)에 막히면 취소.
-            if res is not None and not self._bullet_blocked(
-                    cam_pos, ray_dir, res[0]):
+            # 또한 내 스폰룸 안에서는 상대를 맞혀도 무효(스폰 안에서 사격 금지).
+            if (res is not None and not self._in_own_spawn()
+                    and not self._bullet_blocked(cam_pos, ray_dir, res[0])):
                 best_t, best_zone, remote_hit_pos = res
                 best_z = None
                 best_barrier = None
+            # 추가 봇(적 수>1) — 같은 ray 로 검사해 더 가까운 봇이 있으면 그쪽을 맞힘.
+            if self.ai_mode and not self._in_own_spawn():
+                for _bot in self._ai_bots:
+                    bres = self._bot_hit_test(_bot, cam_pos, ray_dir, best_t)
+                    if bres is None or self._bullet_blocked(
+                            cam_pos, ray_dir, bres[0]):
+                        continue
+                    best_t, best_zone, remote_hit_pos = bres
+                    hit_bot = _bot
+                    best_z = None
+                    best_barrier = None
 
         # 트레이서 종점 — 카메라 ray 상의 실제 명중 지점(없으면 먼 거리). 머즐→이 점으로
         # 트레이서를 그어야 조준점(화면 중앙)에 수렴한다. 머즐에서 평행선만 그으면
@@ -3646,7 +3759,10 @@ class ZombieGame(ShowBase):
                 return            # 공을 맞히면 뒤 판정 무효(공이 막아줌)
 
         if remote_hit_pos is not None:
-            self._on_remote_player_hit(best_zone, remote_hit_pos)
+            if hit_bot is not None:
+                self._on_bot_hit(hit_bot, best_zone, remote_hit_pos)
+            else:
+                self._on_remote_player_hit(best_zone, remote_hit_pos)
             return
         if best_barrier is not None:
             best_barrier.hit()
@@ -3758,18 +3874,25 @@ class ZombieGame(ShowBase):
         self.sfx_foot[i].play()
 
     def _on_zombie_killed(self, zone):
-        """적 처치 시 호출 — 킬 카운트 + 콤보 단계 갱신 + 킬 사운드.
-        zone: 마지막에 맞혀 죽인 부위('head'/'body'/'other'). 콤보 판정에 사용."""
-        headshot = (zone == 'head')
+        """적 처치 시 호출 — 킬 카운트 + 킬 사운드.
+        zone 은 더 이상 사용 안 함(콤보 시간제한 제거). 죽일수록 사운드 단계만 올라간다."""
         self.kills += 1
-        # 직전 킬 5초 이내 + 이번이 헤드샷이면 단계 상승(최대 5), 아니면 1로 리셋.
-        if headshot and self._combo_window > 0.0:
+        # 킬스트릭(킬 사운드 단계) 규칙:
+        #  · 듀얼/데스매치(_is_duel_mode — AI 듀얼 적 1~5기 또는 온라인 PvP):
+        #    시간제한 없이 적을 잡을수록 단계 1→5 상승. 적을 전멸시켜 라운드가 바뀌면
+        #    (_arena_round_reset)에서 0 으로 초기화된다.
+        #  · 그 외(웨이브/페인트/축구/점프): 직전 킬로부터 4초 이내에 죽여야 단계 상승,
+        #    4초가 지났으면 다시 1단계부터.
+        if self._is_duel_mode():
             self._kill_tier = min(self._kill_tier + 1, 5)
         else:
-            self._kill_tier = 1
-        self._combo_window = self.kill_combo_dur
+            if self._combo_window > 0.0:
+                self._kill_tier = min(self._kill_tier + 1, 5)
+            else:
+                self._kill_tier = 1
+            self._combo_window = self.kill_combo_dur
         self._play_kill_sound(self._kill_tier)
-        self._show_kill_banner()   # 발로란트 스타일 킬배너 (콤보 단계 반영)
+        self._show_kill_banner()   # 발로란트 스타일 킬배너
 
     def _play_kill_sound(self, tier):
         """현재 콤보 단계의 킬 사운드 재생. 이전 킬 사운드는 멈춰 겹침 방지."""
@@ -3865,14 +3988,20 @@ class ZombieGame(ShowBase):
             self.muzzle_flash_t = self.muzzle_flash_dur
             self.muzzle_flash.setScale(self.muzzle_flash_base_scale)
             self.muzzle_flash.show()
-            # Tracer — 머즐에서 '실제 명중 지점'(_last_shot_end, 카메라 ray 상)으로 향하게
-            # lookAt + 길이 스케일. 이러면 조준점에 수렴하고 끊겨 보이지 않는다.
+            # Tracer — 머즐에서 '조준점(화면 중앙) × 명중 거리' 지점으로 향하게 한다.
+            # 종점을 카메라 실제 정면(getForward)에 명중 거리만큼 둬서 트레이서가 화면
+            # 중앙 조준점에 정확히 수렴한다. (_last_shot_end 는 탄퍼짐이 섞인 ray 위라
+            # 조준점에 살짝 못 닿아 '조준점 전까지만 날아가는' 듯 보이던 문제 수정.)
             muzzle = self.muzzle_flash.getPos(self.render)
             end = getattr(self, '_last_shot_end', None)
             self.tracer.setPos(muzzle)
             if end is not None:
-                self.tracer.lookAt(end)                  # 로컬 +Y 를 명중점으로
-                dist = (end - muzzle).length()
+                cam_p = self.camera.getPos(self.render)
+                fwd = self.camera.getQuat(self.render).getForward()
+                depth = (end - cam_p).length()            # 실제 명중 거리(깊이)
+                aim_end = cam_p + fwd * depth              # 조준점 방향 × 명중 거리
+                self.tracer.lookAt(aim_end)               # 로컬 +Y 를 조준점으로
+                dist = (aim_end - muzzle).length()
                 self.tracer.setSy(max(0.05, dist / 30.0))  # 30m 기준 라인을 실제 거리로
             else:
                 self.tracer.setHpr(self.player_yaw + self._shot_yaw_off,
@@ -3904,8 +4033,7 @@ class ZombieGame(ShowBase):
         # 소총 장착 시 RifleReload, 그 외 Reload.
         anim = ('RifleReload' if (self.weapon_name == 'rifle'
                                   and 'RifleReload' in self.anim_names) else 'Reload')
-        if (anim not in self.anim_names or self._reload_oneshot
-                or self.kneel_state in ('going_down', 'going_up')):
+        if anim not in self.anim_names or self._reload_oneshot:
             return
         # upper + hands 두 파트만 단발 (lower 는 locomotion 유지 → 달리며 재장전)
         self.ybot.play(anim, partName='upper')
@@ -4019,7 +4147,7 @@ class ZombieGame(ShowBase):
         # ── 캡션: 레드 틱 + SIMULATION HALTED + 레드 틱, 그 아래 PAUSED ──────────
         _tac_fill(gT, -0.205, -0.145, 0.626, 0.634, TAC_ACCENT)
         _tac_fill(gT, 0.145, 0.205, 0.626, 0.634, TAC_ACCENT)
-        OnscreenText(text='SIMULATION HALTED', pos=(0, 0.618), scale=0.026,
+        OnscreenText(text='GAME PAUSED', pos=(0, 0.618), scale=0.026,
                      fg=TAC_TEXT_2, align=TextNode.ACenter, mayChange=False,
                      parent=gT, font=self._tac_label_font)
         OnscreenText(text='PAUSED', pos=(0, 0.475), scale=0.135,
@@ -4122,7 +4250,7 @@ class ZombieGame(ShowBase):
         """적 공격 → 코어 무결성(체력) 깎기. 0 이 되면 게임오버 훅(현재 미구현).
         source_pos 주어지면 그 방향으로 피격 방향 아크 표시."""
         old_hp = self.core_integrity
-        self.core_integrity = max(0, self.core_integrity - amount)
+        self.core_integrity = self.player_health.take_damage(self.core_integrity, amount)
         self._show_dmg_flash(old_hp, self.core_integrity)   # 체력바 닳은 구간 플래시
         if self.core_integrity < old_hp:
             self._trigger_dmg_vignette()                    # 화면 가장자리 레드 플래시
@@ -4292,7 +4420,8 @@ class ZombieGame(ShowBase):
         setattr(self, f'_set_geom_{key}', (track_l, tw, z, th))
         sl['value'] = value0       # 값 동기(텍스트·채움·핸들 갱신)
         # 트랙/핸들 호버 시 핸들 흰→레드 (HTML .slider .track:hover .handle)
-        sl.bind(DGG.WITHIN, lambda _=None: hfill.setColor(*TAC_ACCENT))
+        sl.bind(DGG.WITHIN,
+                lambda _=None: (self._play_ui_hover(), hfill.setColor(*TAC_ACCENT)))
         sl.bind(DGG.WITHOUT, lambda _=None: hfill.setColor(*TAC_TEXT_1))
         return sl
 
@@ -4308,13 +4437,15 @@ class ZombieGame(ShowBase):
                 frameColor=col, relief=DGG.FLAT, frameSize=(-1.1, 1.1, -1.1, 1.1),
                 command=self._set_outline_color, extraArgs=[col])
 
+            # 호버 스케일 — pause 메뉴는 일시정지 중 글로벌 클럭이 멈춰 direct.interval
+            # 이 안 도므로(LerpScaleInterval 무효), 실시간 태스크로 구동해 settings·pause
+            # 양쪽에서 동일하게 동작하게 한다.
             def _en(_=None, bb=b):
-                LerpScaleInterval(bb, 0.10, Vec3(0.050, 0.050, 0.050),
-                                  blendType='easeOut').start()
+                self._play_ui_hover()
+                self._anim_swatch(bb, 0.050)
 
             def _ex(_=None, bb=b):
-                LerpScaleInterval(bb, 0.10, Vec3(0.042, 0.042, 0.042),
-                                  blendType='easeOut').start()
+                self._anim_swatch(bb, 0.042)
 
             b.bind(DGG.WITHIN, _en)
             b.bind(DGG.WITHOUT, _ex)
@@ -4325,6 +4456,31 @@ class ZombieGame(ShowBase):
         _tac_outline(self._swatch_hl, -m, m, z - m, z + m, TAC_TEXT_1, thickness=2.2)
         self._swatch_hl.setTransparency(1)
         self._refresh_outline_swatches()
+
+    def _anim_swatch(self, bb, target, dur=0.10):
+        """스와치 호버 스케일 애니 — 일시정지(글로벌 클럭 정지) 중에도 동작하도록
+        direct.interval 대신 실시간(time.time) 태스크로 구동. settings/pause 공통."""
+        name = 'swhover_%d' % id(bb)
+        self.taskMgr.remove(name)
+        try:
+            start = bb.getScale()[0]
+        except Exception:
+            start = target
+        if abs(start - target) < 1e-4:
+            bb.setScale(target)
+            return
+        t0 = time.time()
+
+        def _step(task, bb=bb, start=start, target=target, t0=t0, dur=dur):
+            if bb.isEmpty():
+                return Task.done
+            el = time.time() - t0
+            f = min(1.0, el / dur)
+            e = 1.0 - (1.0 - f) ** 2          # easeOut
+            bb.setScale(start + (target - start) * e)
+            return Task.done if f >= 1.0 else Task.cont
+
+        self.taskMgr.add(_step, name)
 
     # ── 디자인 키트 컴포넌트 (Settings/Lobby 화면 공통) ───────────────────────
     def _tac_panel_head(self, parent, text, lx, rx, z, right=None):
@@ -4829,6 +4985,26 @@ class ZombieGame(ShowBase):
         np.setLightOff()
         return np
 
+    @staticmethod
+    def _cb_ease(t, x1, y1, x2, y2):
+        """CSS cubic-bezier(x1,y1,x2,y2) — 시간비 t(0..1)에 대한 진행값을 반환.
+        Bx(u)=t 를 Newton 으로 풀어 u 를 구한 뒤 By(u). 버스트 이징을 HTML 과 일치."""
+        if t <= 0.0:
+            return 0.0
+        if t >= 1.0:
+            return 1.0
+        u = t
+        for _ in range(8):
+            mu = 1.0 - u
+            x = 3.0 * mu * mu * u * x1 + 3.0 * mu * u * u * x2 + u * u * u
+            dx = (3.0 * mu * mu * x1 + 6.0 * mu * u * (x2 - x1)
+                  + 3.0 * u * u * (1.0 - x2))
+            if abs(dx) < 1e-6:
+                break
+            u = min(1.0, max(0.0, u - (x - t) / dx))
+        mu = 1.0 - u
+        return 3.0 * mu * mu * u * y1 + 3.0 * mu * u * u * y2 + u * u * u
+
     def _build_kill_banner(self):
         """처치 알림 위젯을 한 번만 생성하고 평소엔 hide. 색은 흰색 고정.
         HTML(kill_banner_motion.html): 정적 타겟팅 프레임 + 회전 레티클 2겹 + 원반
@@ -4912,7 +5088,7 @@ class ZombieGame(ShowBase):
         self.kb_burst.setBin('fixed', 63)
         self._kb_dots = []
         for _ in range(28):
-            d = self._make_filled_circle(1.6 * S, KB, segs=10)
+            d = self._make_filled_circle(1.0 * S, KB, segs=12)
             d.reparentTo(self.kb_burst)
             d.setTransparency(True)
             d.setColorScale(1, 1, 1, 0)
@@ -4939,7 +5115,7 @@ class ZombieGame(ShowBase):
                 LerpScaleInterval(self.kb_motion, 0.07, 1.0,
                                   startScale=0.97, blendType='easeOut'),
             ),
-            LerpColorScaleInterval(self.kb_motion, 0.18, (1, 1, 1, 1),
+            LerpColorScaleInterval(self.kb_motion, 0.204, (1, 1, 1, 1),
                                    startColorScale=(1, 1, 1, 0), blendType='easeOut'),
             LerpColorScaleInterval(self.kb_flash, 0.45, (1, 1, 1, 0),
                                    startColorScale=(1, 1, 1, 0.85), blendType='easeOut'),
@@ -4957,7 +5133,7 @@ class ZombieGame(ShowBase):
         self._kb_seq = Sequence(
             Func(self._kb_prep),
             appear,
-            Wait(1.6),
+            Wait(1.25),    # appear(최대 0.55s) + 1.25 = play 후 1.8s 에 out (HTML 동일)
             leave,
             Func(self.kb_root.hide),
         )
@@ -4979,9 +5155,10 @@ class ZombieGame(ShowBase):
         self._kb_burst_life = 0.0
         for i, d in enumerate(self._kb_dots):
             ang = random.uniform(0.0, 6.283185307179586)
-            dist = (52.0 + random.uniform(0.0, 84.0)) * S   # 더 넓게 퍼짐
-            life = 0.30 + random.uniform(0.0, 0.22)
-            scl = random.uniform(0.7, 2.3)                  # 원 크기 다양
+            # HTML burst(): dist 46+rand*60, dur 320+rand*240ms, size 2+rand*3 px.
+            dist = (46.0 + random.uniform(0.0, 60.0)) * S
+            life = 0.32 + random.uniform(0.0, 0.24)
+            scl = 1.0 + random.uniform(0.0, 1.5)            # 지름 2~5px (base r=1px)
             self._kb_dot_dir[i] = (cos(ang), -sin(ang))     # svg y-down → z-up
             self._kb_dot_dist[i] = dist
             self._kb_dot_life[i] = life
@@ -5009,12 +5186,12 @@ class ZombieGame(ShowBase):
             for i, d in enumerate(self._kb_dots):
                 life = self._kb_dot_life[i] or 1.0
                 f = min(1.0, elapsed / life)
-                ease = 1.0 - (1.0 - f) ** 4                # quartic easeOut (초반 폭발)
+                ease = self._cb_ease(f, 0.12, 0.85, 0.25, 1.0)   # HTML cubic-bezier
                 ux, uz = self._kb_dot_dir[i]
                 dist = self._kb_dot_dist[i] * ease
                 d.setPos(ux * dist, 0, uz * dist)
-                d.setScale(self._kb_dot_scale[i] * (1.0 - 0.62 * f))   # 점점 작아짐
-                a = 1.0 if f < 0.55 else max(0.0, 1.0 - (f - 0.55) / 0.45)
+                d.setScale(self._kb_dot_scale[i] * (1.0 - 0.6 * ease))  # 1→.4
+                a = 1.0 if f < 0.5 else max(0.0, 1.0 - (f - 0.5) / 0.5)
                 d.setColorScale(1, 1, 1, a)
             if self._kb_burst_t <= 0.0:
                 for d in self._kb_dots:
@@ -5022,8 +5199,13 @@ class ZombieGame(ShowBase):
         return task.cont
 
     def _show_kill_banner(self):
-        """처치 시 호출 — 발로란트식 킬피드 행을 우상단에 추가. (구 해골 슬램 폐기)"""
-        self._push_killfeed('ELIMINATED', mine=True)
+        """처치 시 호출 — HTML(kill_banner_motion.html) 그대로 화면 하단 중앙에 해골
+        슬램 배너를 재생. play()/setInterval 처럼 진행 중이어도 처음부터 재시작."""
+        if getattr(self, '_match_over', False):
+            return                       # 매치 종료 후엔 킬배너 안 띄움(결과창 가림 방지)
+        seq = getattr(self, '_kb_seq', None)
+        if seq is not None:
+            seq.start()
 
     def _push_killfeed(self, text='ELIMINATED', mine=True):
         # 한 줄 행(좌측 레드/스틸 바 + 우측정렬 텍스트)을 쌓고, 최신이 위로.
@@ -5149,7 +5331,16 @@ class ZombieGame(ShowBase):
         return ((self.online_mode or self.ai_mode)
                 and not (self.soccer_mode or self.paint_mode
                          or getattr(self, 'jump_mode', False))
-                and not getattr(self, '_in_lobby', False))
+                and not getattr(self, '_in_lobby', False)
+                and not getattr(self, '_match_over', False))
+
+    def _is_duel_mode(self):
+        """듀얼/데스매치 모드인가 — AI 듀얼(적 1~5기) 또는 온라인 PvP. 킬스트릭 규칙 분기.
+        이 모드는 시간제한 없이 적을 잡을수록 단계 상승, 적 전멸로 라운드가 바뀌면 초기화.
+        축구/땅따먹기/점프/웨이브는 제외(4초 콤보 윈도우 규칙)."""
+        if self.soccer_mode or self.paint_mode or getattr(self, 'jump_mode', False):
+            return False
+        return self.online_mode or self.ai_mode
 
     def _rebuild_mag_strip(self, amax):
         """탄창 스트립을 amax 개의 세그먼트로 다시 그린다(무기 교체 시 ammo_max 변동 대응).
@@ -5238,22 +5429,7 @@ class ZombieGame(ShowBase):
             fg=TAC_TEXT_2, align=TextNode.ACenter, mayChange=True,
             parent=self.hud_score, font=getattr(self, '_tac_label_font', None))
         self.hud_score.hide()             # online 일 때만 _setup_online 에서 show
-        # ── 상대 HP 칩(점수 플레이트 우측) — 이름 + 콜드 스틸 막대. (디자인 OppCompact)
-        #    데스매치에서만 표시. HP 는 AI 모드에선 ai_hp 반영, 온라인은 동기화 안 돼 풀.
-        self.hud_opp = self.aspect2d.attachNewNode('opp_comp')
-        ocx, ocr, ocz, ochh = 0.235, 0.40, 0.838, 0.007
-        self._opp_bar_l, self._opp_bar_w = ocx, ocr - ocx
-        self.hud_opp_name = OnscreenText(
-            text='OPERATOR', pos=(ocx, ocz + 0.022), scale=0.030,
-            fg=TAC_STEEL, align=TextNode.ALeft, mayChange=True,
-            parent=self.hud_opp, font=getattr(self, '_tac_label_font', None))
-        self.hud_opp_track = DirectFrame(
-            frameColor=(0.094, 0.102, 0.125, 0.9), relief=DGG.FLAT,
-            frameSize=(ocx, ocr, ocz - ochh, ocz + ochh), parent=self.hud_opp)
-        self.hud_opp_fill = DirectFrame(
-            frameColor=TAC_STEEL, relief=DGG.FLAT,
-            frameSize=(ocx, ocr, ocz - ochh, ocz + ochh), parent=self.hud_opp)
-        self.hud_opp.hide()
+        # (상대 HP 칩 'OPERATOR' UI 제거 — 불필요해서 삭제)
         # 승/패 결과 배너 — 매치 종료 시 화면 중앙에 크게.
         self.hud_match_result = OnscreenText(
             text='', pos=(0, 0.12), scale=0.20,
@@ -5494,6 +5670,17 @@ class ZombieGame(ShowBase):
                 sil.hide()
                 self._wsils[w] = sil
 
+        # 무기 교체 시 우하단 패널 전체가 살짝 내려갔다 올라오는 슬라이드(디자인
+        # silStyle clip-out/in)를 한 번에 주려면 패널 요소가 한 노드 아래 모여 있어야
+        # 한다. BR 직속이던 탄약 텍스트·재장전 바를 _ammo_plate(원점 (0,0,0)) 자식으로
+        # 옮긴다 — pos 는 BR 기준 = 패널 기준이라 보이는 위치는 그대로 유지된다.
+        for _w in (self.hud_weapon_lbl, self.hud_ammo_max, self.hud_ammo_num,
+                   self.hud_reload_text, self.hud_reload_track,
+                   self.hud_reload_fill):
+            _w.reparentTo(self._ammo_plate)
+        self._ammo_plate_z0 = 0.0
+        self._ammo_slide = None
+
         # 중앙 상단 — 적 타겟 정보 그룹 (enemy.png 1600×1040 ≈ 1.54:1, 평소 hidden).
         # 컨테이너 NodePath 아래에 PNG + 2줄 텍스트 묶음 → enemy_target.show/hide 한 번에 처리.
         self.enemy_target = self.aspect2d.attachNewNode('enemy_target_grp')
@@ -5610,12 +5797,20 @@ class ZombieGame(ShowBase):
         # 무기 라벨/실루엣과 겹쳐 보였다. 재장전 중엔 '00'(채워지는 중)으로 표시.
         if self.ammo == 0 and not self._reload_oneshot:
             ft = ClockObject.getGlobalClock().getFrameTime()
+            # 'EMPTY'(5글자)는 숫자(2글자)용 큰 스케일로 그리면 플레이트를 벗어난다.
+            # 상태 진입 시 한 번만 작은 스케일로 낮춰 "(R)" 와 한 줄에 들어오게.
+            if not getattr(self, '_ammo_empty_shown', False):
+                self.hud_ammo_num.setScale(0.052)
+                self._ammo_empty_shown = True
             self.hud_ammo_num.setText('EMPTY')
             self.hud_ammo_num.setFg(TAC_ACCENT if int(ft * 3) % 2 == 0
                                     else TAC_ACCENT_DIM)
             self.hud_ammo_max.setText('(R)')
             self.hud_ammo_max.setFg(TAC_ACCENT_DIM)
         else:
+            if getattr(self, '_ammo_empty_shown', False):
+                self.hud_ammo_num.setScale(0.135)   # 숫자 표시 — 원래 큰 스케일 복원
+                self._ammo_empty_shown = False
             low = self.ammo <= max(1, self.ammo_max // 4)
             self.hud_ammo_num.setText(f'{self.ammo:02d}')
             self.hud_ammo_num.setFg(TAC_ACCENT if low else TAC_TEXT_1)
@@ -5641,11 +5836,17 @@ class ZombieGame(ShowBase):
         # 무기 실루엣 — 현재 무기 표시 + 교체 시 슬라이드 스왑(파일 꺼내듯: 이전 건
         # 아래로 빠지며 사라지고, 새 건 위에서 미끄러져 안착).
         sils = getattr(self, '_wsils', {})
-        prev_w = getattr(self, '_hud_prev_w', cur_w)
-        if cur_w != prev_w:
+        # _hud_prev_w 는 트리거 안에서만 기록하므로 getattr 기본값을 cur_w 로 두면
+        # prev_w 가 영영 cur_w 와 같아져 스왑이 절대 감지되지 않는다 → 기본 None,
+        # 최초 1회는 애니 없이 기록만, 이후 실제 변경에서만 슬라이드/실루엣 스왑.
+        prev_w = getattr(self, '_hud_prev_w', None)
+        if prev_w is None:
+            self._hud_prev_w = cur_w
+        elif cur_w != prev_w:
             self._hud_swap_t = self.HUD_SWAP_DUR
             self._hud_swap_from = prev_w
             self._hud_prev_w = cur_w
+            self._start_ammo_panel_slide()
         swt = getattr(self, '_hud_swap_t', 0.0)
         if swt > 0.0 and sils:
             swt = max(0.0, swt - dt)
@@ -5736,23 +5937,7 @@ class ZombieGame(ShowBase):
             self.hud_low_bg.hide()
             self.hud_low_tag.hide()
 
-        # 상대 HP 칩 — 데스매치에서만. AI 모드는 ai_hp 반영, 온라인은 동기화 없어 풀.
-        if self._deathmatch_active():
-            if self.hud_opp.isHidden():
-                self.hud_opp.show()
-            nm = (self._remote_name or 'OPERATOR') if self.online_mode else 'OPERATOR'
-            self.hud_opp_name.setText(nm.upper())
-            if self.ai_mode and not self.online_mode:
-                oratio = max(0.0, min(1.0, self.ai_hp / max(1, self.ai_max_hp)))
-            else:
-                oratio = 1.0
-            ol, ow = self._opp_bar_l, self._opp_bar_w
-            fs = self.hud_opp_track['frameSize']
-            self.hud_opp_fill['frameSize'] = (ol, ol + ow * oratio, fs[2], fs[3])
-            self.hud_opp_fill['frameColor'] = (TAC_ACCENT if oratio <= 0.3
-                                               else TAC_STEEL)
-        elif not self.hud_opp.isHidden():
-            self.hud_opp.hide()
+        # (상대 HP 칩 'OPERATOR' UI 제거됨 — 표시 로직 없음)
 
         # 웨이브 모드 HUD — 총 처치 수 + 현재 웨이브/남은 적
         alive = sum(1 for z in self.zombies if z.hp > 0)
@@ -5808,7 +5993,6 @@ class ZombieGame(ShowBase):
                 f'pos:  ({self.player_pos.x:.1f}, {self.player_pos.y:.1f}, '
                 f'{self.player_pos.z:.1f})\n'
                 f'mode: {"editor[F2]" if self.editor_mode else "fps"}'
-                f'{"  kneel" if self.kneel_state == "kneel" else ""}'
                 f'{"  ADS" if self.aim_t > 0.5 else ""}'
             )
 
@@ -5857,8 +6041,13 @@ class ZombieGame(ShowBase):
         else:
             props.setFullscreen(False)
             props.setSize(1280, 720)
-        props.setCursorHidden(True)
-        props.setMouseMode(WindowProperties.M_confined)
+        # 커서/마우스 모드는 현재 화면 상태를 유지한다 — 메뉴나 일시정지 중엔 버튼
+        # 클릭을 위해 커서를 보여야 하고, 인게임(마우스룩)에선 숨기고 가둔다.
+        in_game = (getattr(self, '_game_started', False)
+                   and not getattr(self, 'paused', False))
+        props.setCursorHidden(in_game)
+        props.setMouseMode(WindowProperties.M_confined if in_game
+                           else WindowProperties.M_absolute)
         self.win.requestProperties(props)
 
     def windowEvent(self, win):
@@ -6082,9 +6271,33 @@ class ZombieGame(ShowBase):
         self._update_score_hud()
         print(f'[ai] AI 대결 시작 — 플레이어=A, AI=B, hp={self.ai_hp}', flush=True)
 
+    def _apply_ai_difficulty(self, diff):
+        """난이도(easy/medium/hard) 적용 — 헤드샷 확률·정확도·무빙샷·이동/연사/데미지.
+        모든 AI 모드 공통. _start_game(메뉴) 또는 __init__(기본 medium) 이 호출."""
+        d = AI_DIFFICULTY.get(diff, AI_DIFFICULTY['medium'])
+        self.ai_difficulty = diff if diff in AI_DIFFICULTY else 'medium'
+        self._ai_headshot_p = d['headshot']      # 헤드 조준 확률
+        self._ai_acc_mult = d['acc']             # 전체 명중률 배율
+        self._ai_move_shoot_p = d['move_shoot']  # 멈추지 않고 무빙샷 할 확률
+        self._ai_move_acc_mult = d['move_acc']   # 무빙샷 시 명중률 배율(높을수록 덜 깎임)
+        self.AI_SPEED = AI_BASE_SPEED * d['speed']
+        self.AI_FIRE_INTERVAL = AI_BASE_FIRE_INTERVAL * d['fire']
+        self.AI_DMG = max(1, int(round(AI_BASE_DMG * d['dmg'])))
+        print(f'[ai] 난이도={self.ai_difficulty} 헤드샷={self._ai_headshot_p} '
+              f'무빙샷={self._ai_move_shoot_p} 속도x{d["speed"]}', flush=True)
+
+    def _ai_pick_exit_door(self):
+        """봇이 스폰을 나갈 문 하나를 무작위로 고른다(여러 방향 분산). 막이 없으면 0."""
+        doors = [(m.x0 + m.x1) / 2.0 for m in self._spawn_mem_enemy]
+        self._ai_exit_door_x = random.choice(doors) if doors else 0.0
+
     def _ai_update(self, dt):
         """AI 봇 1프레임 — 거리 유지 + 좌우 스트레이프(무빙)로 플레이어 추격, 항상 조준,
-        시야 트이면 소총 연사. 카운트다운/데스캠/매치종료 중엔 스폰에서 대기."""
+        시야 트이면 소총 연사. 카운트다운/데스캠/매치종료 중엔 스폰에서 대기.
+        적 수>1 이면 봇0 비활성(숨김) — 모든 적을 _bot_update 가 통일 구동(사망 모션/
+        데스캠 없는 부활)."""
+        if self._ai_enemy_count > 1:
+            return
         av = self.remote_avatar
         if av is None:
             return
@@ -6107,34 +6320,52 @@ class ZombieGame(ShowBase):
         self._ai_yaw = degrees(atan2(-ux, uy))    # 항상 플레이어 향함
         moving = False
         if not frozen and not self.jump_mode:     # 점프맵은 추격 X, 웨이포인트만(아래)
-            # 스트레이프 방향 주기적 전환(저크).
+            # 스트레이프 방향 주기적 전환(저크) + 이번 구간 무빙샷 여부 재결정(난이도).
             self._ai_strafe_t -= dt
             if self._ai_strafe_t <= 0.0:
                 self._ai_strafe_dir = random.choice((-1, 1))
                 self._ai_strafe_t = random.uniform(0.5, 1.3)
-            # 멈춰서 쏘기 — 사거리 안 + 시야 트임 + 재장전 아님 + 탄약 있음이면 '정지'해
-            # 조준/사격(플레이어가 피할 여지를 줌). 그 외엔 접근/측면 무빙으로 자리 잡기.
-            los = not self.level_collider.segment_blocked(
-                self._ai_pos.x, self._ai_pos.y,
-                self.player_pos.x, self.player_pos.y)
-            shoot_stance = (dist < self.AI_SHOOT_RANGE and los
-                            and self._ai_reload_t <= 0.0 and self._ai_ammo > 0)
-            fwd = 0.0
-            strafe_mult = 0.85
-            if shoot_stance:
-                strafe_mult = 0.0                  # 사격 자세 — 완전 정지
-            elif dist > self.AI_PREF_MAX:
-                fwd = 1.0                          # 멀면 접근
-            elif dist < self.AI_PREF_MIN:
-                fwd = -1.0                         # 너무 가까우면 후퇴
-            # 피격 직후엔 봇도 잠깐 감속.
+                self._ai_mobile_shoot = (random.random() < self._ai_move_shoot_p)
+            # 스폰 안인지 — 안이면 사격 금지 + 고른 문으로 '무조건' 나간다.
+            ze = self._spawn_zone_enemy
+            in_spawn = (ze is not None
+                        and ze[0] <= self._ai_pos.x <= ze[1]
+                        and ze[2] <= self._ai_pos.y <= ze[3])
+            self._ai_in_spawn = in_spawn
+            # 사격 가능: 사거리 + 시야 + 재장전 아님 + 탄약 + 스폰 밖.
+            los = (not in_spawn) and (not self._ai_fire_blocked())
+            can_shoot = (dist < self.AI_SHOOT_RANGE and los
+                         and self._ai_reload_t <= 0.0 and self._ai_ammo > 0)
             spd = self.AI_SPEED * (self.HIT_SLOW_MULT if self._ai_slow_t > 0.0 else 1.0)
-            sx, sy = -uy, ux                       # 플레이어 기준 오른쪽(수직)
-            mvx = (ux * fwd + sx * self._ai_strafe_dir * strafe_mult) * spd
-            mvy = (uy * fwd + sy * self._ai_strafe_dir * strafe_mult) * spd
+            if in_spawn:
+                # 스폰 탈출 — 이번에 고른 문으로 이동(여러 방향 분산). 막은 통과(skip).
+                if self._ai_exit_door_x is None:
+                    self._ai_pick_exit_door()
+                front_y = ze[2] if abs(ze[2]) < abs(ze[3]) else ze[3]
+                field_sign = -1.0 if front_y > 0 else 1.0
+                tx, ty = self._ai_exit_door_x, front_y + field_sign * 2.0
+                ex, ey = tx - self._ai_pos.x, ty - self._ai_pos.y
+                em = (ex * ex + ey * ey) ** 0.5 or 1e-5
+                mvx, mvy = ex / em * spd, ey / em * spd
+            else:
+                self._ai_exit_door_x = None        # 나갔으면 다음 입장 때 새 문 고르게
+                # 멈춰 쏘기 vs 무빙샷 — 쏠 수 있고 '무빙샷' 아니면 정지 정조준,
+                # 무빙샷이면 계속 움직이며 사격(정확도는 _ai_try_shoot 가 깎음).
+                fwd = 0.0
+                strafe_mult = 0.85
+                if can_shoot and not self._ai_mobile_shoot:
+                    strafe_mult = 0.0              # 정지 정조준
+                elif dist > self.AI_PREF_MAX:
+                    fwd = 1.0                      # 멀면 접근
+                elif dist < self.AI_PREF_MIN:
+                    fwd = -1.0                     # 너무 가까우면 후퇴
+                sx, sy = -uy, ux                   # 플레이어 기준 오른쪽(수직)
+                mvx = (ux * fwd + sx * self._ai_strafe_dir * strafe_mult) * spd
+                mvy = (uy * fwd + sy * self._ai_strafe_dir * strafe_mult) * spd
             nx0 = self._ai_pos.x + mvx * dt
             ny0 = self._ai_pos.y + mvy * dt
-            nx, ny = self.level_collider.resolve(nx0, ny0, PLAYER_RADIUS)
+            nx, ny = self.level_collider.resolve(nx0, ny0, PLAYER_RADIUS,
+                                                 skip=self._spawn_mem_enemy)
             # 발판(올라타는 박스) 옆면 충돌 — 봇은 지면(z≈0)이라 윗면보다 낮아 통과 못 함.
             for p in self._platforms:
                 if self._ai_pos.z < p['top'] - self._step_assist:
@@ -6142,22 +6373,25 @@ class ZombieGame(ShowBase):
             moved = ((nx - self._ai_pos.x) ** 2 + (ny - self._ai_pos.y) ** 2) ** 0.5
             self._ai_pos.x, self._ai_pos.y = nx, ny
             moving = moved > 0.003
-            # 벽/발판에 비비면 스트레이프 방향 뒤집어 빠져나오게.
-            if (mvx * mvx + mvy * mvy) > 1e-4 and moved < 0.3 * spd * dt:
+            # 벽/발판에 비비면 스트레이프 방향 뒤집어 빠져나오게(스폰 탈출 중엔 제외).
+            if (not in_spawn and (mvx * mvx + mvy * mvy) > 1e-4
+                    and moved < 0.3 * spd * dt):
                 self._ai_strafe_dir *= -1
         # 점프맵 — 봇은 자기 레인 B 코스를 스스로 진행(웨이포인트 추종, 점프하듯 호 그림)
         # 하고 플레이어를 독립적으로 향해 조준/사격. (플레이어를 따라하지 않음.)
         bot_z = 0.0
         if self.jump_mode:
-            bot_z = self._ai_jump_z if not frozen else self._ai_jump_z
-            if not frozen:
+            bot_z = self._ai_jump_z
+            # 카운트다운(FIGHT) 전에는 봇이 출발 지점에 완전히 정지 — 코스 진행도
+            # 플레이어 조준 회전도 하지 않는다. 시작 후(_jump_started)에만 움직인다.
+            if self._jump_started and not frozen:
                 bot_z = self._ai_jump_step(dt)
                 self._ai_jump_z = bot_z
                 moving = True
-            ddx = self.player_pos.x - self._ai_pos.x
-            ddy = self.player_pos.y - self._ai_pos.y
-            dist = (ddx * ddx + ddy * ddy) ** 0.5 or 1e-5
-            self._ai_yaw = degrees(atan2(-ddx / dist, ddy / dist))  # 플레이어 조준
+                ddx = self.player_pos.x - self._ai_pos.x
+                ddy = self.player_pos.y - self._ai_pos.y
+                dist = (ddx * ddx + ddy * ddy) ** 0.5 or 1e-5
+                self._ai_yaw = degrees(atan2(-ddx / dist, ddy / dist))  # 플레이어 조준
         # 아바타 배치/표시.
         self._remote_smooth = Vec3(self._ai_pos.x, self._ai_pos.y, bot_z)
         av.setPos(self._ai_pos.x, self._ai_pos.y, bot_z)
@@ -6222,9 +6456,10 @@ class ZombieGame(ShowBase):
                 if dist < self.AI_SHOOT_RANGE:
                     self._ai_try_shoot(dist, weak=True)
                     fired = True
-            elif dist < self.AI_SHOOT_RANGE:
+            elif dist < self.AI_SHOOT_RANGE and not self._ai_in_spawn:
+                # 스폰 밖에서만 사격. 무빙 중이면 _ai_try_shoot 가 정확도 깎음.
                 self._ai_fire_t = self.AI_FIRE_INTERVAL
-                self._ai_try_shoot(dist)
+                self._ai_try_shoot(dist, moving=moving)
                 fired = True
             else:
                 self._ai_fire_t = self.AI_FIRE_INTERVAL
@@ -6329,24 +6564,65 @@ class ZombieGame(ShowBase):
             self._ai_invuln_ring.setTransparency(True)
         self._ai_invuln_ring.show()
 
-    def _ai_try_shoot(self, dist, weak=False):
-        """AI 한 발 — 벽에 막히면 안 쏨. 트레이서 + 거리별 소총음 + 거리 기반 명중 확률로
-        내 체력 감소. weak=True(점프맵 견제)면 명중·데미지를 크게 낮춰 진행을 막지 않는다."""
-        if self.level_collider.segment_blocked(
-                self._ai_pos.x, self._ai_pos.y,
-                self.player_pos.x, self.player_pos.y):
-            return                                # 벽 뒤 — 사격 안 함
-        # 헤드샷 굴림 — 일정 확률로 머리 조준(데미지↑·트레이서도 머리로). 그 외 몸통.
+    def _ai_fire_blocked(self):
+        """봇 총구(z≈1.4)→플레이어 사격선이 벽/올라타는 엄폐 박스(_platforms)에 막히는지.
+        플레이어 총알과 '동일한' _bullet_blocked 로 판정한다 — segment_blocked 는 walls 만
+        보고 _platforms(박스)를 빼서, '봇은 박스 너머로 쏘는데 플레이어 총알은 박스에 막혀
+        못 맞히는' 비대칭 버그가 있었다. 같은 함수로 통일해 높이·박스까지 대칭으로 맞춘다."""
+        gun = Vec3(self._ai_pos.x, self._ai_pos.y, 1.4)
+        # 상체(머리 약간 아래)를 겨냥선으로 — 플레이어가 박스 위에 올라가 있어도
+        # 상체가 보이면 사격선이 트인다(가슴 높이로 잡아 낮은 엄폐 위로 넘겨 쏨).
+        tgt = Vec3(self.player_pos.x, self.player_pos.y,
+                   self.player_pos.z + self.head_height * 0.85)
+        delta = tgt - gun
+        dist3 = delta.length()
+        if dist3 < 1e-6:
+            return False
+        # 플레이어가 올라서 있는 발판 박스는 엄폐가 아니라 바닥 — 차단에서 뺀다.
+        skip = [p for p in self._platforms
+                if self.player_pos.z >= p['top'] - self._step_assist
+                and p['x0'] - 0.4 <= self.player_pos.x <= p['x1'] + 0.4
+                and p['y0'] - 0.4 <= self.player_pos.y <= p['y1'] + 0.4]
+        if self._bullet_blocked(gun, delta * (1.0 / dist3), dist3, skip):
+            return True
+        # ── 상호성(reciprocity) ── 플레이어 눈→봇 몸통 사선도 트여야만 봇이 쏜다.
+        # 봇 총구(1.4)만으로 사선을 보면, 낮은 발판·벽 모서리 너머로 봇은 쏘는데
+        # 플레이어는 봇 몸통이 가려 못 맞히는 위치가 생긴다('적이 쏠 때만 맞는' 버그).
+        # 플레이어가 봇을 맞힐 수 없는 위치면 봇도 못 쏘게 해 좌우대칭으로 맞춘다.
+        eye = Vec3(self.player_pos.x, self.player_pos.y,
+                   self.player_pos.z + self.head_height)
+        body = Vec3(self._ai_pos.x, self._ai_pos.y, 1.4)   # 봇 가슴 높이(플레이어 조준점)
+        rev = body - eye
+        rdist = rev.length()
+        if rdist < 1e-6:
+            return False
+        # 봇이 올라서 있는 발판은 표적의 바닥 — 자기 사선을 막지 않게 제외.
+        skip2 = [p for p in self._platforms
+                 if self._ai_pos.z >= p['top'] - self._step_assist
+                 and p['x0'] - 0.4 <= self._ai_pos.x <= p['x1'] + 0.4
+                 and p['y0'] - 0.4 <= self._ai_pos.y <= p['y1'] + 0.4]
+        return self._bullet_blocked(eye, rev * (1.0 / rdist), rdist, skip2)
+
+    def _ai_try_shoot(self, dist, weak=False, moving=False):
+        """AI 한 발 — 벽/엄폐 박스에 막히면 안 쏨. 트레이서 + 거리별 소총음 + 명중 확률로
+        내 체력 감소. 헤드샷 확률·정확도는 난이도(_ai_headshot_p/_ai_acc_mult)가 정하고,
+        움직이며 쏘면(moving) 무빙 정확도 배율로 명중을 낮춘다(난이도 높을수록 덜 깎임).
+        weak=True(점프맵 견제)면 명중·데미지를 크게 낮춰 진행을 막지 않는다."""
+        if self._ai_fire_blocked():
+            return                                # 벽/박스 뒤 — 사격 안 함
+        # 헤드샷 굴림 — 난이도 확률로 머리 조준(데미지↑·트레이서도 머리로). 그 외 몸통.
         gun_z = 1.4
-        headshot = (not weak) and random.random() < 0.28
+        headshot = (not weak) and random.random() < self._ai_headshot_p
         tgt_z = self.player_pos.z + self.head_height * (0.95 if headshot else 0.5)
         pitch = degrees(atan2(tgt_z - gun_z, dist))
         self._show_remote_tracer((0, 0, 0, self._ai_yaw, pitch))
         vol = self._remote_dist_volume(1.3, 5.0, 90.0)
         if vol > 0.0:
             self._play_pool_vol(self._r_sfx_m16, '_r_sfx_m16_i', vol)
-        # 명중 확률 — 살짝 낮춤(0.28~0.60). '멈춰 쏘므로' 플레이어가 피할 여지를 둔다.
-        acc = max(0.28, min(0.60, 0.64 - dist * 0.016))
+        # 명중 확률 — 거리 기반 × 난이도 정확도 배율. 무빙샷이면 무빙 정확도 배율 추가.
+        acc = max(0.18, min(0.90, (0.64 - dist * 0.016) * self._ai_acc_mult))
+        if moving:
+            acc *= self._ai_move_acc_mult
         dmg = self.AI_DMG
         if headshot:
             dmg = int(self.AI_DMG * 2.2)      # 헤드샷 추가 데미지
@@ -6423,6 +6699,9 @@ class ZombieGame(ShowBase):
             self.win.requestProperties(props)
             self.win.movePointer(0, self._win_cx, self._win_cy)
             self._first_frame = True
+            # 멀티 축구는 로비를 건너뛰어 _exit_lobby 가 안 불린다 → _setup_online 이
+            # 로비용으로 숨긴 인게임 HUD(조준점/탄약/체력/점수…)를 여기서 직접 복구.
+            self._set_ingame_hud_visible(True)
         # 공 생성(중앙).
         sc = self._arena_data.get('soccer', {}) if self._arena_data else {}
         self._ball = SoccerBall(self, sc.get('ball_spawn', (0.0, 0.0)))
@@ -6571,8 +6850,11 @@ class ZombieGame(ShowBase):
 
     def _show_goal_banner(self, i_scored):
         """득점/실점 배너 표시 + 득점 효과음(있으면). 권위·클라 공용."""
+        if getattr(self, '_match_over', False):
+            return                       # 매치 종료 후엔 안 띄움(슬로우모션 중 골 재감지로
+                                         # 배너가 다시 떠 결과창 위에 잔상처럼 남는 것 방지)
         if self.hud_goal_banner is not None:
-            self.hud_goal_banner.setText('골!!!' if i_scored else '실점...')
+            self.hud_goal_banner.setText('GOAL' if i_scored else '실점...')
             self.hud_goal_banner.setFg((0.3, 1.0, 0.5, 1.0) if i_scored
                                        else (1.0, 0.5, 0.4, 1.0))
             self.hud_goal_banner.show()
@@ -6673,6 +6955,7 @@ class ZombieGame(ShowBase):
         self.hud_score_frame.hide()
         self._build_paint_hud()
         self._update_paint_hud()
+        self._assign_spawn_rooms()        # 팀별 막(통과)/스폰존(캠핑) 매핑
         print(f'[paint] 땅따먹기 시작 — 내 색={"A(파랑)" if self._am_a else "B(주황)"} '
               f'(3분, 더 많이 칠한 쪽 승리)', flush=True)
 
@@ -6721,6 +7004,7 @@ class ZombieGame(ShowBase):
             return
         if self._barriers_active:
             return                            # 시작 5초 카운트다운 중엔 타이머 대기
+        self._update_spawn_timers(dt)         # 스폰 캠핑 방지(8s 경고/10s+ 데미지)
         self._paint_time_left -= dt
         if self._paint_time_left <= 0.0:
             self._paint_time_left = 0.0
@@ -6735,6 +7019,94 @@ class ZombieGame(ShowBase):
         opp = self._paint_count.get(self._paint_opp_id, 0)
         print(f'[paint] 시간 종료 — 내 칸 {mine} vs 상대 {opp}', flush=True)
         self._end_match(mine > opp)
+
+    def _assign_spawn_rooms(self):
+        """페인트 스폰룸 — 내 팀(_am_a)에 맞춰 통과 막/스폰존을 '내 것/적 것'으로 매핑.
+        막은 build_paint_field 가 이미 collider.walls 에 넣어 둠(총알·적 차단). 온라인은
+        역할이 _decide_role 에서 늦게 확정될 수 있어 거기서도 다시 호출한다."""
+        sr = self._arena_data.get('spawn_rooms') if self._arena_data else None
+        if not sr:
+            return
+        if self._am_a:
+            self._spawn_mem_mine, self._spawn_mem_enemy = sr['membranes_a'], sr['membranes_b']
+            self._spawn_zone_mine, self._spawn_zone_enemy = sr['zone_a'], sr['zone_b']
+        else:
+            self._spawn_mem_mine, self._spawn_mem_enemy = sr['membranes_b'], sr['membranes_a']
+            self._spawn_zone_mine, self._spawn_zone_enemy = sr['zone_b'], sr['zone_a']
+
+    def _in_own_spawn(self):
+        """플레이어가 자기 스폰룸 사각 안에 있는지(페인트 전용). 스폰 안 사격 금지에 사용."""
+        z = self._spawn_zone_mine
+        return (z is not None
+                and z[0] <= self.player_pos.x <= z[1]
+                and z[2] <= self.player_pos.y <= z[3])
+
+    def _update_spawn_timers(self, dt):
+        """페인트 전용 스폰 캠핑 방지 — 자기 스폰룸 안에 오래 있으면 8초 경고,
+        10초+ 부터 초당 데미지(밖으로 나가면 타이머 리셋). 플레이어·AI 봇 둘 다."""
+        # ── 플레이어(내 스폰존) ──
+        z = self._spawn_zone_mine
+        inside = (z is not None and not self._dead and self._deathcam_t <= 0.0
+                  and z[0] <= self.player_pos.x <= z[1]
+                  and z[2] <= self.player_pos.y <= z[3])
+        if inside:
+            self._spawn_dwell += dt
+            if self._spawn_dwell >= SPAWN_CAMP_WARN:
+                self._show_spawn_warning()
+            if self._spawn_dwell >= SPAWN_CAMP_LIMIT:
+                self._spawn_dmg_accum += SPAWN_CAMP_DPS * dt
+                n = int(self._spawn_dmg_accum)
+                if n > 0:
+                    self._spawn_dmg_accum -= n
+                    self._apply_spawn_damage(n)
+        else:
+            self._spawn_dwell = 0.0
+            self._spawn_dmg_accum = 0.0
+            self._hide_spawn_warning()
+        # ── AI 봇(적 스폰존) ── 봇은 보통 바로 나가지만, 버티면 동일하게 압박.
+        ze = self._spawn_zone_enemy
+        if self.ai_mode and ze is not None and self.ai_hp > 0:
+            if (ze[0] <= self._ai_pos.x <= ze[1]
+                    and ze[2] <= self._ai_pos.y <= ze[3]):
+                self._ai_spawn_dwell += dt
+                if self._ai_spawn_dwell >= SPAWN_CAMP_LIMIT:
+                    self._ai_spawn_dmg_accum += SPAWN_CAMP_DPS * dt
+                    n = int(self._ai_spawn_dmg_accum)
+                    if n > 0:
+                        self._ai_spawn_dmg_accum -= n
+                        self.ai_hp = self.enemy_health.take_damage(self.ai_hp, n)
+                        if self.ai_hp <= 0:    # 스폰서 버티다 죽으면 회복+잠깐 무적
+                            self.ai_hp = self.ai_max_hp
+                            self._ai_spawn_dwell = 0.0
+                            self._ai_spawn_dmg_accum = 0.0
+                            self._ai_invuln_t = 1.5
+            else:
+                self._ai_spawn_dwell = 0.0
+                self._ai_spawn_dmg_accum = 0.0
+
+    def _apply_spawn_damage(self, amount):
+        """스폰 캠핑 데미지 — 방향 아크 없이 내 체력만 깎고 0 이면 사망 처리."""
+        if self._invuln_t > 0.0 or self._dead or self._match_over:
+            return
+        old = self.core_integrity
+        self.core_integrity = self.player_health.take_damage(self.core_integrity, amount)
+        self._show_dmg_flash(old, self.core_integrity)
+        self._trigger_dmg_vignette()
+        if self.core_integrity <= 0:
+            self._pvp_die()
+
+    def _show_spawn_warning(self):
+        """'스폰을 떠나라' 경고 텍스트 표시(없으면 생성)."""
+        if self._spawn_warn_np is None:
+            self._spawn_warn_np = OnscreenText(
+                text='LEAVE SPAWN ZONE', pos=(0, 0.34), scale=0.075,
+                fg=(1.0, 0.32, 0.25, 1.0), shadow=(0, 0, 0, 1),
+                align=TextNode.ACenter, mayChange=False, parent=self.aspect2d)
+        self._spawn_warn_np.show()
+
+    def _hide_spawn_warning(self):
+        if self._spawn_warn_np is not None:
+            self._spawn_warn_np.hide()
 
     def _paint_disc(self, cx, cy, radius, color_id, cz=0.5):
         """(cx,cy,cz) 중심 반경 안의 셀(바닥+벽+장애물)을 color_id 색으로 칠한다.
@@ -6884,6 +7256,7 @@ class ZombieGame(ShowBase):
             self._ai_jump_z = w0[2]
         self._ai_wp_i = 1
         self._ai_jump_done = False
+        self._jump_started = False     # 카운트다운(FIGHT) 끝나면 _arena_release 가 True
         self._build_jump_hud()
         print('[jump] 점프맵 시작 — 결승까지 달려라!', flush=True)
 
@@ -7044,6 +7417,467 @@ class ZombieGame(ShowBase):
         self._remote_weapons[name] = node
         self._remote_weapon_order.append(name)
 
+    # --- 멀티 봇(AI DUEL / PAINT, 적 수 2~5) ------------------------------
+    #     봇0은 기존 self._ai_* / self.remote_avatar / self.ai_hp 머신을 그대로 쓴다
+    #     (적 수 1이면 아래 코드는 전혀 안 탐 → 오늘과 동일). 적 수>1 일 때만 추가
+    #     봇(인덱스 1..n-1)을 별도 아바타+상태 dict 로 만들어 동일 로직으로 구동한다.
+
+    def _build_bot_avatar(self):
+        """추가 봇 1기 — 아바타/테두리/손본/무기앵커+무기/히트박스/트레이서를 만들어
+        반환한다. self._remote_* 싱글톤(봇0/온라인용)은 건드리지 않는다. 사운드 풀은
+        봇0 이 로드한 self._r_sfx_* 를 공유한다(한 번만 로드)."""
+        av = Actor(BAM_PATH)
+        av.reparentTo(self.render)
+        av.setPos(0, 0, 0)
+        av.setH(180)
+        idle = 'Idle' if 'Idle' in self.anim_names else (
+            self.anim_names[0] if self.anim_names else None)
+        if idle:
+            av.loop(idle)
+        outline = self._attach_outline(av)
+        rhand_name = next(
+            (j.getName() for j in av.getJoints()
+             if j.getName().endswith('RightHand')), None)
+        hand = (av.exposeJoint(None, 'modelRoot', rhand_name)
+                if rhand_name else None)
+        anchor = self.render.attachNewNode('bot_weapon_anchor')
+        # 무기(소총 인덱스 1) — 봇0 의 _register_remote_weapon 배치 로직을 그대로 따름.
+        weapons = {}
+        def reg(name, path, scale, pos, hpr, prerot=(0, 0, 0)):
+            if not path.exists():
+                return
+            try:
+                model = self.loader.loadModel(path)
+            except Exception as e:
+                print(f'[ai] 봇 무기 {name} 로드 실패: {e}', flush=True)
+                return
+            for _prop in ('7.62x51 mag.001', '76251'):
+                for _np in model.findAllMatches(f'**/*{_prop}*'):
+                    _np.removeNode()
+            model.flattenLight()
+            node = anchor.attachNewNode(f'bot_{name}')
+            model.reparentTo(node)
+            model.setHpr(*prerot)
+            node.setScale(scale)
+            node.setPos(*pos)
+            node.setHpr(*hpr)
+            node.setTwoSided(True)
+            node.hide()
+            weapons[name] = node
+        reg('pistol', WEAPON_PATH, WEAPON_LOCAL_SCALE,
+            WEAPON_LOCAL_POS, WEAPON_LOCAL_HPR)
+        reg('rifle', RIFLE_PATH, RIFLE_LOCAL_SCALE,
+            RIFLE_LOCAL_POS, RIFLE_LOCAL_HPR, prerot=RIFLE_LOCAL_PREROT)
+        # 소총만 보이게.
+        if 'rifle' in weapons:
+            weapons['rifle'].show()
+        hitboxes = self._build_remote_hitboxes(av)
+        ls = LineSegs('bot_tracer')
+        ls.setThickness(1)
+        ls.setColor(1.0, 0.9, 0.55, 0.65)
+        ls.moveTo(0, 0, 0)
+        ls.drawTo(0, 30, 0)
+        tracer = self.render.attachNewNode(ls.create())
+        tracer.setTransparency(True)
+        tracer.setLightOff()
+        tracer.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd))
+        tracer.setBin('fixed', 99)
+        tracer.setDepthWrite(False)
+        tracer.hide()
+        av.hide()
+        return {'avatar': av, 'outline': outline, 'hand': hand,
+                'anchor': anchor, 'weapons': weapons, 'hitboxes': hitboxes,
+                'tracer': tracer, 'tracer_t': 0.0,
+                'invuln_ring': None, 'anim': idle}
+
+    def _setup_extra_bots(self):
+        """적 수>1 일 때 추가 봇(인덱스 1..n-1) 생성 + 스폰 분산 배치. 봇0(_ai_*)은
+        이미 _setup_ai 가 세팅했다. _setup_ai 의 끝에서 호출(아레나/스폰존이 준비된 뒤)."""
+        for b in self._ai_bots:        # 재시작 안전 — 기존 추가봇 정리
+            if b.get('avatar') is not None:
+                b['avatar'].cleanup()
+                b['avatar'].removeNode()
+            if b.get('corpse') is not None:
+                try:
+                    b['corpse'].cleanup()
+                    b['corpse'].removeNode()
+                except Exception:
+                    pass
+            for nm in ('anchor', 'tracer'):
+                if b.get(nm) is not None:
+                    b[nm].removeNode()
+        self._ai_bots = []
+        n = getattr(self, '_ai_enemy_count', 1)
+        if n <= 1:
+            return                     # 적 수 1 → 추가 봇 없음(봇0 단일, 오늘과 동일)
+        # 멀티봇 — 봇0(_ai_*/remote_avatar)은 비활성(숨김)하고 적 n 기를 모두 추가-봇으로
+        # 통일한다. 그래야 적 처치 시 데스캠/멈춤 없이 일관되게 사망 모션 후 부활한다.
+        if self.remote_avatar is not None:
+            self.remote_avatar.hide()
+        base = Vec3(self._ai_spawn)
+        for i in range(n):             # 0..n-1 = n 기(봇0 대체)
+            bot = self._build_bot_avatar()
+            # 스폰 분산 — x 를 인덱스별로 어긋나게(스폰 중앙 기준 좌우 번갈아).
+            off = (1.4 * ((i + 1) // 2)) * (1 if i % 2 else -1)
+            home = Vec3(base.x + off, base.y, 0)
+            bot['home_spawn'] = home
+            bot['pos'] = Vec3(home)
+            bot['yaw'] = self._ai_yaw
+            bot['hp'] = self.ai_max_hp
+            bot['fire_t'] = random.uniform(0.0, 0.6)
+            bot['ammo'] = self.AI_AMMO_MAX
+            bot['reload_t'] = 0.0
+            bot['strafe_dir'] = random.choice((-1, 1))
+            bot['strafe_t'] = random.uniform(0.5, 1.3)
+            bot['mobile_shoot'] = False
+            bot['in_spawn'] = True
+            bot['exit_door_x'] = None
+            bot['invuln_t'] = 0.0
+            bot['slow_t'] = 0.0
+            bot['foot_t'] = 0.0
+            bot['smooth'] = Vec3(home)
+            bot['last_foot_i'] = -1
+            bot['dead_t'] = 0.0
+            bot['down'] = False
+            bot['corpse'] = None
+            av = bot['avatar']
+            av.setPos(home)
+            av.setH(self._ai_yaw + 180)
+            av.show()
+            self._ai_bots.append(bot)
+        print(f'[ai] 추가 봇 {len(self._ai_bots)}기 생성 (총 적 {n}기)', flush=True)
+
+    def _bot_pick_exit_door(self, bot):
+        doors = [(m.x0 + m.x1) / 2.0 for m in self._spawn_mem_enemy]
+        bot['exit_door_x'] = random.choice(doors) if doors else 0.0
+
+    def _bot_fire_blocked(self, bot):
+        """봇(extra) 총구→플레이어 + 상호성 — _ai_fire_blocked 의 봇별 일반화."""
+        pos = bot['pos']
+        gun = Vec3(pos.x, pos.y, 1.4)
+        tgt = Vec3(self.player_pos.x, self.player_pos.y,
+                   self.player_pos.z + self.head_height * 0.85)
+        delta = tgt - gun
+        dist3 = delta.length()
+        if dist3 < 1e-6:
+            return False
+        skip = [p for p in self._platforms
+                if self.player_pos.z >= p['top'] - self._step_assist
+                and p['x0'] - 0.4 <= self.player_pos.x <= p['x1'] + 0.4
+                and p['y0'] - 0.4 <= self.player_pos.y <= p['y1'] + 0.4]
+        if self._bullet_blocked(gun, delta * (1.0 / dist3), dist3, skip):
+            return True
+        eye = Vec3(self.player_pos.x, self.player_pos.y,
+                   self.player_pos.z + self.head_height)
+        body = Vec3(pos.x, pos.y, 1.4)
+        rev = body - eye
+        rdist = rev.length()
+        if rdist < 1e-6:
+            return False
+        skip2 = [p for p in self._platforms
+                 if pos.z >= p['top'] - self._step_assist
+                 and p['x0'] - 0.4 <= pos.x <= p['x1'] + 0.4
+                 and p['y0'] - 0.4 <= pos.y <= p['y1'] + 0.4]
+        return self._bullet_blocked(eye, rev * (1.0 / rdist), rdist, skip2)
+
+    def _bot_show_tracer(self, bot, yaw, pitch):
+        tr = bot['tracer']
+        if tr is None:
+            return
+        anchor = bot['anchor']
+        if anchor is not None and not anchor.isEmpty():
+            tr.setPos(anchor.getPos(self.render))
+        else:
+            tr.setPos(bot['pos'] + Vec3(0, 0, self.head_height))
+        tr.setHpr(yaw, pitch, 0)
+        tr.show()
+        bot['tracer_t'] = self.tracer_dur
+
+    def _bot_try_shoot(self, bot, dist, weak=False, moving=False):
+        """추가 봇 한 발 — _ai_try_shoot 의 봇별 일반화. 난이도 파라미터는 전역 공유."""
+        if self._bot_fire_blocked(bot):
+            return
+        gun_z = 1.4
+        headshot = (not weak) and random.random() < self._ai_headshot_p
+        tgt_z = self.player_pos.z + self.head_height * (0.95 if headshot else 0.5)
+        pitch = degrees(atan2(tgt_z - gun_z, dist))
+        self._bot_show_tracer(bot, bot['yaw'], pitch)
+        # 거리별 음량 — 봇 위치 기준.
+        d = (bot['smooth'] - self.player_pos).length()
+        vol = (1.3 if d <= 5.0 else (0.0 if d >= 90.0
+               else 1.3 * (1.0 - (d - 5.0) / 85.0)))
+        if vol > 0.0:
+            self._play_pool_vol(self._r_sfx_m16, '_r_sfx_m16_i', vol)
+        acc = max(0.18, min(0.90, (0.64 - dist * 0.016) * self._ai_acc_mult))
+        if moving:
+            acc *= self._ai_move_acc_mult
+        dmg = self.AI_DMG
+        if headshot:
+            dmg = int(self.AI_DMG * 2.2)
+        if weak:
+            acc *= 0.40
+            dmg = max(3, self.AI_DMG // 2)
+        if random.random() < acc:
+            self._apply_pvp_damage(dmg)
+
+    def _bot_show_invuln_ring(self, bot):
+        av = bot['avatar']
+        if av is None:
+            return
+        if bot.get('invuln_ring') is None:
+            seg = LineSegs('bot_invuln_ring')
+            seg.setThickness(3.0)
+            seg.setColor(1.0, 0.85, 0.25, 0.9)
+            steps, R = 36, 1.1
+            for i in range(steps + 1):
+                a = (i / steps) * 6.28318
+                seg.drawTo(R * cos(a), R * sin(a), 0.05)
+            bot['invuln_ring'] = av.attachNewNode(seg.create())
+            bot['invuln_ring'].setLightOff()
+            bot['invuln_ring'].setTransparency(True)
+        bot['invuln_ring'].show()
+
+    def _bot_die(self, bot):
+        """추가 봇 사망 — 적과 동일한 X Bot DeathHeadshot 시체로 교체(아바타 숨김).
+        페인트: 잠깐 시체 후 부활(영역전 계속). AI 대결: '다운'으로 라운드 끝까지 시체로
+        남고, 전원 다운되면 라운드 승리(+1점, 먼저 10점 매치 승)."""
+        bot['hp'] = 0
+        av = bot['avatar']
+        if av is not None:
+            bot['corpse'] = self._make_death_corpse(
+                Vec3(bot['pos'].x, bot['pos'].y, 0.0), bot['yaw'] + 180)
+            av.hide()
+        rifle = bot.get('weapons', {}).get('rifle')
+        if rifle is not None:
+            rifle.hide()
+        if bot.get('invuln_ring') is not None:
+            bot['invuln_ring'].hide()
+        if bot.get('tracer') is not None:
+            bot['tracer'].hide()
+        if self.paint_mode:
+            bot['dead_t'] = BOT_DEATH_DUR        # 잠깐 시체 → 부활
+        else:
+            bot['down'] = True                   # AI 대결 — 라운드 끝까지 시체
+            self._check_ai_duel_round()
+
+    def _check_ai_duel_round(self):
+        """AI 대결(멀티봇) — 적 전원 다운(전멸)이면 라운드 승리: 내 점수 +1, 먼저
+        WIN_SCORE(10) 점이면 매치 승리, 아니면 라운드 리셋(전원 부활 + 카운트다운)."""
+        if self.paint_mode or self._match_over or not self._ai_bots:
+            return
+        if all(b.get('down') for b in self._ai_bots):
+            self._my_score += 1
+            self._update_score_hud()
+            print(f'[ai] 적 전멸 — 라운드 승리, 점수 {self._my_score}:'
+                  f'{self._enemy_score}', flush=True)
+            if self._my_score >= self.WIN_SCORE:
+                self._end_match(True)
+            elif self._deathcam_t <= 0.0:
+                # 단일 봇 때와 동일 — 바로 다음 라운드로 안 넘어가고 3초 데스캠.
+                # 이긴 사람(플레이어)은 그동안 자유 이동, 적 시체는 이미 깔려 있다.
+                # 3초 뒤 _arena_update 가 _arena_round_reset(전원 부활)을 호출한다.
+                self._deathcam_t = self.DEATHCAM_DUR
+                print('[ai] 라운드 승리 — 3초 후 다음 라운드', flush=True)
+
+    def _bot_respawn(self, bot):
+        """추가 봇 부활 — X Bot 시체 제거 + 아바타/총 복구 + 홈 스폰 복귀 + 잠깐 무적."""
+        if bot.get('corpse') is not None:
+            try:
+                bot['corpse'].cleanup()
+                bot['corpse'].removeNode()
+            except Exception:
+                pass
+            bot['corpse'] = None
+        bot['pos'] = Vec3(bot['home_spawn'])
+        bot['hp'] = self.ai_max_hp
+        bot['fire_t'] = 0.0
+        bot['ammo'] = self.AI_AMMO_MAX
+        bot['reload_t'] = 0.0
+        bot['invuln_t'] = self.AI_INVULN_DUR
+        bot['in_spawn'] = True
+        bot['exit_door_x'] = None
+        bot['dead_t'] = 0.0
+        bot['down'] = False
+        bot['smooth'] = Vec3(bot['pos'])
+        av = bot['avatar']
+        if av is not None:
+            av.setPos(bot['pos'])
+            av.show()                            # 사망 시 숨겼던 아바타 복구
+            idle = 'RifleIdle' if 'RifleIdle' in self.anim_names else (
+                'Idle' if 'Idle' in self.anim_names else None)
+            if idle:
+                av.loop(idle)
+                bot['anim'] = idle
+        rifle = bot.get('weapons', {}).get('rifle')
+        if rifle is not None:
+            rifle.show()                         # 부활 시 총 복구
+        self._bot_show_invuln_ring(bot)
+
+    def _bot_update(self, bot, dt):
+        """추가 봇 1프레임 — _ai_update 의 봇별 일반화(점프맵 제외: 멀티봇은 AI DUEL/
+        PAINT 전용이라 jump_mode 가 아님)."""
+        av = bot['avatar']
+        if av is None:
+            return
+        if bot.get('down'):
+            return                         # AI 대결 — 다운(라운드 리셋까지 X Bot 시체)
+        if bot.get('dead_t', 0.0) > 0.0:   # 페인트 — 잠깐 시체 후 부활
+            bot['dead_t'] -= dt
+            if bot['dead_t'] <= 0.0:
+                self._bot_respawn(bot)
+            return
+        if bot['invuln_t'] > 0.0:
+            bot['invuln_t'] -= dt
+            if bot['invuln_t'] <= 0.0 and bot.get('invuln_ring') is not None:
+                bot['invuln_ring'].hide()
+        if bot['reload_t'] > 0.0:
+            bot['reload_t'] -= dt
+            if bot['reload_t'] <= 0.0:
+                bot['ammo'] = self.AI_AMMO_MAX
+        frozen = (self._barriers_active or self._deathcam_t > 0.0
+                  or self._match_over)
+        pos = bot['pos']
+        dxp = self.player_pos.x - pos.x
+        dyp = self.player_pos.y - pos.y
+        dist = (dxp * dxp + dyp * dyp) ** 0.5 or 1e-5
+        ux, uy = dxp / dist, dyp / dist
+        bot['yaw'] = degrees(atan2(-ux, uy))
+        moving = False
+        if not frozen:
+            bot['strafe_t'] -= dt
+            if bot['strafe_t'] <= 0.0:
+                bot['strafe_dir'] = random.choice((-1, 1))
+                bot['strafe_t'] = random.uniform(0.5, 1.3)
+                bot['mobile_shoot'] = (random.random() < self._ai_move_shoot_p)
+            ze = self._spawn_zone_enemy
+            in_spawn = (ze is not None
+                        and ze[0] <= pos.x <= ze[1]
+                        and ze[2] <= pos.y <= ze[3])
+            bot['in_spawn'] = in_spawn
+            los = (not in_spawn) and (not self._bot_fire_blocked(bot))
+            can_shoot = (dist < self.AI_SHOOT_RANGE and los
+                         and bot['reload_t'] <= 0.0 and bot['ammo'] > 0)
+            spd = self.AI_SPEED * (self.HIT_SLOW_MULT if bot['slow_t'] > 0.0 else 1.0)
+            if in_spawn:
+                if bot['exit_door_x'] is None:
+                    self._bot_pick_exit_door(bot)
+                front_y = ze[2] if abs(ze[2]) < abs(ze[3]) else ze[3]
+                field_sign = -1.0 if front_y > 0 else 1.0
+                tx, ty = bot['exit_door_x'], front_y + field_sign * 2.0
+                ex, ey = tx - pos.x, ty - pos.y
+                em = (ex * ex + ey * ey) ** 0.5 or 1e-5
+                mvx, mvy = ex / em * spd, ey / em * spd
+            else:
+                bot['exit_door_x'] = None
+                fwd = 0.0
+                strafe_mult = 0.85
+                if can_shoot and not bot['mobile_shoot']:
+                    strafe_mult = 0.0
+                elif dist > self.AI_PREF_MAX:
+                    fwd = 1.0
+                elif dist < self.AI_PREF_MIN:
+                    fwd = -1.0
+                sx, sy = -uy, ux
+                mvx = (ux * fwd + sx * bot['strafe_dir'] * strafe_mult) * spd
+                mvy = (uy * fwd + sy * bot['strafe_dir'] * strafe_mult) * spd
+            nx0 = pos.x + mvx * dt
+            ny0 = pos.y + mvy * dt
+            nx, ny = self.level_collider.resolve(nx0, ny0, PLAYER_RADIUS,
+                                                 skip=self._spawn_mem_enemy)
+            for p in self._platforms:
+                if pos.z < p['top'] - self._step_assist:
+                    nx, ny = p['collider'].resolve(nx, ny, PLAYER_RADIUS)
+            moved = ((nx - pos.x) ** 2 + (ny - pos.y) ** 2) ** 0.5
+            pos.x, pos.y = nx, ny
+            moving = moved > 0.003
+            if (not in_spawn and (mvx * mvx + mvy * mvy) > 1e-4
+                    and moved < 0.3 * spd * dt):
+                bot['strafe_dir'] *= -1
+        if bot['slow_t'] > 0.0:
+            bot['slow_t'] = max(0.0, bot['slow_t'] - dt)
+        # 아바타 배치.
+        bot['smooth'] = Vec3(pos.x, pos.y, 0.0)
+        av.setPos(pos.x, pos.y, 0.0)
+        av.setH(bot['yaw'] + 180)
+        if av.isHidden():
+            av.show()
+        want = ('RifleRunForward' if (moving and 'RifleRunForward' in self.anim_names)
+                else ('RifleIdle' if 'RifleIdle' in self.anim_names else 'Idle'))
+        if want and want != bot['anim']:
+            av.loop(want)
+            bot['anim'] = want
+        av.update(force=True)
+        if bot['anchor'] is not None and bot['hand'] is not None \
+                and not bot['hand'].isEmpty():
+            bot['anchor'].setPos(bot['hand'].getPos(self.render))
+            bot['anchor'].setHpr(bot['hand'].getHpr(self.render))
+        if moving and not frozen:
+            bot['foot_t'] -= dt
+            if bot['foot_t'] <= 0.0:
+                self._bot_footstep(bot)
+                bot['foot_t'] = self.footstep_interval
+        else:
+            bot['foot_t'] = 0.0
+        if bot['tracer_t'] > 0.0:
+            bot['tracer_t'] -= dt
+            if bot['tracer_t'] <= 0.0 and bot['tracer'] is not None:
+                bot['tracer'].hide()
+        if frozen or bot['invuln_t'] > 0.0 or bot['reload_t'] > 0.0:
+            return
+        bot['fire_t'] -= dt
+        if bot['fire_t'] <= 0.0:
+            if bot['ammo'] <= 0:
+                bot['reload_t'] = self.AI_RELOAD_DUR
+                bot['fire_t'] = self.AI_FIRE_INTERVAL
+                vol = self._remote_dist_volume(0.55, 3.0, 24.0)
+                if self._r_sfx_reload is not None and vol > 0.0:
+                    self._r_sfx_reload.setVolume(vol)
+                    self._r_sfx_reload.play()
+                return
+            if dist < self.AI_SHOOT_RANGE and not bot['in_spawn']:
+                bot['fire_t'] = self.AI_FIRE_INTERVAL
+                self._bot_try_shoot(bot, dist, moving=moving)
+                bot['ammo'] -= 1
+            else:
+                bot['fire_t'] = self.AI_FIRE_INTERVAL
+
+    def _bot_footstep(self, bot):
+        pool = self._r_sfx_foot
+        if not pool:
+            return
+        d = (bot['smooth'] - self.player_pos).length()
+        vol = (23.4 if d <= 2.0 else (0.0 if d >= 26.0
+               else 23.4 * (1.0 - (d - 2.0) / 24.0)))
+        if vol <= 0.0:
+            return
+        n = len(pool)
+        i = random.randrange(n) if n > 1 else 0
+        while n > 1 and i == bot['last_foot_i']:
+            i = random.randrange(n)
+        bot['last_foot_i'] = i
+        pool[i].setVolume(vol)
+        pool[i].play()
+
+    def _bot_hit_test(self, bot, cam_pos, ray_dir, max_t):
+        av = bot['avatar']
+        if (av is None or av.isHidden() or not bot['hitboxes']
+                or bot.get('dead_t', 0.0) > 0.0 or bot.get('down')):
+            return None                   # 죽은(시체)/다운된 봇은 피격 판정 제외
+        best = None
+        for npa, npb, r, zone in bot['hitboxes']:
+            a = npa.getPos(self.render)
+            b = a if npb is npa else npb.getPos(self.render)
+            if zone == 'head':
+                off = Vec3(0, 0, Zombie.HEAD_UP_OFFSET)
+                a = a + off
+                b = b + off
+            t = _ray_capsule(cam_pos, ray_dir, a, b, r)
+            if t is None or t < 0.0 or t >= max_t:
+                continue
+            max_t = t
+            best = (t, zone, Vec3(cam_pos + ray_dir * t))
+        return best
+
     def _show_remote_weapon(self, widx):
         """무기 인덱스(0=권총 1=소총)에 맞는 상대 무기만 show, 나머지 hide.
         로컬이 무기를 바꾸면 패킷의 인덱스가 바뀌어 상대 화면 손 총도 바뀐다."""
@@ -7168,6 +8002,8 @@ class ZombieGame(ShowBase):
         self.on_ground = True
         self._role_decided = True
         self._am_a = am_a                 # 축구 공 권위 + 득점 매핑
+        if self.paint_mode:               # 역할 확정 후 스폰룸 막/존 재매핑(온라인)
+            self._assign_spawn_rooms()
         # 축구는 로비가 없으므로 역할 확정 즉시 킥오프 카운트다운 시작.
         if self.soccer_mode and self._countdown_t is None:
             self._countdown_t = 5.0
@@ -7182,6 +8018,7 @@ class ZombieGame(ShowBase):
                 self.level_collider.walls.remove(w)
         self._barriers_active = False
         self._countdown_t = 0.0
+        self._jump_started = True        # 점프맵 — 이제부터 봇도 코스 진행(그 전엔 정지)
         self._shimmer_fading = True
         self.hud_countdown.setText('FIGHT!')
         self.hud_countdown.setFg((1, 0.45, 0.3, 1))
@@ -7314,14 +8151,39 @@ class ZombieGame(ShowBase):
             best = (t, zone, Vec3(cam_pos + ray_dir * t))
         return best
 
-    def _bullet_blocked(self, cam, rdir, t_hit):
-        """사격 ray(cam, rdir 정규화)가 벽/플랫폼에 막혀 t_hit(상대까지 거리)보다
-        먼저 차단되는지 3D 로 판정. 벽은 실제 높이까지만 막아(낮은 엄폐는 위로 넘겨
-        쏠 수 있음), 벽 끝단의 두께 확장은 제거 + margin 인셋 → 모서리 옆 살짝 보이는
-        적도 맞는다(과한 차단 수정)."""
+    def _bullet_blocked(self, cam, rdir, t_hit, skip_platforms=()):
+        """사격 ray(cam, rdir 정규화)가 벽/플랫폼에 막혀 t_hit(표적까지 거리)보다
+        먼저 차단되는지 판정. 핵심: ray 가 벽의 xy 풋프린트에 '진입하는 지점의 높이'를
+        보고, 그게 벽 윗변보다 위면(=윗변 너머가 보임) 통과시키고, 아래면(=옆/앞면에
+        부딪힘) 차단한다. → 높은 곳에서 벽 너머로 보이는 머리를 쏠 수 있고(아래로 내리꽂는
+        사선이 벽 뒤쪽 윗모서리에 걸려 무효되던 버그 수정), 평평한 관통은 그대로 막힌다.
+        끝단 margin 인셋으로 옆 모서리 피킹도 관대. 내가 올라선 발판은 진입 t≈0 이라 자동 제외.
+        skip_platforms: 표적이 올라서 있는 발판 — 표적의 바닥이므로 차단에서 뺀다."""
         ox, oy, oz = cam.x, cam.y, cam.z
         dx, dy, dz = rdir.x, rdir.y, rdir.z
         m = 0.10                          # 끝단 여유(모서리 피킹 관대)
+
+        def blocks(bx0, bx1, by0, by1, hgt):
+            if bx1 <= bx0 or by1 <= by0:
+                return False
+            te, tx = 0.0, t_hit           # ray 가 xy 풋프린트 안에 있는 t 구간
+            for o, dd, lo, hi in ((ox, dx, bx0, bx1), (oy, dy, by0, by1)):
+                if -1e-12 < dd < 1e-12:
+                    if o < lo or o > hi:
+                        return False      # 이 축으로 풋프린트 안 통과
+                else:
+                    ta, tb = (lo - o) / dd, (hi - o) / dd
+                    if ta > tb:
+                        ta, tb = tb, ta
+                    if ta > te:
+                        te = ta
+                    if tb < tx:
+                        tx = tb
+            if not (te < tx and 1e-4 < te < t_hit - 1e-4):
+                return False              # 표적보다 뒤거나, 시작점이 이미 풋프린트 안
+            z_enter = oz + dz * te        # 풋프린트 진입 지점 높이
+            return z_enter <= hgt         # 윗변 아래로 진입 → 막힘 / 위로 진입 → 통과
+
         for w in self.level_collider.walls:
             if abs(w.ay - w.by) < 1e-6:   # 수평벽(긴축 x) — 끝단만 인셋, 두께 정확
                 bx0, bx1 = min(w.ax, w.bx) + m, max(w.ax, w.bx) - m
@@ -7329,17 +8191,12 @@ class ZombieGame(ShowBase):
             else:                         # 수직벽(긴축 y)
                 bx0, bx1 = w.x0, w.x1
                 by0, by1 = min(w.ay, w.by) + m, max(w.ay, w.by) - m
-            if bx1 <= bx0 or by1 <= by0:
-                continue
-            hgt = getattr(w, 'height', WALL_HEIGHT)
-            t = _ray_aabb(ox, oy, oz, dx, dy, dz, bx0, bx1, by0, by1, 0.0, hgt)
-            if t is not None and 1e-4 < t < t_hit - 1e-4:
+            if blocks(bx0, bx1, by0, by1, getattr(w, 'height', WALL_HEIGHT)):
                 return True
-        for p in self._platforms:         # 올라타는 박스도 윗면 높이까지 총알 차단
-            t = _ray_aabb(ox, oy, oz, dx, dy, dz,
-                          p['x0'] + m, p['x1'] - m, p['y0'] + m, p['y1'] - m,
-                          0.0, p['top'])
-            if t is not None and 1e-4 < t < t_hit - 1e-4:
+        for p in self._platforms:         # 올라타는 박스 — 윗면 높이까지(윗면 너머는 통과)
+            if p in skip_platforms:
+                continue
+            if blocks(p['x0'] + m, p['x1'] - m, p['y0'] + m, p['y1'] - m, p['top']):
                 return True
         return False
 
@@ -7357,7 +8214,7 @@ class ZombieGame(ShowBase):
             if self._ai_invuln_t > 0.0:
                 return                       # 봇 부활 무적 — 피해 무효
             # AI 대결 — 로컬 HP 를 직접 깎고, 0 이하면 처치 처리(점수/데스캠/리셋).
-            self.ai_hp -= dmg
+            self.ai_hp = self.enemy_health.take_damage(self.ai_hp, dmg)
             self._ai_slow_t = self.HIT_SLOW_DUR   # 봇도 피격 시 잠깐 감속
             print(f'[ai] AI 명중 zone={zone} dmg={dmg} → hp={self.ai_hp}', flush=True)
             if self.ai_hp <= 0:
@@ -7382,6 +8239,32 @@ class ZombieGame(ShowBase):
         print(f'[pvp] 상대 명중 zone={zone} dmg={dmg} 누적={self._dmg_dealt}',
               flush=True)
 
+    def _on_bot_hit(self, bot, zone, world_pos):
+        """추가 봇(적 수>1) 명중 — 봇0 의 ai_mode 명중 피드백과 동일하되, 처치 시엔
+        데스캠/라운드리셋 없이 즉시 부활(잠깐 무적)시키고 플레이어에게 킬을 준다."""
+        dmg = Zombie.DAMAGE.get(zone, 5)
+        if zone == 'head' and getattr(self, '_head_onekill', False):
+            dmg = max(dmg, 100)
+        if bot.get('dead_t', 0.0) > 0.0 or bot.get('down'):
+            return                       # 이미 죽은(시체/다운) 봇 — 무시
+        self._play_pool(self.sfx_hit, '_hit_i')
+        self._spawn_hit_particle(world_pos)
+        self._spawn_damage_number(world_pos, dmg)
+        self._show_hitmarker()
+        if bot['invuln_t'] > 0.0:
+            return                       # 봇 부활 무적 — 피해 무효
+        bot['hp'] = self.enemy_health.take_damage(bot['hp'], dmg)
+        bot['slow_t'] = self.HIT_SLOW_DUR
+        print(f'[ai] 추가봇 명중 zone={zone} dmg={dmg} → hp={bot["hp"]}', flush=True)
+        if bot['hp'] <= 0:
+            self._show_hitmarker(kill=True)
+            if self.paint_mode:
+                self._paint_on_kill((bot['pos'].x, bot['pos'].y),
+                                    zone, self._paint_my_id)
+                self._spawn_health_pack(bot['pos'].x, bot['pos'].y)
+            self._on_zombie_killed(zone)     # 발로란트 킬배너 + 콤보 + 사운드
+            self._bot_die(bot)               # 사망 모션 → 잠깐 시체 → 부활(데스캠/멈춤 없음)
+
     def _show_hitmarker(self, kill=False):
         """적 명중 — 조준점에 X(히트마커)를 0.18초 점멸. 일반 명중=흰색,
         처치(kill=True)=레드. (디자인 .hitx.white / .hitx.red)"""
@@ -7393,6 +8276,35 @@ class ZombieGame(ShowBase):
             self.hitmarker.setColorScale(1.0, 1.0, 1.0, 1.0)     # 흰색 그대로
         self.hitmarker.show()
         self._hitmarker_t = 0.18
+        # 팝 — 크게(1.4) 떴다 빠르게 1.0 으로 settle. 명중 순간(상태 전환)에만 start.
+        pop = getattr(self, '_hm_pop', None)
+        if pop is not None:
+            pop.finish()
+        self.hitmarker.setScale(1.4)
+        self._hm_pop = LerpScaleInterval(self.hitmarker, 0.09, 1.0,
+                                         startScale=1.4, blendType='easeOut')
+        self._hm_pop.start()
+
+    def _start_ammo_panel_slide(self):
+        """무기 교체 시 우하단 탄약 패널이 살짝 내려갔다(clip-out) 다시 올라오는
+        (clip-in) 슬라이드. 무기 변경(상태 전환) 시점에만 인터벌 start — 매 프레임
+        setPos 하지 않는다. online·솔로 공통(무기 교체는 로컬 동작)."""
+        panel = getattr(self, '_ammo_plate', None)
+        if panel is None:
+            return
+        z0 = getattr(self, '_ammo_plate_z0', 0.0)
+        sl = getattr(self, '_ammo_slide', None)
+        if sl is not None:
+            sl.finish()
+        panel.setPos(0, 0, z0)
+        drop = 0.05
+        self._ammo_slide = Sequence(
+            LerpPosInterval(panel, 0.08, (0, 0, z0 - drop),
+                            startPos=(0, 0, z0), blendType='easeIn'),
+            LerpPosInterval(panel, 0.16, (0, 0, z0),
+                            startPos=(0, 0, z0 - drop), blendType='easeOut'),
+        )
+        self._ammo_slide.start()
 
     def _show_dmg_flash(self, old_hp, new_hp):
         """체력바에서 방금 닳은 구간 위에 하얀 직사각형을 띄워 '팍' 커지며 페이드아웃.
@@ -7442,7 +8354,7 @@ class ZombieGame(ShowBase):
         if self._invuln_t > 0.0:
             return                        # 부활 무적 — 피해 무효
         old_hp = self.core_integrity
-        self.core_integrity = max(0, self.core_integrity - amount)
+        self.core_integrity = self.player_health.take_damage(self.core_integrity, amount)
         self._show_dmg_flash(old_hp, self.core_integrity)   # 체력바 닳은 구간 플래시
         if self.core_integrity < old_hp:
             self._trigger_dmg_vignette()                    # 가장자리 레드 플래시
@@ -7463,6 +8375,12 @@ class ZombieGame(ShowBase):
         self._on_zombie_killed('body')   # kills+1 + 콤보/킬 사운드 + 발로란트 킬 배너
         self._my_score += 1
         self._update_score_hud()
+        # 땅따먹기 온라인 — 상대를 처치한 자리를 '내 색'으로 칠한다(점수=칸수). 양쪽
+        # 클라가 각자 감지한 죽음 위치를 칠하므로 별도 패킷 없이 타일이 동기화된다.
+        # (AI 대결은 _on_remote_player_hit 에서 봇 처치 시 이미 칠했으므로 온라인만.)
+        if self.paint_mode and not self.ai_mode and self._remote_smooth is not None:
+            self._paint_on_kill((self._remote_smooth.x, self._remote_smooth.y),
+                                'body', self._paint_my_id)
         print(f'[pvp] 상대 처치! 점수 {self._my_score}:{self._enemy_score}', flush=True)
         if not self.soccer_mode and not self.paint_mode \
                 and self._my_score >= self.WIN_SCORE:
@@ -7518,6 +8436,12 @@ class ZombieGame(ShowBase):
             w = getattr(self, nm, None)
             if w is not None:
                 w.hide()
+        # 킬배너 — 마지막(승리) 처치의 슬램 애니가 결과창 위로 남지 않게 시퀀스 정지+숨김.
+        seq = getattr(self, '_kb_seq', None)
+        if seq is not None:
+            seq.finish()
+        if getattr(self, 'kb_root', None) is not None:
+            self.kb_root.hide()
         self._dmg_dir_t = 0.0
         if getattr(self, '_dmg_arc_geom', None) is not None:
             self._dmg_arc_geom.removeNode()
@@ -7833,6 +8757,8 @@ class ZombieGame(ShowBase):
         독립적으로 호출 — 둘 다 똑같이 리셋되어 라운드가 다시 시작된다.)"""
         if self._match_over:
             return
+        # 라운드 종료(적 전멸/사망으로 라운드 전환) — 킬 사운드 사이클 초기화.
+        self._kill_tier = 0
         self.player_pos = Vec3(self._spawn_pos)
         self.player_yaw = self._spawn_yaw
         self.player_pitch = 0.0
@@ -7862,6 +8788,8 @@ class ZombieGame(ShowBase):
             self._ai_reload_t = 0.0
             if self.remote_avatar is not None:
                 self.remote_avatar.setPos(self._ai_pos)
+        for b in self._ai_bots:              # 멀티봇 — 전원 부활(시체 제거 + 홈 복귀)
+            self._bot_respawn(b)
         # 5초 카운트다운 재시작 — _arena_update 가 끝에서 배리어 제거 + FIGHT!.
         self._countdown_t = 5.0
         self.hud_countdown.setFg((1, 0.92, 0.4, 1))
@@ -8206,7 +9134,9 @@ class ZombieGame(ShowBase):
             self._update_remote_avatar(dt)
             self._arena_update(dt)        # 스폰 배리어 카운트다운 + shimmer fade
         elif self.ai_mode:
-            self._ai_update(dt)           # AI 봇 이동/조준/사격(네트워크 없음)
+            self._ai_update(dt)           # AI 봇0 이동/조준/사격(네트워크 없음, 오늘과 동일)
+            for _bot in self._ai_bots:    # 추가 봇(적 수>1) — 비어 있으면 no-op
+                self._bot_update(_bot, dt)
             self._arena_update(dt)        # 카운트다운/라운드 흐름 공유
         if self.soccer_mode:
             self._soccer_update(dt)       # 공 물리 + 골/킥오프
@@ -8318,47 +9248,48 @@ class ZombieGame(ShowBase):
                 mv.normalize()
                 self.editor_pos += mv * (self.editor_speed * dt)
         else:
-            # WASD 이동 + 점프 (1인칭, 서있는 상태에서만 — 무릎/transition 중 잠금)
-            if self.kneel_state == 'stand':
-                yr = radians(self.player_yaw)
-                forward = Vec3(-sin(yr), cos(yr), 0)
-                right_v = Vec3(cos(yr), sin(yr), 0)
-                mv = Vec3(0, 0, 0)
-                if not self._dead:        # 사망 중엔 이동 동결(데스캠 고정)
-                    if self.keys['w']: mv += forward
-                    if self.keys['s']: mv -= forward
-                    if self.keys['d']: mv += right_v
-                    if self.keys['a']: mv -= right_v
-                if mv.length() > 0:
-                    mv.normalize()
-                    spd_mult = (1.0 + (self.ads_move_factor - 1.0) * self.aim_t) \
-                        * self._weapon_speed_mult   # 무기별 속도(권총 1.3배)
-                    if self._slow_t > 0.0:          # 피격 직후 잠깐 감속
-                        spd_mult *= self.HIT_SLOW_MULT
-                    self.player_pos += mv * (self.move_speed * spd_mult * dt)
-                    # 벽 충돌 해소 (XY 평면) — 박스 안쪽으로 침투했으면 바깥으로 밀어냄.
-                    nx, ny = self.level_collider.resolve(
-                        self.player_pos.x, self.player_pos.y, PLAYER_RADIUS)
-                    self.player_pos.x = nx
-                    self.player_pos.y = ny
-                    # 플랫폼(올라타는 박스) — 발이 윗면보다 step_assist 이상 낮으면
-                    # 옆면이 막고, step_assist 이내면 윗면으로 스냅(올라섬). 위/근처면 자유.
-                    for p in self._platforms:
-                        if self.player_pos.z >= p['top'] - self._step_assist:
-                            if (p['x0'] <= self.player_pos.x <= p['x1']
-                                    and p['y0'] <= self.player_pos.y <= p['y1']
-                                    and self.player_pos.z < p['top']):
-                                self.player_pos.z = p['top']   # 윗면으로 올라섬
-                                self.player_vz = 0.0
-                                self.on_ground = True
-                        else:
-                            nx, ny = p['collider'].resolve(
-                                self.player_pos.x, self.player_pos.y, PLAYER_RADIUS)
-                            self.player_pos.x = nx
-                            self.player_pos.y = ny
-                if self.keys['space'] and self.on_ground and not self._dead:
-                    self.player_vz = self.jump_speed
-                    self.on_ground = False
+            # WASD 이동 + 점프 (1인칭).
+            yr = radians(self.player_yaw)
+            forward = Vec3(-sin(yr), cos(yr), 0)
+            right_v = Vec3(cos(yr), sin(yr), 0)
+            mv = Vec3(0, 0, 0)
+            if not self._dead:        # 사망 중엔 이동 동결(데스캠 고정)
+                if self.keys['w']: mv += forward
+                if self.keys['s']: mv -= forward
+                if self.keys['d']: mv += right_v
+                if self.keys['a']: mv -= right_v
+            if mv.length() > 0:
+                mv.normalize()
+                spd_mult = (1.0 + (self.ads_move_factor - 1.0) * self.aim_t) \
+                    * self._weapon_speed_mult   # 무기별 속도(권총 1.3배)
+                if self._slow_t > 0.0:          # 피격 직후 잠깐 감속
+                    spd_mult *= self.HIT_SLOW_MULT
+                self.player_pos += mv * (self.move_speed * spd_mult * dt)
+                # 벽 충돌 해소 (XY 평면) — 박스 안쪽으로 침투했으면 바깥으로 밀어냄.
+                # 내 팀 스폰 막은 통과(skip) — 페인트 외엔 빈 리스트라 영향 없음.
+                nx, ny = self.level_collider.resolve(
+                    self.player_pos.x, self.player_pos.y, PLAYER_RADIUS,
+                    skip=self._spawn_mem_mine)
+                self.player_pos.x = nx
+                self.player_pos.y = ny
+                # 플랫폼(올라타는 박스) — 발이 윗면보다 step_assist 이상 낮으면
+                # 옆면이 막고, step_assist 이내면 윗면으로 스냅(올라섬). 위/근처면 자유.
+                for p in self._platforms:
+                    if self.player_pos.z >= p['top'] - self._step_assist:
+                        if (p['x0'] <= self.player_pos.x <= p['x1']
+                                and p['y0'] <= self.player_pos.y <= p['y1']
+                                and self.player_pos.z < p['top']):
+                            self.player_pos.z = p['top']   # 윗면으로 올라섬
+                            self.player_vz = 0.0
+                            self.on_ground = True
+                    else:
+                        nx, ny = p['collider'].resolve(
+                            self.player_pos.x, self.player_pos.y, PLAYER_RADIUS)
+                        self.player_pos.x = nx
+                        self.player_pos.y = ny
+            if self.keys['space'] and self.on_ground and not self._dead:
+                self.player_vz = self.jump_speed
+                self.on_ground = False
 
             # 지지 높이 — 플랫폼 윗면 위(또는 step_assist 이내)에 올라타 있으면 그게 바닥.
             support = 0.0
@@ -8368,7 +9299,7 @@ class ZombieGame(ShowBase):
                         and self.player_pos.z >= p['top'] - self._step_assist
                         and p['top'] > support):
                     support = p['top']
-            # 중력은 항상 적용 (무릎자세에서도)
+            # 중력은 항상 적용
             self.player_vz -= self.gravity * dt
             self.player_pos.z += self.player_vz * dt
             if self.player_pos.z <= support:
@@ -8376,9 +9307,9 @@ class ZombieGame(ShowBase):
                 self.player_vz = 0
                 self.on_ground = True
 
-            # 발소리 — 지상에서 서서 WASD 이동 중일 때 보폭 간격마다 한 발.
-            # (점프 중·무릎 자세·에디터 free-cam 에선 안 남)
-            stepping = (self.on_ground and self.kneel_state == 'stand'
+            # 발소리 — 지상에서 WASD 이동 중일 때 보폭 간격마다 한 발.
+            # (점프 중·에디터 free-cam 에선 안 남)
+            stepping = (self.on_ground
                         and any(self.keys[k] for k in ('w', 'a', 's', 'd')))
             if stepping:
                 self._footstep_t -= dt
@@ -8555,11 +9486,9 @@ class ZombieGame(ShowBase):
                     self.wave += 1
                     self._spawn_wave(self.wave)
 
-        # 킬 콤보 윈도우 카운트다운 — 0 이 되면 다음 킬은 1단계부터.
+        # 킬스트릭 4초 콤보 윈도우 카운트다운(1v1 외 모드) — 0 이 되면 다음 킬은 1단계부터.
         if self._combo_window > 0.0:
             self._combo_window = max(0.0, self._combo_window - dt)
-        # 하단 콤보 게이지 갱신 (남은 시간 → 왼쪽으로 슬라이드 소진)
-        self._update_combo_bar()
 
         # (F 처치/복원 상호작용 제거 — 적는 죽으면 페이드아웃되어 사라짐)
 
@@ -8604,6 +9533,13 @@ if __name__ == '__main__':
     paint = '--paint' in sys.argv
     jump = '--jump' in sys.argv     # 점프맵 솔로(타임트라이얼)
     spawn_b = '--p2' in sys.argv
+    # '--enemies N'(직접실행 테스트용) — AI DUEL/PAINT 솔로 적 봇 수 1~5. 메뉴는 별도.
+    enemies = 1
+    if '--enemies' in sys.argv:
+        try:
+            enemies = int(sys.argv[sys.argv.index('--enemies') + 1])
+        except (ValueError, IndexError):
+            enemies = 1
     menu = not (online or spawn_b or soccer or paint or jump)
     ZombieGame(online=online, spawn_b=spawn_b, menu=menu, soccer=soccer,
-               paint=paint, jump=jump).run()
+               paint=paint, jump=jump, enemies=enemies).run()
