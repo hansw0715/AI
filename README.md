@@ -22,14 +22,43 @@ Mirror's Edge 스타일 1인칭 슈터 프로토타입 (Panda3D).
 | I / J / K / L / U / O | 슬라이드 IK target marker 튜닝 (RightHand-local, 2cm step — 임시 하네스) |
 | P | 현재 marker 좌표 dump + 화면 가운데 큰 글씨 3초 overlay |
 
-## 실행
+## 실행 (커맨드라인)
 
-```powershell
-pip install -r requirements.txt
-python zombie_game.py
-```
+> 별도 설치 프로그램(.bat) 없이 **명령어로 직접 설치·실행**합니다.
 
-`assets/ybot/scene.bam` + `assets/weapons/9mm_pistol.bam` 이 이미 레포에 포함되어 있어서 위 두 줄이면 끝.
+1. **Python 설치** (없으면): <https://www.python.org/downloads/>
+   설치 첫 화면에서 **"Add python.exe to PATH" 체크 필수.**
+
+2. **터미널 열기**: Windows 검색창에 `cmd`(명령 프롬프트) 또는 `powershell` 입력 → 실행.
+
+3. **게임 폴더로 이동** — 탐색기에서 이 폴더를 연 뒤 **주소창의 경로를 복사**하고,
+   터미널에 `cd ` 뒤에 따옴표로 감싸 붙여넣기:
+
+   ```
+   cd "복사한_폴더_경로"
+   ```
+
+   예) `cd "C:\Users\내이름\Downloads\Null Project"`
+
+4. **필요한 라이브러리 설치** (최초 1회만):
+
+   ```
+   pip install panda3d==1.10.16 panda3d-gltf==1.3.0
+   ```
+
+5. **게임 실행**:
+
+   ```
+   python play_online.py
+   ```
+
+   다음부터는 5번 한 줄(`python play_online.py`)만 입력하면 됩니다.
+   메뉴에서 솔로(AI 대결 / 웨이브) 또는 멀티플레이를 선택하세요.
+
+> 설치 + 실행을 한 줄로:
+> `pip install panda3d==1.10.16 panda3d-gltf==1.3.0 && python play_online.py`
+
+`assets/` 의 `.bam` 자산이 이미 포함되어 있어 위 단계면 바로 실행됩니다.
 
 ## 의존성
 

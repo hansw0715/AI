@@ -25,3 +25,9 @@ footstep.aiff
 
 # 적 테두리 색 등 런타임 설정(사용자별)
 settings.json
+
+# 발표/분석용 워드 문서 — 게임과 무관해서 제외
+*.docx
+
+# 설치/실행 .bat — 커맨드라인 실행으로 대체(README 참고)
+*.bat

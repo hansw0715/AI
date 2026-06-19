@@ -1523,6 +1523,7 @@ class ZombieGame(ShowBase):
         self._jump_checkpoint = None
         self._jump_start_t = 0.0
         self._jump_finished = False
+        self._jump_started = False     # 점프맵 — 카운트다운(FIGHT) 전엔 봇 정지
         # 아레나 스폰 측 — False=스폰 A(0,-15 북향), True=스폰 B(0,15 남향).
         # 두 클라이언트가 겹치지 않게 한쪽은 '--p2' 로 띄운다(릴레이는 역할 배정 못함).
         self._spawn_b = spawn_b
@@ -1720,6 +1721,9 @@ class ZombieGame(ShowBase):
         self.win.requestProperties(props)
         self.disableMouse()  # ShowBase 기본 마우스-카메라 비활성
         self._is_fullscreen = False   # F11 토글 — 진짜 전체화면(작업표시줄 가림)
+        # F11 은 메뉴/인게임 어디서든 동작해야 하므로 여기(__init__)서 한 번 바인딩한다.
+        # (_bind_inputs 는 _build_world 에서만 돌아 메뉴 화면엔 F11 이 안 걸렸었다.)
+        self.accept('f11', self._toggle_fullscreen)
         self.setBackgroundColor(0.015, 0.020, 0.030)   # 어두운 검푸른 야간 하늘
 
         # ── 설정/오디오/릴레이 상태 — 메뉴(SETTINGS/로비)에서 _build_world 전에도
@@ -2161,8 +2165,8 @@ class ZombieGame(ShowBase):
         }
         self._last_kill_snd = None
         self._kill_tier = 0             # 현재 콤보 단계 (1..5)
-        self._combo_window = 0.0        # 콤보 유지 남은 시간(초)
-        self.kill_combo_dur = 5.0       # 연속킬 인정 시간
+        self._combo_window = 0.0        # 콤보 유지 남은 시간(초) — 1v1 외 모드에서만 사용
+        self.kill_combo_dur = 4.0       # 연속킬 인정 시간(4초 내 다음 킬이면 단계 상승)
         self.kills = 0                  # 총 처치 수 (HUD)
 
         # 피격 사운드 — 부위(head/body/other) 상관없이 Voicy_Headshot 으로 통일.
@@ -2250,8 +2254,7 @@ class ZombieGame(ShowBase):
         self._build_pause_menu()
         # 화면 중앙 십자 조준점
         self._build_crosshair()
-        # 화면 하단 연속킬 콤보 게이지 (남은 시간 → 왼쪽으로 슬라이드 소진)
-        self._build_combo_bar()
+        # (연속킬 콤보 게이지 제거 — 시간제한 없이 죽일수록 킬 사운드 단계만 오른다)
         # 발로란트 스타일 킬배너 (처치 시 하단 중앙에 '쾅' 등장)
         self._build_kill_banner()
 
@@ -3062,6 +3065,13 @@ class ZombieGame(ShowBase):
                 z.outline.setColor(self.outline_color, 1)
         if self._remote_outline is not None:
             self._remote_outline.setColor(self.outline_color, 1)
+        # AI 대결에서 적 수>1 이면 봇0(remote_avatar)을 숨기고 적를 모두
+        # self._ai_bots 로 통일한다. 이 봇들의 테두리는 self.zombies 에도
+        # _remote_outline 에도 없어 위 루프가 못 잡으므로 직접 갱신한다.
+        for b in getattr(self, '_ai_bots', []):
+            ol = b.get('outline')
+            if ol is not None and not ol.isEmpty():
+                ol.setColor(self.outline_color, 1)
         self._refresh_outline_swatches()
 
     def _refresh_outline_swatches(self):
@@ -3864,18 +3874,25 @@ class ZombieGame(ShowBase):
         self.sfx_foot[i].play()
 
     def _on_zombie_killed(self, zone):
-        """적 처치 시 호출 — 킬 카운트 + 콤보 단계 갱신 + 킬 사운드.
-        zone: 마지막에 맞혀 죽인 부위('head'/'body'/'other'). 콤보 판정에 사용."""
-        headshot = (zone == 'head')
+        """적 처치 시 호출 — 킬 카운트 + 킬 사운드.
+        zone 은 더 이상 사용 안 함(콤보 시간제한 제거). 죽일수록 사운드 단계만 올라간다."""
         self.kills += 1
-        # 직전 킬 5초 이내 + 이번이 헤드샷이면 단계 상승(최대 5), 아니면 1로 리셋.
-        if headshot and self._combo_window > 0.0:
+        # 킬스트릭(킬 사운드 단계) 규칙:
+        #  · 듀얼/데스매치(_is_duel_mode — AI 듀얼 적 1~5기 또는 온라인 PvP):
+        #    시간제한 없이 적을 잡을수록 단계 1→5 상승. 적을 전멸시켜 라운드가 바뀌면
+        #    (_arena_round_reset)에서 0 으로 초기화된다.
+        #  · 그 외(웨이브/페인트/축구/점프): 직전 킬로부터 4초 이내에 죽여야 단계 상승,
+        #    4초가 지났으면 다시 1단계부터.
+        if self._is_duel_mode():
             self._kill_tier = min(self._kill_tier + 1, 5)
         else:
-            self._kill_tier = 1
-        self._combo_window = self.kill_combo_dur
+            if self._combo_window > 0.0:
+                self._kill_tier = min(self._kill_tier + 1, 5)
+            else:
+                self._kill_tier = 1
+            self._combo_window = self.kill_combo_dur
         self._play_kill_sound(self._kill_tier)
-        self._show_kill_banner()   # 발로란트 스타일 킬배너 (콤보 단계 반영)
+        self._show_kill_banner()   # 발로란트 스타일 킬배너
 
     def _play_kill_sound(self, tier):
         """현재 콤보 단계의 킬 사운드 재생. 이전 킬 사운드는 멈춰 겹침 방지."""
@@ -5184,6 +5201,8 @@ class ZombieGame(ShowBase):
     def _show_kill_banner(self):
         """처치 시 호출 — HTML(kill_banner_motion.html) 그대로 화면 하단 중앙에 해골
         슬램 배너를 재생. play()/setInterval 처럼 진행 중이어도 처음부터 재시작."""
+        if getattr(self, '_match_over', False):
+            return                       # 매치 종료 후엔 킬배너 안 띄움(결과창 가림 방지)
         seq = getattr(self, '_kb_seq', None)
         if seq is not None:
             seq.start()
@@ -5312,7 +5331,16 @@ class ZombieGame(ShowBase):
         return ((self.online_mode or self.ai_mode)
                 and not (self.soccer_mode or self.paint_mode
                          or getattr(self, 'jump_mode', False))
-                and not getattr(self, '_in_lobby', False))
+                and not getattr(self, '_in_lobby', False)
+                and not getattr(self, '_match_over', False))
+
+    def _is_duel_mode(self):
+        """듀얼/데스매치 모드인가 — AI 듀얼(적 1~5기) 또는 온라인 PvP. 킬스트릭 규칙 분기.
+        이 모드는 시간제한 없이 적을 잡을수록 단계 상승, 적 전멸로 라운드가 바뀌면 초기화.
+        축구/땅따먹기/점프/웨이브는 제외(4초 콤보 윈도우 규칙)."""
+        if self.soccer_mode or self.paint_mode or getattr(self, 'jump_mode', False):
+            return False
+        return self.online_mode or self.ai_mode
 
     def _rebuild_mag_strip(self, amax):
         """탄창 스트립을 amax 개의 세그먼트로 다시 그린다(무기 교체 시 ammo_max 변동 대응).
@@ -5401,22 +5429,7 @@ class ZombieGame(ShowBase):
             fg=TAC_TEXT_2, align=TextNode.ACenter, mayChange=True,
             parent=self.hud_score, font=getattr(self, '_tac_label_font', None))
         self.hud_score.hide()             # online 일 때만 _setup_online 에서 show
-        # ── 상대 HP 칩(점수 플레이트 우측) — 이름 + 콜드 스틸 막대. (디자인 OppCompact)
-        #    데스매치에서만 표시. HP 는 AI 모드에선 ai_hp 반영, 온라인은 동기화 안 돼 풀.
-        self.hud_opp = self.aspect2d.attachNewNode('opp_comp')
-        ocx, ocr, ocz, ochh = 0.235, 0.40, 0.838, 0.007
-        self._opp_bar_l, self._opp_bar_w = ocx, ocr - ocx
-        self.hud_opp_name = OnscreenText(
-            text='OPERATOR', pos=(ocx, ocz + 0.022), scale=0.030,
-            fg=TAC_STEEL, align=TextNode.ALeft, mayChange=True,
-            parent=self.hud_opp, font=getattr(self, '_tac_label_font', None))
-        self.hud_opp_track = DirectFrame(
-            frameColor=(0.094, 0.102, 0.125, 0.9), relief=DGG.FLAT,
-            frameSize=(ocx, ocr, ocz - ochh, ocz + ochh), parent=self.hud_opp)
-        self.hud_opp_fill = DirectFrame(
-            frameColor=TAC_STEEL, relief=DGG.FLAT,
-            frameSize=(ocx, ocr, ocz - ochh, ocz + ochh), parent=self.hud_opp)
-        self.hud_opp.hide()
+        # (상대 HP 칩 'OPERATOR' UI 제거 — 불필요해서 삭제)
         # 승/패 결과 배너 — 매치 종료 시 화면 중앙에 크게.
         self.hud_match_result = OnscreenText(
             text='', pos=(0, 0.12), scale=0.20,
@@ -5924,23 +5937,7 @@ class ZombieGame(ShowBase):
             self.hud_low_bg.hide()
             self.hud_low_tag.hide()
 
-        # 상대 HP 칩 — 데스매치에서만. AI 모드는 ai_hp 반영, 온라인은 동기화 없어 풀.
-        if self._deathmatch_active():
-            if self.hud_opp.isHidden():
-                self.hud_opp.show()
-            nm = (self._remote_name or 'OPERATOR') if self.online_mode else 'OPERATOR'
-            self.hud_opp_name.setText(nm.upper())
-            if self.ai_mode and not self.online_mode:
-                oratio = max(0.0, min(1.0, self.ai_hp / max(1, self.ai_max_hp)))
-            else:
-                oratio = 1.0
-            ol, ow = self._opp_bar_l, self._opp_bar_w
-            fs = self.hud_opp_track['frameSize']
-            self.hud_opp_fill['frameSize'] = (ol, ol + ow * oratio, fs[2], fs[3])
-            self.hud_opp_fill['frameColor'] = (TAC_ACCENT if oratio <= 0.3
-                                               else TAC_STEEL)
-        elif not self.hud_opp.isHidden():
-            self.hud_opp.hide()
+        # (상대 HP 칩 'OPERATOR' UI 제거됨 — 표시 로직 없음)
 
         # 웨이브 모드 HUD — 총 처치 수 + 현재 웨이브/남은 적
         alive = sum(1 for z in self.zombies if z.hp > 0)
@@ -6044,8 +6041,13 @@ class ZombieGame(ShowBase):
         else:
             props.setFullscreen(False)
             props.setSize(1280, 720)
-        props.setCursorHidden(True)
-        props.setMouseMode(WindowProperties.M_confined)
+        # 커서/마우스 모드는 현재 화면 상태를 유지한다 — 메뉴나 일시정지 중엔 버튼
+        # 클릭을 위해 커서를 보여야 하고, 인게임(마우스룩)에선 숨기고 가둔다.
+        in_game = (getattr(self, '_game_started', False)
+                   and not getattr(self, 'paused', False))
+        props.setCursorHidden(in_game)
+        props.setMouseMode(WindowProperties.M_confined if in_game
+                           else WindowProperties.M_absolute)
         self.win.requestProperties(props)
 
     def windowEvent(self, win):
@@ -6379,15 +6381,17 @@ class ZombieGame(ShowBase):
         # 하고 플레이어를 독립적으로 향해 조준/사격. (플레이어를 따라하지 않음.)
         bot_z = 0.0
         if self.jump_mode:
-            bot_z = self._ai_jump_z if not frozen else self._ai_jump_z
-            if not frozen:
+            bot_z = self._ai_jump_z
+            # 카운트다운(FIGHT) 전에는 봇이 출발 지점에 완전히 정지 — 코스 진행도
+            # 플레이어 조준 회전도 하지 않는다. 시작 후(_jump_started)에만 움직인다.
+            if self._jump_started and not frozen:
                 bot_z = self._ai_jump_step(dt)
                 self._ai_jump_z = bot_z
                 moving = True
-            ddx = self.player_pos.x - self._ai_pos.x
-            ddy = self.player_pos.y - self._ai_pos.y
-            dist = (ddx * ddx + ddy * ddy) ** 0.5 or 1e-5
-            self._ai_yaw = degrees(atan2(-ddx / dist, ddy / dist))  # 플레이어 조준
+                ddx = self.player_pos.x - self._ai_pos.x
+                ddy = self.player_pos.y - self._ai_pos.y
+                dist = (ddx * ddx + ddy * ddy) ** 0.5 or 1e-5
+                self._ai_yaw = degrees(atan2(-ddx / dist, ddy / dist))  # 플레이어 조준
         # 아바타 배치/표시.
         self._remote_smooth = Vec3(self._ai_pos.x, self._ai_pos.y, bot_z)
         av.setPos(self._ai_pos.x, self._ai_pos.y, bot_z)
@@ -6846,8 +6850,11 @@ class ZombieGame(ShowBase):
 
     def _show_goal_banner(self, i_scored):
         """득점/실점 배너 표시 + 득점 효과음(있으면). 권위·클라 공용."""
+        if getattr(self, '_match_over', False):
+            return                       # 매치 종료 후엔 안 띄움(슬로우모션 중 골 재감지로
+                                         # 배너가 다시 떠 결과창 위에 잔상처럼 남는 것 방지)
         if self.hud_goal_banner is not None:
-            self.hud_goal_banner.setText('골!!!' if i_scored else '실점...')
+            self.hud_goal_banner.setText('GOAL' if i_scored else '실점...')
             self.hud_goal_banner.setFg((0.3, 1.0, 0.5, 1.0) if i_scored
                                        else (1.0, 0.5, 0.4, 1.0))
             self.hud_goal_banner.show()
@@ -7249,6 +7256,7 @@ class ZombieGame(ShowBase):
             self._ai_jump_z = w0[2]
         self._ai_wp_i = 1
         self._ai_jump_done = False
+        self._jump_started = False     # 카운트다운(FIGHT) 끝나면 _arena_release 가 True
         self._build_jump_hud()
         print('[jump] 점프맵 시작 — 결승까지 달려라!', flush=True)
 
@@ -8010,6 +8018,7 @@ class ZombieGame(ShowBase):
                 self.level_collider.walls.remove(w)
         self._barriers_active = False
         self._countdown_t = 0.0
+        self._jump_started = True        # 점프맵 — 이제부터 봇도 코스 진행(그 전엔 정지)
         self._shimmer_fading = True
         self.hud_countdown.setText('FIGHT!')
         self.hud_countdown.setFg((1, 0.45, 0.3, 1))
@@ -8427,6 +8436,12 @@ class ZombieGame(ShowBase):
             w = getattr(self, nm, None)
             if w is not None:
                 w.hide()
+        # 킬배너 — 마지막(승리) 처치의 슬램 애니가 결과창 위로 남지 않게 시퀀스 정지+숨김.
+        seq = getattr(self, '_kb_seq', None)
+        if seq is not None:
+            seq.finish()
+        if getattr(self, 'kb_root', None) is not None:
+            self.kb_root.hide()
         self._dmg_dir_t = 0.0
         if getattr(self, '_dmg_arc_geom', None) is not None:
             self._dmg_arc_geom.removeNode()
@@ -8742,6 +8757,8 @@ class ZombieGame(ShowBase):
         독립적으로 호출 — 둘 다 똑같이 리셋되어 라운드가 다시 시작된다.)"""
         if self._match_over:
             return
+        # 라운드 종료(적 전멸/사망으로 라운드 전환) — 킬 사운드 사이클 초기화.
+        self._kill_tier = 0
         self.player_pos = Vec3(self._spawn_pos)
         self.player_yaw = self._spawn_yaw
         self.player_pitch = 0.0
@@ -9469,11 +9486,9 @@ class ZombieGame(ShowBase):
                     self.wave += 1
                     self._spawn_wave(self.wave)
 
-        # 킬 콤보 윈도우 카운트다운 — 0 이 되면 다음 킬은 1단계부터.
+        # 킬스트릭 4초 콤보 윈도우 카운트다운(1v1 외 모드) — 0 이 되면 다음 킬은 1단계부터.
         if self._combo_window > 0.0:
             self._combo_window = max(0.0, self._combo_window - dt)
-        # 하단 콤보 게이지 갱신 (남은 시간 → 왼쪽으로 슬라이드 소진)
-        self._update_combo_bar()
 
         # (F 처치/복원 상호작용 제거 — 적는 죽으면 페이드아웃되어 사라짐)
 
